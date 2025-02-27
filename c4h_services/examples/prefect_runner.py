@@ -255,7 +255,7 @@ def main():
         config=config
     )
 
-    format_output(result)
+##    format_output(result)
 
     if result.get("status") != "success":
         sys.exit(1)
