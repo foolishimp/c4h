@@ -221,25 +221,33 @@ llm_config:
           Rules:
           1. Follow the extraction instruction exactly
           2. Return ONLY raw JSON - no markdown, no code blocks, no backticks
-          3. Each change must include file_path, type, and either content or diff
-          4. Never include explanatory text or formatting markers
-          5. Extract all changes in a single pass
-          6. Response must start with [ and end with ]
-          7. Every string must use double quotes
-          8. No comments or trailing commas allowed, or markdown formatting
+          3. Each change MUST include a non-empty file_path, type, and either content or diff
+          4. NEVER extract items without a valid file_path
+          5. Never include explanatory text or formatting markers
+          6. Extract all valid changes in a single pass
+          7. Response must start with [ and end with ]
+          8. Every string must use double quotes
+          9. No comments or trailing commas allowed
+          10. Do not extract metadata as separate files - only extract actual file changes
 
         extract: |
-          Extract all information objects from the input, regardless of format.
+          Extract all code change objects from the input.
           
           Content to analyze:
           {content}
 
-          Each change action must include:
-          1. file_path: Path of the file to modify (if available)
+          Each change MUST include ALL of these required fields:
+          1. file_path: Path of the file to modify - THIS MUST BE A NON-EMPTY STRING
           2. type: One of "modify", "create", or "delete"
           3. content: The complete new content (if available)
           4. diff: Git-style diff (if content not available)
           5. description: Clear description of the change
+
+          VALIDATION RULES:
+          - SKIP any object that doesn't have a valid file_path
+          - DO NOT extract metadata as separate files
+          - ONLY extract actual file changes
+          - ONLY extract items that represent code or content files
 
           Input instruction:
           {instruction}
@@ -247,7 +255,7 @@ llm_config:
           Required format:
           {format}
 
-          CRITICAL: Return raw JSON only. Do not wrap in code blocks or markdown.
+          CRITICAL: Return raw JSON array of valid file changes only. Do not include any item without a valid file_path.
 
     semantic_slow_extractor:
       provider: "openai"
