@@ -20,7 +20,7 @@ def is_text_file(file_path: str) -> bool:
     mime_type, _ = mimetypes.guess_type(file_path)
     
     # List of common text-based file extensions
-    text_file_extensions = ['.dart', '.js', '.java', '.py', '.cpp', '.c', '.h', '.html', '.css', '.txt', '.md', '.sh', '.yml', '.yaml']
+    text_file_extensions = ['.dart', '.js', '.java', '.py', '.cpp', '.c', '.h', '.html', '.css', '.txt', '.md', '.sh', '.yml', '.yaml', '.json', '.tsx', '.ts']
 
     if mime_type and (mime_type.startswith('text/') or mime_type in [
         'application/x-sh',
