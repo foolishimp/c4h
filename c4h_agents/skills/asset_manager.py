@@ -174,15 +174,12 @@ class AssetManager(BaseAgent):
             directory = path.parent
             if not directory.exists():
                 logger.info("asset_manager.creating_directory", 
-                           directory=str(directory),
-                           absolute_path=str(directory.resolve()))
+                           directory=str(directory))
                 directory.mkdir(parents=True, exist_ok=True)
                 
                 # Verify directory was created
                 if not directory.exists():
-                    logger.error("asset_manager.directory_creation_failed", 
-                               directory=str(directory),
-                               reason="Directory does not exist after creation attempt")
+                    logger.error("asset_manager.directory_creation_failed")
                     return False
                     
                 logger.info("asset_manager.directory_created", 
@@ -191,8 +188,7 @@ class AssetManager(BaseAgent):
         except Exception as e:
             logger.error("asset_manager.directory_creation_failed", 
                        directory=str(path.parent),
-                       error=str(e),
-                       error_type=type(e).__name__)
+                       error=str(e))
             return False
 
     def process_action(self, action: Union[str, Dict[str, Any]]) -> AssetResult:
@@ -238,15 +234,26 @@ class AssetManager(BaseAgent):
                     action_copy = action
             else:
                 # For new files, explicitly mark as create operation
-                if isinstance(action, dict) and 'type' not in action:
+                if isinstance(action, dict):
                     action_copy = dict(action)
                     action_copy['type'] = 'create'
+                    # Use special marker for new files to help the merger
+                    action_copy['original'] = "New file - no original content"
                 else:
                     action_copy = action
             
             # Enhance the context with the file path
             if isinstance(action_copy, dict):
                 action_copy['file_path'] = str(resolved_path)
+            
+            # Ensure directory exists before attempting merge
+            if not self._ensure_directory_exists(resolved_path):
+                return AssetResult(
+                    success=False,
+                    path=resolved_path,
+                    backup_path=backup_path,
+                    error=f"Failed to create directory: {resolved_path.parent}"
+                )
             
             # Let merger handle content merging/creation
             merge_result = self.merger.process(action_copy)
@@ -271,21 +278,12 @@ class AssetManager(BaseAgent):
                     error="No content after merge"
                 )
 
-            # Ensure the directory exists before writing the file
-            if not self._ensure_directory_exists(resolved_path):
-                return AssetResult(
-                    success=False,
-                    path=resolved_path,
-                    backup_path=backup_path,
-                    error=f"Failed to create directory: {resolved_path.parent}"
-                )
-
             # Write final content to the resolved path
             try:
                 resolved_path.write_text(content)
                 logger.info("asset_manager.content_written", path=str(resolved_path))
                 
-                # Verify file was written successfully
+                # Verify file was written correctly
                 if not resolved_path.exists():
                     raise FileNotFoundError(f"File was not created: {resolved_path}")
                     
@@ -299,8 +297,7 @@ class AssetManager(BaseAgent):
             except Exception as e:
                 logger.error("asset_manager.write_failed",
                            path=str(resolved_path),
-                           error=str(e),
-                           error_type=type(e).__name__)
+                           error=str(e))
                 return AssetResult(
                     success=False,
                     path=resolved_path,

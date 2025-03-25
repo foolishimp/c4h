@@ -318,24 +318,38 @@ llm_config:
             - You will receive:
               - Original code ("original" in context)
               - Unified git-style diff ("diff" in context)
-            - If either is missing, return the error: "Missing required [original|diff] content".
+            - For new file creation:
+              - If original is empty or contains "New file - no original content" it means this is a NEW FILE
+              - For new files, extract the complete content from the diff by taking all lines starting with "+" and removing the leading "+"
+              - Do not return an error for new files; instead return the extracted content as the complete file content
+            - For modifications to existing files:
+              - If either original or diff is missing, return the error: "Missing required [original|diff] content".
 
           2. Diff Application Rules:
-            - Parse the @@ markers to determine exact positions of changes.
-            - Verify that context lines in the diff match the original code.
-            - Modify only the lines specified in the diff and leave all other lines untouched.
-            - Maintain original indentation, whitespace, comments, docstrings, imports, and overall structure.
+            - For NEW FILES:
+              - Extract all content from diff lines that start with "+"
+              - Remove the leading "+" character from each line
+              - Return this as a complete file
+              - Do not return errors about missing original content for new files
+            - For MODIFICATIONS:
+              - Parse the @@ markers to determine exact positions of changes.
+              - Verify that context lines in the diff match the original code.
+              - Modify only the lines specified in the diff and leave all other lines untouched.
+              - Maintain original indentation, whitespace, comments, docstrings, imports, and overall structure.
 
           3. Validation Checks:
-            - Ensure @@ line numbers align with the original code.
-            - Verify that all context lines exist in the original file.
-            - Ensure no unintended code is added or removed.
-            - Retain all class and function structures, import order, and grouping.
+            - Check if this is a new file by looking for empty original or "New file"
+            - If new file, skip validation checks for original content
+            - Otherwise:
+              - Ensure @@ line numbers align with the original code.
+              - Verify that all context lines exist in the original file.
+              - Ensure no unintended code is added or removed.
+              - Retain all class and function structures, import order, and grouping.
 
           4. Output Format:
             - Return ONLY the complete, modified file content.
-            - Start with the original file docstring.
-            - End with the last line of actual code.
+            - For new files, return the complete content extracted from the diff
+            - For existing files, start with the original file docstring and end with the last line of actual code.
             - Never include:
               * File boundary markers (---, ===, etc)
               * End-of-file comments or markers
@@ -369,24 +383,33 @@ llm_config:
             {diff}
 
           ======================================================================
-          3. Preservation Rules:
-            - Keep original code structure intact.
-            - Apply all modifications from the diff.
-            - Maintain existing imports, comments, and docstrings.
-            - Preserve original functionality.
-            - Keep original whitespace patterns.
-            - Maintain exact method ordering.
+          3. NEW FILE DETECTION:
+            - If original is empty or contains "New file", this is a NEW FILE creation
+            - For new files, extract content directly from the diff by taking all lines that start with "+" and removing the leading "+"
+            - DO NOT return an error about missing original content for new files
+
+          ======================================================================
+          4. Preservation Rules:
+            - For existing files:
+              - Keep original code structure intact.
+              - Apply all modifications from the diff.
+              - Maintain existing imports, comments, and docstrings.
+              - Preserve original functionality.
+              - Keep original whitespace patterns.
+              - Maintain exact method ordering.
+            - For new files:
+              - Extract the complete content from lines starting with "+" in the diff
+              - Remove the leading "+" character from each line
+              - Return the complete clean content as the file content
 
           CRITICAL OUTPUT INSTRUCTIONS:
-            - Return ONLY the complete modified file content.
-            - Start with original file docstring.
-            - End with last line of actual code.
+            - Return ONLY the complete final file content.
             - NO file boundary markers.
             - NO end-of-file comments.
             - NO markdown formatting.
             - NO documentation separators.
             - NO conversation text or explanations.
-            - Output must be valid Python that could be directly saved to a .py file.
+            - Output must be valid code that could be directly saved to a file.
 
           Any non-code content will break the processing pipeline.
 
