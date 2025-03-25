@@ -159,6 +159,42 @@ class AssetManager(BaseAgent):
                        error=str(e))
             return None
 
+    def _ensure_directory_exists(self, path: Path) -> bool:
+        """
+        Ensure the directory for a file exists, creating it if necessary.
+        
+        Args:
+            path: The file path whose parent directories should exist
+            
+        Returns:
+            True if successful, False if failed
+        """
+        try:
+            # Create parent directories if they don't exist
+            directory = path.parent
+            if not directory.exists():
+                logger.info("asset_manager.creating_directory", 
+                           directory=str(directory),
+                           absolute_path=str(directory.resolve()))
+                directory.mkdir(parents=True, exist_ok=True)
+                
+                # Verify directory was created
+                if not directory.exists():
+                    logger.error("asset_manager.directory_creation_failed", 
+                               directory=str(directory),
+                               reason="Directory does not exist after creation attempt")
+                    return False
+                    
+                logger.info("asset_manager.directory_created", 
+                           directory=str(directory))
+            return True
+        except Exception as e:
+            logger.error("asset_manager.directory_creation_failed", 
+                       directory=str(path.parent),
+                       error=str(e),
+                       error_type=type(e).__name__)
+            return False
+
     def process_action(self, action: Union[str, Dict[str, Any]]) -> AssetResult:
         """Process single file action focusing on path handling and backup"""
         try:
@@ -235,10 +271,42 @@ class AssetManager(BaseAgent):
                     error="No content after merge"
                 )
 
+            # Ensure the directory exists before writing the file
+            if not self._ensure_directory_exists(resolved_path):
+                return AssetResult(
+                    success=False,
+                    path=resolved_path,
+                    backup_path=backup_path,
+                    error=f"Failed to create directory: {resolved_path.parent}"
+                )
+
             # Write final content to the resolved path
-            resolved_path.parent.mkdir(parents=True, exist_ok=True)
-            resolved_path.write_text(content)
-            logger.info("asset_manager.content_written", path=str(resolved_path))
+            try:
+                resolved_path.write_text(content)
+                logger.info("asset_manager.content_written", path=str(resolved_path))
+                
+                # Verify file was written successfully
+                if not resolved_path.exists():
+                    raise FileNotFoundError(f"File was not created: {resolved_path}")
+                    
+                actual_size = resolved_path.stat().st_size
+                expected_size = len(content.encode('utf-8'))
+                if actual_size == 0 or abs(actual_size - expected_size) > 10:  # Allow small difference due to encoding
+                    logger.warning("asset_manager.file_size_mismatch",
+                                  path=str(resolved_path),
+                                  expected=expected_size,
+                                  actual=actual_size)
+            except Exception as e:
+                logger.error("asset_manager.write_failed",
+                           path=str(resolved_path),
+                           error=str(e),
+                           error_type=type(e).__name__)
+                return AssetResult(
+                    success=False,
+                    path=resolved_path,
+                    backup_path=backup_path,
+                    error=f"Failed to write file: {str(e)}"
+                )
             
             return AssetResult(
                 success=True, 
