@@ -323,8 +323,9 @@ class Orchestrator:
                 prepared_config['project'] = {}
             prepared_config['project']['path'] = project_path
 
-            # Generate workflow ID
-            workflow_id = f"wf_{uuid.uuid4()}"
+            # Generate workflow ID with embedded timestamp
+            time_str = datetime.now().strftime('%H%M')
+            workflow_id = f"wf_{time_str}_{uuid.uuid4()}"
 
             # Configure system namespace
             if 'system' not in prepared_config:
@@ -396,10 +397,10 @@ class Orchestrator:
             }
             
             logger.info("workflow.initialized", 
-                       workflow_id=workflow_id,
-                       project_path=project_path,
-                       tartxt_config_keys=list(tartxt_config.keys()))
-                       
+                    workflow_id=workflow_id,
+                    project_path=project_path,
+                    tartxt_config_keys=list(tartxt_config.keys()))
+                    
             return prepared_config, context
             
         except Exception as e:

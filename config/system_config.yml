@@ -113,7 +113,10 @@ llm_config:
     solution_designer:
       provider: "anthropic"
       model: "claude-3-7-sonnet-20250219"
-      temperature: 0
+      temperature: 1
+      extended_thinking:
+        enabled: true
+        budget_tokens: 32000 # 32k tokens for extended thinking
       prompts:
         system: |
           You are a code modification solution designer that returns ONLY git-style diffs in JSON format.
