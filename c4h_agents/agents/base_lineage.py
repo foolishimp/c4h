@@ -1,3 +1,4 @@
+# Path: c4h_agents/agents/base_lineage.py
 """
 Lineage tracking implementation leveraging existing workflow event storage.
 Path: c4h_agents/agents/base_lineage.py
@@ -55,6 +56,7 @@ class BaseLineage:
         self.enabled = False
         self.client = None
         self.use_marquez = False
+        self.lineage_dir = None
         
         # Create a configuration node for hierarchical access
         self.config_node = create_config_node(config or {})
@@ -110,7 +112,27 @@ class BaseLineage:
                 # Setup file storage
                 base_dir = Path(file_config.get("path", "workspaces/lineage"))
                 date_str = datetime.now().strftime('%Y%m%d')
-                self.lineage_dir = base_dir / date_str / self.run_id
+                
+                # Generate a fixed timestamp for the run_id folder
+                # This ensures the folder name remains consistent throughout the workflow
+                time_str = datetime.now().strftime('%H%M')
+                
+                # Create a stable directory name once per workflow
+                # Instead of modifying the run_id each time, construct a consistent folder name
+                if self.run_id.startswith("wf_"):
+                    # If the run_id already has the wf_ prefix, don't modify it
+                    # This could happen if the run_id is already fully formatted
+                    if "_" not in self.run_id[3:]:
+                        # Add timestamp only if not already present
+                        stable_dir_name = f"wf_{time_str}_{self.run_id[3:]}"
+                    else:
+                        # Keep existing format
+                        stable_dir_name = self.run_id
+                else:
+                    # For any other format, add the prefix and timestamp
+                    stable_dir_name = f"wf_{time_str}_{self.run_id}"
+                    
+                self.lineage_dir = base_dir / date_str / stable_dir_name
                 self.lineage_dir.mkdir(parents=True, exist_ok=True)
                 
                 # Create subdirectories

@@ -112,7 +112,7 @@ llm_config:
           4. Available functionality
     solution_designer:
       provider: "anthropic"
-      model: "claude-3-5-sonnet-20241022"
+      model: "claude-3-7-sonnet-20250219"
       temperature: 0
       prompts:
         system: |
@@ -177,7 +177,7 @@ llm_config:
 
     semantic_extract:
       provider: "anthropic"
-      model: "claude-3-opus-20240229"
+      model: "claude-3-7-sonnet-20250219"
       temperature: 0
       prompts:
         system: |
@@ -211,8 +211,8 @@ llm_config:
           Do not add any processing or validation beyond what is specifically requested.
 
     semantic_fast_extractor:
-      provider: "openai"
-      model: "o3-mini" 
+      provider: "anthropic"
+      model: "claude-3-7-sonnet-20250219"
       temperature: 0
       prompts:
         system: |
@@ -258,8 +258,8 @@ llm_config:
           CRITICAL: Return raw JSON array of valid file changes only. Do not include any item without a valid file_path.
 
     semantic_slow_extractor:
-      provider: "openai"
-      model: "o3-mini"  
+      provider: "anthropic"
+      model: "claude-3-7-sonnet-20250219" 
       temperature: 0
       prompts:
         system: |
@@ -303,8 +303,8 @@ llm_config:
           4. No explanations or headers allowed or conversational text
 
     semantic_merge:
-      provider: "openai"
-      model: "o3-mini"  
+      provider: "anthropic"
+      model: "claude-3-7-sonnet-20250219"
       temperature: 0
       merge_config:
         preserve_formatting: true
@@ -368,7 +368,6 @@ llm_config:
 
           REMINDER:
           Your role is strictly to apply the changes defined in the diff. Any deviation from the original code not specified in the diff is an error.
-
         merge: |
           You will receive a git-style unified diff representing code changes.
           Your task is to apply these changes to the provided original code and return the COMPLETE modified file content.
@@ -440,20 +439,6 @@ llm_config:
           5. Apply changes exactly as specified
           6. Handle errors gracefully with backups
           7. Validate code after changes
-    
-    assurance:
-      provider: "openai"
-      model: "gpt-4-0125-preview"
-      temperature: 0
-      prompts:
-        system: |
-          You are a validation expert that analyzes test results.
-          When given test output:
-          1. Extract key success/failure indicators
-          2. Identify specific test failures
-          3. Extract relevant error messages
-          4. Determine overall validation status
-          5. Provide clear validation summary
 
 # Default teams and lineage configuration
 orchestration:
