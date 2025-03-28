@@ -1,573 +1,493 @@
-# c4h_services API Reference
+# C4H Services API Integration Guide
 
 ## Introduction
 
-The `c4h_services` library serves as a service orchestration layer that implements and exposes the core functionality provided by `c4h_agents`. It provides various implementations of the intent service interface, adds workflow orchestration, offers a REST API, and includes utilities for configuration management and logging. The primary purpose of this library is to:
-
-1. Provide service-level implementations for agent orchestration
-2. Support multiple execution modes (local, prefect-based workflows)
-3. Expose agent functionality through a RESTful API
-4. Manage teams of agents working together
-5. Handle workflow execution, monitoring, and lineage tracking
-
-The library acts as the integration layer between the agent system and external interfaces, ensuring proper configuration propagation, execution tracking, and error handling.
+This guide provides comprehensive details for integrating with the C4H Services API, a system designed for orchestrating intelligent code refactoring workflows. The API allows you to submit code refactoring intents and receive structured results, making it ideal for building GUI interfaces for code analysis and transformation.
 
 ## Folder Structure
 
 ```
+c4h_agents/
+├── core/
+│   └── project.py        # Project domain model
+├── agents/
+│   ├── base_agent.py     # Base implementation
+│   ├── base_config.py    # Configuration management
+│   ├── base_lineage.py   # Lineage tracking
+│   ├── base_llm.py       # LLM interaction
+│   ├── lineage_context.py # Context management
+│   ├── discovery.py      # Project discovery
+│   ├── solution_designer.py # Solution design
+│   ├── coder.py          # Code modification
+│   ├── assurance.py      # Validation agent
+│   └── types.py          # Type definitions
+├── skills/
+│   ├── semantic_extract.py  # Information extraction
+│   ├── semantic_merge.py    # Code merging
+│   ├── semantic_iterator.py # Sequential processing
+│   ├── semantic_formatter.py # Text formatting
+│   ├── asset_manager.py     # File operations
+│   ├── tartxt.py            # File analysis
+│   ├── _semantic_fast.py    # Fast extraction
+│   ├── _semantic_slow.py    # Sequential extraction
+│   └── shared/
+│       ├── types.py         # Shared type definitions
+│       └── markdown_utils.py # Markdown processing
+├── utils/
+│   └── logging.py           # Logging utilities
+└── config.py                # Configuration handling
+
 c4h_services/
 ├── src/
 │   ├── bootstrap/
-│   │   └── prefect_runner.py    # Main entry point for execution
+│   │   └── prefect_runner.py    # Main entry point
 │   ├── api/
-│   │   ├── service.py           # FastAPI service implementation
-│   │   └── models.py            # API request/response models
+│   │   ├── service.py           # FastAPI service
+│   │   └── models.py            # API models
 │   ├── intent/
 │   │   ├── core/
-│   │   │   └── service.py       # Intent service interface
+│   │   │   └── service.py       # Service interface
 │   │   └── impl/
 │   │       ├── team/
-│   │       │   └── service.py   # Team-based implementation
+│   │       │   └── service.py   # Team implementation
 │   │       └── prefect/
 │   │           ├── service.py   # Prefect implementation
 │   │           ├── flows.py     # Workflow definitions
 │   │           ├── tasks.py     # Task wrappers
 │   │           ├── models.py    # Task models
 │   │           ├── factories.py # Task factories
-│   │           └── workflows.py # Core workflow logic
+│   │           └── workflows.py # Workflow logic
 │   ├── orchestration/
 │   │   ├── orchestrator.py      # Team orchestration
 │   │   └── team.py              # Team implementation
 │   └── utils/
 │       ├── logging.py           # Logging utilities
-│       ├── string_utils.py      # String handling utilities
-│       └── __init__.py          # Package exports
+│       └── string_utils.py      # String utilities
 ```
 
 ## Class Diagram
 
 ```mermaid
 classDiagram
+    class BaseConfig {
+        +config: Dict
+        +project: Optional~Project~
+        +metrics: Dict
+        +lookup(path: str)
+        +get_agent_node()
+        +_update_metrics(duration, success, error)
+    }
+    class BaseLLM {
+        +_get_completion_with_continuation(messages)
+        +_process_response(content, raw_response)
+        +_get_llm_content(response)
+    }
+    class BaseAgent {
+        +agent_id: str
+        +provider: LLMProvider
+        +model: str
+        +temperature: float
+        +process(context)
+        +_process(context)
+        +_format_request(context)
+        +_get_system_message()
+        +call_skill(skill_name, context)
+    }
+    class BaseLineage {
+        +namespace: str
+        +agent_name: str
+        +enabled: bool
+        +track_llm_interaction(context, messages, response, metrics)
+    }
+    class DiscoveryAgent {
+        +tartxt_config: Dict
+        +_run_tartxt(project_path)
+        +_parse_manifest(output)
+        +process(context)
+    }
+    class SolutionDesigner {
+        +_format_request(context)
+        +_validate_input(context)
+        +process(context)
+    }
+    class Coder {
+        +iterator: SemanticIterator
+        +merger: SemanticMerge
+        +asset_manager: AssetManager
+        +process(context)
+    }
+    class SemanticExtract {
+        +extract(content, instruction, format_hint)
+    }
+    class SemanticMerge {
+        +_get_original_content(file_path)
+        +process(context)
+    }
+    class SemanticIterator {
+        +create_iterator(content, config)
+        +configure(content, config)
+        +__iter__()
+        +__next__()
+    }
+    class AssetManager {
+        +backup_enabled: bool
+        +backup_dir: Path
+        +process_action(action)
+        +_resolve_file_path(file_path)
+        +_create_backup(file_path)
+    }
     class IntentService {
         <<Protocol>>
         +process_intent(project_path, intent_desc, max_iterations)
         +get_status(intent_id)
         +cancel_intent(intent_id)
     }
-    
-    class TeamIntentService {
-        +config: Dict
-        +orchestrator: Orchestrator
-        +__init__(config_path)
-        +process_intent(project_path, intent_desc, max_iterations)
-        +get_status(intent_id)
-        +cancel_intent(intent_id)
-    }
-    
-    class PrefectIntentService {
-        +config: Dict
-        +client: PrefectClient
-        +__init__(config_path)
-        +process_intent(project_path, intent_desc, max_iterations)
-        +get_status(intent_id)
-        +cancel_intent(intent_id)
-        +create_deployment(name, schedule)
-    }
-    
     class Orchestrator {
         +config: Dict
         +teams: Dict
-        +__init__(config)
         +execute_workflow(entry_team, context, max_teams)
-        +_load_teams()
-        +_load_default_teams()
     }
     
-    class Team {
-        +team_id: str
-        +name: str
-        +tasks: List
-        +config: Dict
-        +__init__(team_id, name, tasks, config)
-        +execute(context)
-        +_determine_next_team(results, context)
-        +_evaluate_condition(condition, results, context)
-    }
-    
-    class WorkflowRequest {
-        +project_path: str
-        +intent: Dict
-        +system_config: Optional~Dict~
-        +app_config: Optional~Dict~
-    }
-    
-    class WorkflowResponse {
-        +workflow_id: str
-        +status: str
-        +storage_path: Optional~str~
-        +error: Optional~str~
-    }
-    
-    class AgentTaskConfig {
-        +agent_class: Any
-        +config: Dict
-        +task_name: Optional~str~
-        +requires_approval: bool
-        +max_retries: int
-        +retry_delay_seconds: int
-    }
-
+    BaseConfig <|-- BaseAgent
+    BaseLLM <|-- BaseAgent
+    BaseAgent <|-- DiscoveryAgent
+    BaseAgent <|-- SolutionDesigner
+    BaseAgent <|-- Coder
+    BaseAgent <|-- SemanticExtract
+    BaseAgent <|-- SemanticMerge
+    BaseAgent <|-- SemanticIterator
+    BaseAgent <|-- AssetManager
     IntentService <|.. TeamIntentService
     IntentService <|.. PrefectIntentService
     TeamIntentService --> Orchestrator
-    Orchestrator --> Team
 ```
 
-## Main Entry Point: prefect_runner.py
+## API Overview
 
-The `prefect_runner.py` script serves as the main entry point for the services implementation, providing both command-line and API interfaces to the agent system.
+The C4H Services exposes a RESTful API for managing workflow executions. The primary endpoints are:
 
-```python
-class prefect_runner:
-    # Main entry point function
-    def main()
-    
-    # Configuration loading
-    def load_configs(app_config_path: Optional[str] = None, system_config_paths: Optional[List[str]] = None) -> Dict[str, Any]
-    
-    # Workflow execution
-    def run_workflow(project_path: Optional[str], intent_desc: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]
+- `POST /api/v1/workflow` - Submit a new workflow request
+- `GET /api/v1/workflow/{workflow_id}` - Check status of an existing workflow
+- `GET /health` - Service health check
+
+## Core Concepts
+
+### Workflow
+
+A workflow represents an end-to-end execution process that typically includes:
+
+1. **Discovery** - Analysis of the project structure and files
+2. **Solution Design** - Planning modifications based on intent
+3. **Code Implementation** - Applying the planned changes
+
+### Intent
+
+An "intent" specifies what you want to accomplish with the codebase. Examples include:
+- Adding error handling
+- Improving logging
+- Refactoring for performance
+- Applying design patterns
+
+### Teams
+
+The system uses a team-based approach where specialized agent teams handle different aspects of the workflow:
+- **Discovery Team** - Analyzes project files and structure
+- **Solution Team** - Designs changes based on intent
+- **Coder Team** - Implements the designed changes
+- **Fallback Team** - Handles failures with a simplified approach
+
+## API Reference
+
+### Submit Workflow
+
+```
+POST /api/v1/workflow
 ```
 
-### Usage Modes
+#### Request Body
 
-The runner supports two primary modes:
-
-1. **Workflow Mode**: Direct execution of agent workflows
-   ```bash
-   python -m c4h_services.src.bootstrap.prefect_runner workflow --project-path /path/to/project --intent-file intent.json
-   ```
-
-2. **Service Mode**: Running as a REST API service
-   ```bash
-   python -m c4h_services.src.bootstrap.prefect_runner service --port 8000 --config config.yml
-   ```
-
-### Configuration Loading
-
-```python
-# Load and merge configurations from multiple sources
-config = load_configs(
-    app_config_path="app_config.yml",
-    system_config_paths=["system_config.yml", "override_config.yml"]
-)
+```json
+{
+  "project_path": "/path/to/project",
+  "intent": {
+    "description": "Description of your refactoring intent"
+  },
+  "app_config": {
+    "key": "value"
+  },
+  "system_config": {
+    "key": "value"
+  }
+}
 ```
 
-## Core Services Implementation
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| project_path | string | Yes | Path to the project directory |
+| intent | object | Yes | Description of refactoring intent |
+| app_config | object | No | Application-specific configuration |
+| system_config | object | No | System-level configuration |
 
-### IntentService Protocol (intent/core/service.py)
+#### Response
 
-```python
-@runtime_checkable
-class IntentService(Protocol):
-    # Process a refactoring intent
-    def process_intent(
-        self,
-        project_path: Path,
-        intent_desc: Dict[str, Any],
-        max_iterations: int = 3
-    ) -> Dict[str, Any]
-    
-    # Get status for a workflow run
-    def get_status(self, intent_id: str) -> Dict[str, Any]
-    
-    # Cancel a running workflow
-    def cancel_intent(self, intent_id: str) -> bool
+```json
+{
+  "workflow_id": "wf_12345678-abcd-1234-efgh-123456789abc",
+  "status": "pending",
+  "storage_path": "workspaces/lineage/wf_12345678-abcd-1234-efgh-123456789abc",
+  "error": null
+}
 ```
 
-### TeamIntentService (intent/impl/team/service.py)
+| Field | Type | Description |
+|-------|------|-------------|
+| workflow_id | string | Unique identifier for the workflow |
+| status | string | Current status of the workflow |
+| storage_path | string | Path where workflow results are stored |
+| error | string | Error message (null if no errors) |
 
-```python
-class TeamIntentService(IntentService):
-    # Initialization
-    def __init__(self, config_path: Optional[Path] = None)
-    
-    # Process refactoring intent through team workflow
-    async def process_intent(
-        self,
-        project_path: Path,
-        intent_desc: Dict[str, Any],
-        max_iterations: int = 3
-    ) -> Dict[str, Any]
-    
-    # Get status for a workflow run
-    async def get_status(self, intent_id: str) -> Dict[str, Any]
-    
-    # Cancel a workflow run
-    async def cancel_intent(self, intent_id: str) -> bool
+Status values:
+- `pending` - Processing in progress
+- `success` - Completed successfully
+- `error` - Failed (error field contains details)
+
+### Check Workflow Status
+
+```
+GET /api/v1/workflow/{workflow_id}
 ```
 
-### PrefectIntentService (intent/impl/prefect/service.py)
+#### URL Parameters
 
-```python
-class PrefectIntentService:
-    # Initialization
-    def __init__(self, config_path: Optional[Path] = None)
-    
-    # Process refactoring intent through Prefect workflow
-    async def process_intent(
-        self,
-        project_path: Path,
-        intent_desc: Dict[str, Any],
-        max_iterations: int = 3
-    ) -> Dict[str, Any]
-    
-    # Get status from Prefect flow run
-    async def get_status(self, intent_id: str) -> Dict[str, Any]
-    
-    # Cancel Prefect flow run
-    async def cancel_intent(self, intent_id: str) -> bool
-    
-    # Create a deployment for the intent workflow
-    async def create_deployment(
-        self,
-        name: str,
-        schedule: Optional[str] = None
-    ) -> Dict[str, Any]
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| workflow_id | string | ID of the workflow to check |
+
+#### Response
+
+```json
+{
+  "workflow_id": "wf_12345678-abcd-1234-efgh-123456789abc",
+  "status": "success",
+  "storage_path": "workspaces/lineage/wf_12345678-abcd-1234-efgh-123456789abc",
+  "error": null
+}
 ```
 
-## Orchestration
+### Health Check
 
-### Orchestrator (orchestration/orchestrator.py)
-
-```python
-class Orchestrator:
-    # Initialization
-    def __init__(self, config: Dict[str, Any])
-    
-    # Load team configurations
-    def _load_teams(self) -> None
-    
-    # Load default teams for backward compatibility
-    def _load_default_teams(self) -> None
-    
-    # Execute a workflow starting from the specified team
-    def execute_workflow(
-        self, 
-        entry_team: str = "discovery",
-        context: Dict[str, Any] = None,
-        max_teams: int = 10
-    ) -> Dict[str, Any]
+```
+GET /health
 ```
 
-### Team (orchestration/team.py)
+#### Response
 
-```python
-class Team:
-    # Initialization
-    def __init__(self, team_id: str, name: str, tasks: List[AgentTaskConfig], config: Dict[str, Any])
-    
-    # Execute this team's agents in sequence
-    def execute(self, context: Dict[str, Any]) -> Dict[str, Any]
-    
-    # Determine the next team to execute based on routing rules and results
-    def _determine_next_team(self, results: List[Dict[str, Any]], context: Dict[str, Any]) -> Optional[str]
-    
-    # Evaluate a routing condition against results and context
-    def _evaluate_condition(self, condition: str, results: List[Dict[str, Any]], context: Dict[str, Any]) -> bool
+```json
+{
+  "status": "healthy",
+  "workflows_tracked": 5,
+  "teams_available": 4
+}
 ```
 
-## Prefect Implementation
+## Configuration System
 
-### AgentTaskConfig (intent/impl/prefect/models.py)
+The system uses a hierarchical configuration structure. When submitting a workflow, you can provide configuration at two levels:
 
-```python
-class AgentTaskConfig(BaseModel):
-    # Agent class or string path for dynamic loading
-    agent_class: Any
-    
-    # Configuration dictionary
-    config: Dict[str, Any] = Field(default_factory=dict)
-    
-    # Task name
-    task_name: Optional[str] = None
-    
-    # Whether this task requires user approval
-    requires_approval: bool = Field(default=False)
-    
-    # Max retry attempts
-    max_retries: int = Field(default=3)
-    
-    # Seconds to wait between retries
-    retry_delay_seconds: int = Field(default=30)
-    
-    class Config:
-        arbitrary_types_allowed = True
-```
+1. **system_config**: Core system settings that affect all components
+2. **app_config**: Application-specific settings that override system settings
 
-### run_agent_task (intent/impl/prefect/tasks.py)
+### Configuration Merging Process
 
-```python
-@task(retries=2, retry_delay_seconds=10)
-def run_agent_task(
-    agent_config: AgentTaskConfig,
-    context: Dict[str, Any],
-    task_name: Optional[str] = None
-) -> Dict[str, Any]
-```
+When you submit a workflow request with custom configuration:
 
-### Task Factories (intent/impl/prefect/factories.py)
+1. The base system configuration is loaded from the server
+2. Your provided `system_config` is merged with the base configuration
+3. Your provided `app_config` is merged on top, taking highest precedence
+4. This merged configuration drives the agent behavior
 
-```python
-# Prepare configuration for an agent
-def prepare_agent_config(config: Dict[str, Any], agent_section: str) -> Dict[str, Any]
-
-# Create discovery agent task configuration
-def create_discovery_task(config: Dict[str, Any]) -> AgentTaskConfig
-
-# Create solution designer task configuration
-def create_solution_task(config: Dict[str, Any]) -> AgentTaskConfig
-
-# Create coder agent task configuration
-def create_coder_task(config: Dict[str, Any]) -> AgentTaskConfig
-
-# Create task configurations for a team from configuration
-def create_team_tasks(config: Dict[str, Any], team_config: Dict[str, Any]) -> List[AgentTaskConfig]
-```
-
-### Workflows (intent/impl/prefect/workflows.py)
-
-```python
-# Prepare workflow configuration with proper run ID and context
-def prepare_workflow_config(base_config: Dict[str, Any]) -> Dict[str, Any]
-
-# Basic workflow implementing the core refactoring steps
-@flow(name="basic_refactoring")
-def run_basic_workflow(
-    project_path: Path,
-    intent_desc: Dict[str, Any],
-    config: Dict[str, Any]
-) -> Dict[str, Any]
-```
-
-### Flows (intent/impl/prefect/flows.py)
-
-```python
-# Main workflow for intent-based refactoring
-@flow(name="intent_refactoring")
-def run_intent_workflow(
-    project_path: Path,
-    intent_desc: Dict[str, Any],
-    config: Dict[str, Any],
-    max_iterations: int = 3
-) -> Dict[str, Any]
-
-# Recovery workflow for handling failed runs
-@flow(name="intent_recovery")
-def run_recovery_workflow(
-    flow_run_id: str,
-    config: Dict[str, Any]
-) -> Dict[str, Any]
-```
-
-## API Service
-
-### API Models (api/models.py)
-
-```python
-class WorkflowRequest(BaseModel):
-    # Path to the project to be processed
-    project_path: str = Field(..., description="Path to the project to be processed")
-    
-    # Intent description for the workflow
-    intent: Dict[str, Any] = Field(..., description="Intent description for the workflow")
-    
-    # Base system configuration
-    system_config: Optional[Dict[str, Any]] = Field(default=None, description="Base system configuration")
-    
-    # Application-specific configuration overrides
-    app_config: Optional[Dict[str, Any]] = Field(default=None, description="Application-specific configuration overrides")
-
-class WorkflowResponse(BaseModel):
-    # Unique identifier for the workflow
-    workflow_id: str = Field(..., description="Unique identifier for the workflow")
-    
-    # Current status of the workflow
-    status: str = Field(..., description="Current status of the workflow")
-    
-    # Path to stored results if available
-    storage_path: Optional[str] = Field(default=None, description="Path to stored results if available")
-    
-    # Error message if status is 'error'
-    error: Optional[str] = Field(default=None, description="Error message if status is 'error'")
-```
-
-### FastAPI Service (api/service.py)
-
-```python
-def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
-    # Create FastAPI application with team-based orchestration
-    
-    @app.post("/api/v1/workflow", response_model=WorkflowResponse)
-    async def run_workflow(request: WorkflowRequest):
-        # Execute a team-based workflow with the provided configuration
-        
-    @app.get("/api/v1/workflow/{workflow_id}", response_model=WorkflowResponse)
-    async def get_workflow(workflow_id: str):
-        # Get workflow status and results
-        
-    @app.get("/health")
-    async def health_check():
-        # Simple health check endpoint
-```
-
-## System Configuration Structure
-
-The system configuration (system_config.yml) provides a comprehensive configuration template for the entire agent system. It serves as the foundation that can be extended or overridden by application-specific configurations.
-
-### Purpose
-
-1. Provide default configurations for all components
-2. Define provider settings (API endpoints, models, etc.)
-3. Configure agent-specific parameters
-4. Set up team composition and routing
-5. Define workflow and lineage tracking settings
-6. Configure logging and backup behavior
+The merge follows these principles:
+- Base configuration provides the foundation
+- Override configuration can add new nodes
+- Override configuration can update leaf values
+- Parent node structure is preserved during merges
 
 ### Configuration Structure
 
+Here's a comprehensive example of the configuration structure:
+
 ```yaml
+# Project settings
+project:
+  path: "/path/to/project"
+  workspace_root: "workspaces"
+  source_root: "src"
+  output_root: "output"
+  config_root: "config"
+
+# Intent description
+intent:
+  description: "Add logging to all functions with lineage tracking"
+  target_files:
+    - "src/services/auth.js"
+    - "src/services/user.js"
+
+# LLM Configuration
 llm_config:
-  # Provider configurations
+  # Provider settings
   providers:
     anthropic:
       api_base: "https://api.anthropic.com"
       context_length: 200000
       env_var: "ANTHROPIC_API_KEY"
       default_model: "claude-3-5-sonnet-20241022"
-      valid_models: [...]
+      valid_models:
+        - "claude-3-7-sonnet-20250219"
+        - "claude-3-5-sonnet-20241022"
+        - "claude-3-5-haiku-20241022"
+        - "claude-3-opus-20240229"
+        - "claude-3-sonnet-20240229"
+        - "claude-3-haiku-20240307"
       extended_thinking:
         enabled: false
         budget_tokens: 32000
+        min_budget_tokens: 1024
+        max_budget_tokens: 128000        
       litellm_params:
         retry: true
         max_retries: 5
         timeout: 30
-        
+        rate_limit_policy:
+          tokens: 8000
+          requests: 50
+          period: 60
+        backoff:
+          initial_delay: 1
+          max_delay: 30
+          exponential: true
+    
     openai:
       api_base: "https://api.openai.com/v1"
       env_var: "OPENAI_API_KEY"
       default_model: "gpt-4o"
-      valid_models: [...]
-
+      valid_models:
+        - "gpt-4o"
+        - "gpt-4o-mini"
+        - "gpt-4"
+        - "gpt-4-turbo"
+        - "o1"
+        - "o1-mini"
+        - "o3-mini"
+      litellm_params:
+        retry: true
+        max_retries: 3
+        timeout: 30
+        rate_limit_policy:
+          tokens: 4000
+          requests: 200
+          period: 60
+        backoff:
+          initial_delay: 1
+          max_delay: 20
+          exponential: true
+          
+    gemini:
+      api_base: "https://generativelanguage.googleapis.com/v1beta"
+      context_length: 32000
+      env_var: "GEMINI_API_KEY"
+      default_model: "gemini-2"
+      valid_models:
+        - "gemini-1"
+        - "gemini-1.5"
+        - "gemini-2"
+  
   # Global defaults
   default_provider: "anthropic"
   default_model: "claude-3-opus-20240229"
   
   # Agent-specific configurations
   agents:
-    base:  # Base settings all agents inherit
-      storage:
-        root_dir: "workspaces"
-        
-    lineage:  # Lineage tracking configuration
-      enabled: true
-      namespace: "c4h_agents"
-      backend:
-        type: "file"
-        
     discovery:
       default_provider: "anthropic"
-      default_model: "claude-3-5-sonnet-20241022"
+      default_model: "claude-3-5-sonnet-20241022" 
       temperature: 0
-      tartxt_config: {...}
-      prompts: {...}
-      
+      tartxt_config:
+        script_base_path: "c4h_agents/skills"
+        input_paths: ["./"]
+        exclusions: ["**/__pycache__/**"]
+    
     solution_designer:
       provider: "anthropic"
       model: "claude-3-5-sonnet-20241022"
       temperature: 0
-      prompts: {...}
-      
-    semantic_extract:
-      provider: "anthropic"
-      model: "claude-3-opus-20240229"
-      temperature: 0
-      prompts: {...}
-      
-    semantic_iterator:
-      prompts: {...}
-      
-    semantic_fast_extractor:
-      provider: "openai"
-      model: "o3-mini" 
-      temperature: 0
-      prompts: {...}
-      
-    semantic_slow_extractor:
-      provider: "openai"
-      model: "o3-mini"  
-      temperature: 0
-      prompts: {...}
-      
-    semantic_merge:
-      provider: "openai"
-      model: "o3-mini"  
-      temperature: 0
-      merge_config: {...}
-      prompts: {...}
-      
+    
     coder:
       provider: "anthropic"
       model: "claude-3-opus-20240229"
       temperature: 0
-      prompts: {...}
-    
-    assurance:
-      provider: "openai"
-      model: "gpt-4-0125-preview"
-      temperature: 0
-      prompts: {...}
 
-# Team orchestration configuration
+# Orchestration settings
 orchestration:
   enabled: true
   entry_team: "discovery"  # First team to execute
   error_handling:
     retry_teams: true
     max_retries: 2
+    log_level: "ERROR"
   teams:
     # Discovery team - analyzes project structure
     discovery:
       name: "Discovery Team"
-      tasks: [...]
+      tasks:
+        - name: "discovery"
+          agent_class: "c4h_agents.agents.discovery.DiscoveryAgent"
+          requires_approval: false
+          max_retries: 2
       routing:
         default: "solution"  # Go to solution team next
     
     # Solution team - designs code changes
     solution:
       name: "Solution Design Team"
-      tasks: [...]
+      tasks:
+        - name: "solution_designer"
+          agent_class: "c4h_agents.agents.solution_designer.SolutionDesigner"
+          requires_approval: true
+          max_retries: 1
       routing:
-        rules: [...]
-        default: "coder"
+        rules:
+          - condition: "all_success"
+            next_team: "coder"
+          - condition: "any_failure"
+            next_team: "fallback"
+        default: "coder"  # Default next team
     
     # Coder team - implements code changes
     coder:
       name: "Coder Team"
-      tasks: [...]
+      tasks:
+        - name: "coder"
+          agent_class: "c4h_agents.agents.coder.Coder"
+          requires_approval: true
+          max_retries: 1
       routing:
-        rules: [...]
-        default: null
+        rules:
+          - condition: "all_success"
+            next_team: null  # End workflow on success
+        default: null  # End workflow by default
     
     # Fallback team - handles failures with simplified approach
     fallback:
       name: "Fallback Team"
-      tasks: [...]
+      tasks:
+        - name: "fallback_coder"
+          agent_class: "c4h_agents.agents.coder.Coder"
+          config:
+            temperature: 0  # Lower temperature for more conservative changes
       routing:
-        default: null
+        default: null  # End workflow after fallback
 
-# Runtime configuration for workflow and lineage
+# Runtime configuration
 runtime:
   # Workflow storage configuration
   workflow:
@@ -578,14 +498,34 @@ runtime:
       retention:
         max_runs: 10
         max_days: 30
+      error_handling:
+        ignore_storage_errors: true
+        log_level: "ERROR"
   # Lineage tracking configuration
   lineage:
     enabled: true
     namespace: "c4h_agents"
     separate_input_output: true
     backend:
-      type: "file"
-      path: "workspaces/lineage"
+      type: "file"  # File-based storage is more reliable for initial testing
+      path: "workspaces/lineage"  # Use explicit relative path
+    error_handling:
+      ignore_failures: true  # Don't let lineage errors affect workflow
+      log_level: "ERROR"
+    context:
+      include_metrics: true
+      include_token_usage: true
+      record_timestamps: true
+    retry:
+      enabled: true
+      max_attempts: 3
+      initial_delay: 1
+      max_delay: 30
+      backoff_factor: 2
+      retry_on:
+        - "overloaded_error"
+        - "rate_limit_error"
+        - "timeout_error"
 
 # Backup settings
 backup:
@@ -607,185 +547,336 @@ logging:
     suffix_length: 30
 ```
 
-## Usage Patterns
+## Client Implementation Examples
 
-### Running as a Service
-
-```python
-from c4h_services.src.bootstrap.prefect_runner import create_app
-from c4h_services.src.bootstrap.prefect_runner import load_configs
-
-# Load configuration
-config = load_configs("app_config.yml", ["system_config.yml"])
-
-# Create FastAPI app
-app = create_app(default_config=config)
-
-# Run the service
-import uvicorn
-uvicorn.run(app, host="0.0.0.0", port=8000)
-```
-
-### Running a Direct Workflow
-
-```python
-from c4h_services.src.bootstrap.prefect_runner import run_workflow
-from c4h_services.src.bootstrap.prefect_runner import load_configs
-from pathlib import Path
-
-# Load configuration
-config = load_configs("app_config.yml", ["system_config.yml"])
-
-# Define intent
-intent = {
-    "description": "Refactor code to follow single responsibility principle",
-    "target_files": ["src/module.py", "src/utils.py"]
-}
-
-# Run workflow
-result = run_workflow(
-    project_path=Path("/path/to/project"),
-    intent_desc=intent,
-    config=config
-)
-
-# Process result
-if result["status"] == "success":
-    print(f"Changes applied: {len(result['changes'])}")
-    for change in result.get("changes", []):
-        print(f"- {change['file']}: {change['success']}")
-else:
-    print(f"Error: {result['error']}")
-```
-
-### Using the Team Orchestrator
-
-```python
-from c4h_services.src.orchestration.orchestrator import Orchestrator
-
-# Create orchestrator with configuration
-orchestrator = Orchestrator(config)
-
-# Prepare context
-context = {
-    "project_path": "/path/to/project",
-    "intent": {
-        "description": "Add error handling to function X"
-    },
-    "workflow_run_id": "wf_12345"
-}
-
-# Execute workflow
-result = orchestrator.execute_workflow(
-    entry_team="discovery",
-    context=context,
-    max_teams=10
-)
-
-# Process result
-print(f"Status: {result['status']}")
-print(f"Execution path: {' -> '.join(result['execution_path'])}")
-```
-
-### Using the API
+### Python Client Example
 
 ```python
 import requests
-import json
+import time
+import os.path
 
-# API endpoint
-url = "http://localhost:8000/api/v1/workflow"
-
-# Request data
-data = {
-    "project_path": "/path/to/project",
-    "intent": {
-        "description": "Refactor code to improve error handling",
-        "target_files": ["src/module.py"]
-    },
-    "system_config": None,
-    "app_config": {
-        "logging": {
-            "level": "DEBUG"
-        }
-    }
-}
-
-# Send request
-response = requests.post(url, json=data)
-result = response.json()
-
-# Get workflow ID
-workflow_id = result["workflow_id"]
-
-# Check status
-status_url = f"http://localhost:8000/api/v1/workflow/{workflow_id}"
-status = requests.get(status_url).json()
-
-print(f"Status: {status['status']}")
-print(f"Storage Path: {status['storage_path']}")
-```
-
-## Response Formats
-
-### Workflow Response
-
-```python
-{
-    "workflow_id": "wf_12345",
-    "status": "success",
-    "storage_path": "workspaces/lineage/wf_12345",
-    "error": None
-}
-```
-
-### Detailed Workflow Result
-
-```python
-{
-    "status": "success",
-    "workflow_run_id": "wf_12345",
-    "execution_path": ["discovery", "solution", "coder"],
-    "team_results": {
-        "discovery": {
-            "success": True,
-            "data": {...},
-            "next_team": "solution"
-        },
-        "solution": {
-            "success": True,
-            "data": {...},
-            "next_team": "coder"
-        },
-        "coder": {
-            "success": True,
-            "data": {...},
-            "next_team": None
-        }
-    },
-    "data": {
-        "changes": [
-            {
-                "file": "src/module.py",
-                "success": True,
-                "error": None,
-                "backup": "workspaces/backups/20240307_123456/src/module.py"
+class C4HClient:
+    def __init__(self, base_url="http://localhost:8000"):
+        self.base_url = base_url
+        
+    def submit_workflow(self, project_path, intent_description, config=None):
+        """Submit a new workflow request"""
+        url = f"{self.base_url}/api/v1/workflow"
+        
+        # Normalize project path
+        project_path = os.path.abspath(project_path)
+        
+        payload = {
+            "project_path": project_path,
+            "intent": {
+                "description": intent_description
             }
-        ]
-    },
-    "teams_executed": 3,
-    "timestamp": "2024-03-07T12:34:56Z"
+        }
+        
+        if config:
+            payload["app_config"] = config
+            
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()
+    
+    def get_workflow_status(self, workflow_id):
+        """Get status of a workflow"""
+        url = f"{self.base_url}/api/v1/workflow/{workflow_id}"
+        response = requests.get(url)
+        response.raise_for_status()
+        return response.json()
+    
+    def wait_for_completion(self, workflow_id, interval=5, timeout=300, callback=None):
+        """Wait for workflow completion with polling"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            status = self.get_workflow_status(workflow_id)
+            
+            # Call the callback if provided
+            if callback:
+                callback(status)
+                
+            if status["status"] in ["success", "error"]:
+                return status
+                
+            time.sleep(interval)
+            
+        raise TimeoutError(f"Workflow did not complete within {timeout} seconds")
+    
+    def check_health(self):
+        """Check service health"""
+        url = f"{self.base_url}/health"
+        response = requests.get(url)
+        response.raise_for_status()
+        return response.json()
+```
+
+### JavaScript Client Example
+
+```javascript
+class C4HClient {
+  constructor(baseUrl = 'http://localhost:8000') {
+    this.baseUrl = baseUrl;
+  }
+  
+  async submitWorkflow(projectPath, intentDescription, config = null) {
+    const url = `${this.baseUrl}/api/v1/workflow`;
+    
+    // Create payload
+    const payload = {
+      project_path: projectPath,
+      intent: {
+        description: intentDescription
+      }
+    };
+    
+    if (config) {
+      payload.app_config = config;
+    }
+    
+    // Send request
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+    
+    if (!response.ok) {
+      throw new Error(`API error: ${response.status} ${response.statusText}`);
+    }
+    
+    return response.json();
+  }
+  
+  async getWorkflowStatus(workflowId) {
+    const url = `${this.baseUrl}/api/v1/workflow/${workflowId}`;
+    
+    const response = await fetch(url);
+    
+    if (!response.ok) {
+      throw new Error(`API error: ${response.status} ${response.statusText}`);
+    }
+    
+    return response.json();
+  }
+  
+  async waitForCompletion(workflowId, interval = 5000, timeout = 300000, callback = null) {
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < timeout) {
+      const status = await this.getWorkflowStatus(workflowId);
+      
+      if (callback) {
+        callback(status);
+      }
+      
+      if (status.status === 'success' || status.status === 'error') {
+        return status;
+      }
+      
+      // Wait for next interval
+      await new Promise(resolve => setTimeout(resolve, interval));
+    }
+    
+    throw new Error(`Workflow did not complete within ${timeout/1000} seconds`);
+  }
+  
+  async checkHealth() {
+    const url = `${this.baseUrl}/health`;
+    
+    const response = await fetch(url);
+    
+    if (!response.ok) {
+      throw new Error(`API error: ${response.status} ${response.statusText}`);
+    }
+    
+    return response.json();
+  }
 }
 ```
 
-## Key Design Principles
+### Usage Example
 
-1. **Team-Based Execution**: Organize agents into teams with clear responsibilities
-2. **Workflow Orchestration**: Sequential team execution with conditional routing
-3. **Configuration Hierarchy**: System config + application overrides
-4. **Service Independence**: Multiple service implementations with same interface
-5. **Lineage Tracking**: Record execution paths and relationships
-6. **Error Resilience**: Graceful fallback and recovery mechanisms
-7. **Observability**: Comprehensive logging and monitoring
+```python
+client = C4HClient("http://localhost:8000")
 
-These principles ensure that the service layer can effectively coordinate agent activities while maintaining flexibility, reliability, and observability.
+# Check service health
+health = client.check_health()
+print(f"Service status: {health['status']}")
+
+# Submit a workflow
+workflow = client.submit_workflow(
+    project_path="/path/to/my_project",
+    intent_description="Add proper error handling to all API endpoints"
+)
+
+workflow_id = workflow["workflow_id"]
+print(f"Workflow submitted with ID: {workflow_id}")
+
+# Poll for completion
+def status_callback(status):
+    print(f"Current status: {status['status']}")
+
+result = client.wait_for_completion(
+    workflow_id=workflow_id,
+    interval=10,
+    timeout=600,
+    callback=status_callback
+)
+
+if result["status"] == "success":
+    print("Workflow completed successfully!")
+    print(f"Results stored at: {result['storage_path']}")
+else:
+    print(f"Workflow failed: {result['error']}")
+```
+
+## Project Model
+
+The system uses a project model that includes:
+
+### Project Paths
+- `root` - Project root directory
+- `workspace` - Directory for working files
+- `source` - Source code directory
+- `output` - Output directory for modifications
+- `config` - Configuration files location
+
+### Project Metadata
+- `name` - Project name (derived from directory name)
+- `description` - Optional project description
+- `version` - Optional version information
+- `settings` - Custom project settings
+
+## Workflow Execution Flow
+
+1. **Initialization**:
+   - Client submits workflow request with project path and intent
+   - Server generates a workflow ID
+   - Server prepares configuration with default values
+
+2. **Team Execution**:
+   - Discovery team analyzes project structure using tartxt
+   - Solution team designs code modifications
+   - Coder team implements changes using semantic extraction and merging
+   - If solution design fails, the fallback team handles using a more conservative approach
+
+3. **Result Storage**:
+   - Changes are written to the project files
+   - Backup copies are created before modifications
+   - Lineage information is recorded with execution paths
+   - Status information is stored for retrieval
+
+## Common Use Cases
+
+### Adding Logging
+
+```json
+{
+  "project_path": "./my_project",
+  "intent": {
+    "description": "Add logging to all functions with proper error handling and level-appropriate log messages"
+  }
+}
+```
+
+### Implementing Design Patterns
+
+```json
+{
+  "project_path": "./my_project",
+  "intent": {
+    "description": "Refactor to use the Factory pattern for class creation in the user module"
+  }
+}
+```
+
+### Performance Optimization
+
+```json
+{
+  "project_path": "./my_project",
+  "intent": {
+    "description": "Optimize database queries in the data_access.py file to reduce execution time"
+  },
+  "app_config": {
+    "llm_config": {
+      "agents": {
+        "coder": {
+          "provider": "anthropic",
+          "model": "claude-3-7-sonnet-20250219",
+          "temperature": 0
+        }
+      }
+    }
+  }
+}
+```
+
+### Applying Agent Design Principles
+
+```json
+{
+  "project_path": "./my_project",
+  "intent": {
+    "description": "Refactor the code to follow the agent design principles: LLM-first processing, minimal agent logic, clear boundaries, and forward-only flow"
+  }
+}
+```
+
+## Error Handling
+
+Common errors and their solutions:
+
+| Error | Possible Cause | Solution |
+|-------|----------------|----------|
+| "No input paths configured" | Missing tartxt_config.input_paths | Ensure discovery agent has tartxt_config with input_paths |
+| "Team not found" | Invalid entry_team | Verify orchestration.entry_team matches available teams |
+| "No project path specified" | Missing project path | Provide valid project_path in request |
+| "Invalid configuration" | Malformed config | Check configuration structure against schema |
+| "Missing agent_class" | Incorrect task configuration | Ensure all tasks have valid agent_class defined |
+
+## Security Considerations
+
+- The service operates on the filesystem, ensure proper isolation
+- Consider running in a container or restricted environment
+- Validate project paths to prevent path traversal attacks
+- Implement authentication for multi-user environments
+- Use dotenv files for API keys instead of embedding in configuration
+
+## Implementation Considerations for GUI
+
+When building a GUI application over this API, consider:
+
+1. **Project Selection**:
+   - Allow users to select/browse project directories
+   - Validate project structure before submission
+   - Show project stats (file count, languages, etc.)
+
+2. **Intent Formulation**:
+   - Provide templates for common intents
+   - Allow custom intent descriptions
+   - Offer guided intent creation through Q&A
+   - Support target file/directory selection
+
+3. **Configuration Management**:
+   - Provide UI for editing hierarchical configuration
+   - Group configuration by component
+   - Offer sensible defaults
+   - Include model selection with appropriate options
+
+4. **Workflow Monitoring**:
+   - Poll the status endpoint at reasonable intervals
+   - Display execution progress with team transitions
+   - Show live logs if available
+   - Visualize execution path
+
+5. **Result Visualization**:
+   - Display diffs between original and modified files
+   - Allow navigation through changed files
+   - Provide options to accept/reject changes
+   - Show backup locations
