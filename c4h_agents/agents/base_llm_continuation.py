@@ -49,6 +49,8 @@ class ContinuationHandler:
         max_tries = max_attempts or self.max_continuation_attempts
         accumulated_lines = []
         final_response = None
+        consecutive_failures = 0
+        max_consecutive_failures = 2  # Allow up to 2 consecutive parsing failures before falling back
         
         # Detect content type
         content_type = self._detect_content_type(messages)
@@ -92,8 +94,8 @@ class ContinuationHandler:
                 cont_messages.append({"role": "user", "content": continuation_prompt})
                 
                 self.logger.info("llm.requesting_continuation", 
-                               attempt=attempt, 
-                               next_line=next_line)
+                            attempt=attempt, 
+                            next_line=next_line)
                 
                 # Make continuation request
                 try:
@@ -108,11 +110,40 @@ class ContinuationHandler:
                     new_lines = self._parse_json_content(cont_content, next_line)
                     
                     if not new_lines:
-                        self.logger.warning("llm.no_parsable_content", attempt=attempt)
+                        self.logger.warning("llm.no_parsable_content", attempt=attempt, content_preview=cont_content[:100])
                         # Try a repair attempt with more aggressive parsing
                         new_lines = self._attempt_repair_parse(cont_content, next_line)
                         if not new_lines:
-                            break
+                            consecutive_failures += 1
+                            self.logger.warning("llm.repair_parse_failed", consecutive_failures=consecutive_failures)
+                            
+                            # If we've tried parsing multiple times without success, append raw content
+                            if consecutive_failures >= max_consecutive_failures:
+                                # Add a marker line to indicate parsing failure
+                                marker = f"----- CONTINUATION PARSING FAILED (ATTEMPT {attempt}) -----"
+                                raw_fallback = [(next_line, 0, marker)]
+                                
+                                # Process raw content line by line
+                                raw_lines = cont_content.splitlines()
+                                if raw_lines:
+                                    for i, line in enumerate(raw_lines):
+                                        indent = len(line) - len(line.lstrip())
+                                        raw_fallback.append((next_line + i + 1, indent, line))
+                                else:
+                                    # No line breaks, just add the whole content
+                                    raw_fallback.append((next_line + 1, 0, cont_content))
+                                    
+                                self.logger.warning("llm.using_raw_content_fallback", raw_lines_count=len(raw_lines) if raw_lines else 1)
+                                accumulated_lines.extend(raw_fallback)
+                                next_line = len(accumulated_lines) + 1
+                                consecutive_failures = 0  # Reset after applying fallback
+                            else:
+                                # Try again with a simplified prompt next time
+                                continue
+                        else:
+                            consecutive_failures = 0  # Reset on successful repair parse
+                    else:
+                        consecutive_failures = 0  # Reset on successful parse
                     
                     # Update accumulated lines
                     accumulated_lines.extend(new_lines)
@@ -124,7 +155,7 @@ class ContinuationHandler:
                     
                     if finish_reason != 'length':
                         self.logger.info("llm.continuation_complete", 
-                                       finish_reason=finish_reason)
+                                    finish_reason=finish_reason)
                         break
                     
                     # Update next line number for next continuation
@@ -138,19 +169,19 @@ class ContinuationHandler:
                     
                     if rate_limit_retries > self.rate_limit_max_retries:
                         self.logger.error("llm.rate_limit_max_retries_exceeded", 
-                                      retry_count=rate_limit_retries,
-                                      error=error_msg[:200])
+                                    retry_count=rate_limit_retries,
+                                    error=error_msg[:200])
                         raise
-                                  
+                                
                     # Calculate backoff with jitter
                     jitter = 0.1 * rate_limit_backoff * (0.5 - random.random())
                     current_backoff = min(rate_limit_backoff + jitter, self.rate_limit_max_backoff)
                     
                     self.logger.warning("llm.rate_limit_backoff", 
-                                     attempt=attempt,
-                                     retry_count=rate_limit_retries,
-                                     backoff_seconds=current_backoff,
-                                     error=error_msg[:200])
+                                    attempt=attempt,
+                                    retry_count=rate_limit_retries,
+                                    backoff_seconds=current_backoff,
+                                    error=error_msg[:200])
                     
                     # Apply exponential backoff with base 2
                     time.sleep(current_backoff)
@@ -159,6 +190,9 @@ class ContinuationHandler:
                 
                 except Exception as e:
                     self.logger.error("llm.continuation_failed", error=str(e))
+                    # Add marker for error and continue with what we have
+                    marker = f"----- CONTINUATION ERROR: {str(e)[:100]} -----"
+                    accumulated_lines.append((next_line, 0, marker))
                     break
             
             # Convert accumulated lines back to raw content
@@ -177,8 +211,8 @@ class ContinuationHandler:
             error_type = type(e).__name__
             
             self.logger.error("llm.continuation_failed", 
-                           error=error_msg, 
-                           error_type=error_type)
+                        error=error_msg, 
+                        error_type=error_type)
             
             raise
         
@@ -271,89 +305,154 @@ Your continuation starting from line {next_line}:
 """
         return prompt
         
+
     def _parse_json_content(self, content, expected_start_line):
-        """Parse content with line numbers and indentation from JSON format"""
+        """Parse content with line numbers and indentation from JSON format.
+        With enhanced tolerance for formatting variations and line number flexibility."""
         numbered_lines = []
-        
         try:
-            # Extract JSON from response content
+            # First, try to extract JSON enclosed in a markdown code block.
             json_match = re.search(r'```(?:json)?\s*([\s\S]+?)\s*```', content)
             if json_match:
                 json_content = json_match.group(1)
             else:
-                # Try to find JSON object directly
+                # Try to locate a JSON object directly.
                 json_match = re.search(r'(\{\s*"lines"\s*:\s*\[[\s\S]+?\]\s*\})', content)
                 if json_match:
                     json_content = json_match.group(1)
                 else:
-                    # Fall back to using the entire content
+                    # If nothing is found, use the raw content.
                     json_content = content
             
-            # Parse the JSON
+            # Attempt to parse the JSON.
             try:
                 data = json.loads(json_content)
             except json.JSONDecodeError:
-                # Try again with a more aggressive approach to find JSON
+                # Try to find a JSON array and wrap it.
                 array_match = re.search(r'\[\s*\{\s*"line"[\s\S]+?\}\s*\]', content)
                 if array_match:
-                    # Add wrapping to make it valid JSON
                     array_json = '{"lines": ' + array_match.group(0) + '}'
                     try:
                         data = json.loads(array_json)
                     except json.JSONDecodeError:
-                        # Individual line objects
-                        line_objects = self._extract_line_objects(content) 
+                        # As a last resort, try to extract line objects.
+                        line_objects = self._extract_line_objects(content)
                         if line_objects:
                             data = {"lines": line_objects}
                         else:
-                            return []
+                            data = {}
                 else:
-                    return []
+                    data = {}
             
-            # Get the lines array
+            # Retrieve the "lines" array.
             lines = data.get("lines", [])
             if not lines and isinstance(data, list):
-                # Handle case where the array is the top-level element
                 lines = data
             
-            # Process each line
+            # Process each line object.
+            min_line_num = float('inf')
             for line_data in lines:
                 try:
                     line_num = line_data.get("line")
                     indent = line_data.get("indent", 0)
-                    content = line_data.get("content", "")
+                    line_text = line_data.get("content", "")
                     
-                    # Only add if it's the expected line number or after
-                    if line_num >= expected_start_line:
-                        numbered_lines.append((line_num, indent, content))
+                    # Keep track of lowest line number
+                    if line_num and line_num < min_line_num:
+                        min_line_num = line_num
+                        
+                    numbered_lines.append((line_num, indent, line_text))
                 except (TypeError, AttributeError):
-                    # Skip invalid line data
                     continue
             
-            # Sort by line number
-            numbered_lines.sort(key=lambda x: x[0])
-            return numbered_lines
-        
+            # If we found lines but they don't start at expected_start_line,
+            # adjust them to maintain continuity
+            if numbered_lines and min_line_num != float('inf') and min_line_num != expected_start_line:
+                self.logger.warning("llm.line_number_mismatch", 
+                                expected=expected_start_line, 
+                                actual=min_line_num)
+                
+                # Adjust line numbers to match expected sequence
+                offset = expected_start_line - min_line_num
+                adjusted_lines = []
+                for line_num, indent, text in numbered_lines:
+                    adjusted_line_num = line_num + offset
+                    adjusted_lines.append((adjusted_line_num, indent, text))
+                numbered_lines = adjusted_lines
+            
+            # Sort and deduplicate based on line numbers.
+            deduped_lines = []
+            seen_line_nums = set()
+            for ln in sorted(numbered_lines, key=lambda x: x[0] if x[0] is not None else 0):
+                if ln[0] not in seen_line_nums:
+                    deduped_lines.append(ln)
+                    seen_line_nums.add(ln[0])
+            
+            # If no structured lines were parsed, fall back to appending the raw content.
+            if not deduped_lines:
+                self.logger.warning("llm.no_parsed_lines", fallback="appending raw content")
+                # Process raw content line by line instead of as one block
+                raw_lines = content.splitlines()
+                if raw_lines:
+                    for i, line in enumerate(raw_lines):
+                        indent = len(line) - len(line.lstrip())
+                        deduped_lines.append((expected_start_line + i, indent, line))
+                else:
+                    deduped_lines = [(expected_start_line, 0, content)]
+            
+            return deduped_lines
         except Exception as e:
             self.logger.error("llm.json_parse_error", error=str(e))
-            return []
-    
+            # More robust fallback - process the raw content line by line
+            raw_lines = content.splitlines()
+            result = []
+            if raw_lines:
+                for i, line in enumerate(raw_lines):
+                    indent = len(line) - len(line.lstrip())
+                    result.append((expected_start_line + i, indent, line))
+            else:
+                result = [(expected_start_line, 0, content)]
+            return result
+
+
     def _extract_line_objects(self, content):
-        """Extract individual line objects from content using regex"""
+        """Extract individual line objects from content using regex with enhanced pattern matching"""
         line_objects = []
-        # Match pattern for individual line objects
-        pattern = r'\{\s*"line"\s*:\s*(\d+)\s*,\s*"indent"\s*:\s*(\d+)\s*,\s*"content"\s*:\s*"([^"]*)"\s*\}'
-        matches = re.finditer(pattern, content)
         
+        # Enhanced pattern matching for flexibility
+        # Match both quoted and unquoted values for line and indent
+        # Allow for variations in spacing and formatting
+        pattern = r'\{\s*"line"\s*:\s*(\d+)[^}]*"indent"\s*:\s*(\d+)[^}]*"content"\s*:\s*"([^"]*)"'
+        alt_pattern = r'\{\s*line\s*:\s*(\d+)[^}]*indent\s*:\s*(\d+)[^}]*content\s*:\s*"([^"]*)"'
+        
+        # Try both patterns
+        for p in [pattern, alt_pattern]:
+            matches = re.finditer(p, content)
+            for match in matches:
+                try:
+                    line_num = int(match.group(1))
+                    indent = int(match.group(2))
+                    content = match.group(3)
+                    
+                    # Unescape any escaped quotes or slashes
+                    content = content.replace('\\"', '"').replace('\\\\', '\\')
+                    
+                    line_objects.append({
+                        "line": line_num,
+                        "indent": indent,
+                        "content": content
+                    })
+                except (ValueError, IndexError):
+                    continue
+        
+        # Look for alternative formats like line=number instead of "line": number
+        alt_format = r'line\s*=\s*(\d+)[^,]*indent\s*=\s*(\d+)[^,]*content\s*=\s*"([^"]*)"'
+        matches = re.finditer(alt_format, content)
         for match in matches:
             try:
                 line_num = int(match.group(1))
                 indent = int(match.group(2))
                 content = match.group(3)
-                
-                # Unescape any escaped quotes or slashes
-                content = content.replace('\\"', '"').replace('\\\\', '\\')
-                
                 line_objects.append({
                     "line": line_num,
                     "indent": indent,
@@ -365,55 +464,95 @@ Your continuation starting from line {next_line}:
         return line_objects
     
     def _attempt_repair_parse(self, content, expected_start_line):
-        """More aggressive parsing attempt for broken JSON"""
-        # Try to manually extract line number, indent, and content
+        """Attempt a more flexible repair parse with enhanced pattern recognition"""
         numbered_lines = []
         
-        # Look for patterns like "line": 42, "indent": 4, "content": "some content"
-        line_pattern = r'"line"\s*:\s*(\d+)[^\d].*?"indent"\s*:\s*(\d+)[^}]*"content"\s*:\s*"([^"]*)"'
-        matches = re.finditer(line_pattern, content)
+        # First try to find JSON-like line objects with flexible patterns
+        line_patterns = [
+            # Standard JSON format with quotes
+            r'"line"\s*:\s*(\d+)[^,}]*"indent"\s*:\s*(\d+)[^,}]*"content"\s*:\s*"([^"]*)"',
+            # Alternative format without quotes for keys
+            r'line\s*:\s*(\d+)[^,}]*indent\s*:\s*(\d+)[^,}]*content\s*:\s*"([^"]*)"',
+            # Format with equal signs
+            r'line\s*=\s*(\d+)[^,}]*indent\s*=\s*(\d+)[^,}]*content\s*=\s*"([^"]*)"',
+            # Format with extra text around it
+            r'line\s*(?:number|#)?\s*(?::|=)\s*(\d+)[^,}]*indent\s*(?::|=)\s*(\d+)[^,}]*content\s*(?::|=)\s*"([^"]*)"',
+        ]
         
-        for match in matches:
-            try:
-                line_num = int(match.group(1))
-                indent = int(match.group(2))
-                line_content = match.group(3)
-                
-                # Only add if it's the expected line number or after
-                if line_num >= expected_start_line:
-                    numbered_lines.append((line_num, indent, line_content))
-            except (ValueError, IndexError):
-                continue
+        for pattern in line_patterns:
+            matches = re.finditer(pattern, content)
+            for match in matches:
+                try:
+                    line_num = int(match.group(1))
+                    indent = int(match.group(2))
+                    line_text = match.group(3)
+                    numbered_lines.append((line_num, indent, line_text))
+                except (ValueError, IndexError):
+                    continue
         
-        # If we found any lines, sort them and return
-        if numbered_lines:
-            numbered_lines.sort(key=lambda x: x[0])
-            self.logger.info("llm.repair_parse_successful", lines_found=len(numbered_lines))
-            return numbered_lines
-        
-        # Last resort: try to extract any numbered lines from the text
-        line_pattern = r'(?:line|Line)?\s*(\d+)[^\n]*:\s*([^\n]*)'
-        matches = re.finditer(line_pattern, content)
-        
-        for match in matches:
-            try:
-                line_num = int(match.group(1))
-                line_content = match.group(2).strip()
-                
-                # Use a default indent of 0
-                if line_num >= expected_start_line:
-                    indent = len(line_content) - len(line_content.lstrip())
-                    numbered_lines.append((line_num, indent, line_content))
-            except (ValueError, IndexError):
-                continue
-                
-        # Sort any found lines
-        if numbered_lines:
-            numbered_lines.sort(key=lambda x: x[0])
-            self.logger.info("llm.fallback_parse_successful", lines_found=len(numbered_lines))
+        # Try looser patterns like numbered lists or prefixed lines
+        if not numbered_lines:
+            # Look for line numbers at the beginning of lines (e.g., "Line 5: content")
+            looser_patterns = [
+                r'(?:line|Line)?\s*(\d+)[^\n]*:\s*([^\n]*)',  # Line 5: content
+                r'(\d+)[.:\)]\s*([^\n]*)',                    # 5. content or 5: content
+                r'L(\d+):\s*([^\n]*)',                        # L5: content
+            ]
             
-        return numbered_lines
+            for pattern in looser_patterns:
+                matches = re.finditer(pattern, content)
+                for match in matches:
+                    try:
+                        line_num = int(match.group(1))
+                        line_text = match.group(2).strip()
+                        indent = len(line_text) - len(line_text.lstrip())
+                        numbered_lines.append((line_num, indent, line_text))
+                    except (ValueError, IndexError):
+                        continue
         
+        # If we found lines, sort and deduplicate them
+        if numbered_lines:
+            numbered_lines.sort(key=lambda x: x[0])
+            self.logger.info("llm.repair_parse_successful", 
+                        lines_found=len(numbered_lines),
+                        pattern_match="custom_patterns")
+            
+            # Check if we need to adjust line numbers for continuity
+            if numbered_lines and numbered_lines[0][0] != expected_start_line:
+                offset = expected_start_line - numbered_lines[0][0]
+                adjusted_lines = [(ln[0] + offset, ln[1], ln[2]) for ln in numbered_lines]
+                numbered_lines = adjusted_lines
+                self.logger.info("llm.adjusted_line_numbers", offset=offset)
+            
+            # Deduplicate
+            deduped_lines = []
+            seen_line_nums = set()
+            for ln in numbered_lines:
+                if ln[0] not in seen_line_nums:
+                    deduped_lines.append(ln)
+                    seen_line_nums.add(ln[0])
+            return deduped_lines
+        
+        # If everything else failed, parse the content line by line
+        content_lines = content.splitlines()
+        if content_lines:
+            self.logger.warning("llm.using_raw_lines_fallback", 
+                            lines_count=len(content_lines))
+            
+            # Add marker to indicate we're using raw content
+            result = [(expected_start_line, 0, "----- CONTINUATION PARSING FALLBACK -----")]
+            
+            # Add each raw line with appropriate line numbers
+            for i, line in enumerate(content_lines):
+                indent = len(line) - len(line.lstrip())
+                result.append((expected_start_line + i + 1, indent, line))
+            return result
+            
+        # Last resort - return raw content as a single line 
+        self.logger.warning("llm.fallback_to_raw_content")
+        return [(expected_start_line, 0, "----- RAW CONTINUATION CONTENT -----"), 
+                (expected_start_line + 1, 0, content)]    
+
     def _numbered_lines_to_content(self, numbered_lines):
         """Convert numbered lines back to raw content with proper indentation"""
         # Sort by line number to ensure correct order

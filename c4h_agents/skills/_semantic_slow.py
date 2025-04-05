@@ -107,10 +107,9 @@ class SlowItemIterator:
                             attempt=self._current_attempt)
                 return next(self)  # Retry this position
 
-            # Handle completion signal
-            if isinstance(content, str) and content.strip().upper() == "NO_MORE_ITEMS":
-                logger.info("slow_iterator.no_more_items", 
-                        position=self._position)
+            # Handle completion signal - CHANGE THIS LINE ONLY
+            if isinstance(content, str) and content.strip().upper().startswith("NO_MORE_ITEMS"):
+                logger.info("slow_iterator.no_more_items", position=self._position)
                 self._exhausted = True
                 raise StopIteration
 
