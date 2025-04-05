@@ -5,13 +5,16 @@ Path: c4h_agents/agents/continuation_parsing.py
 
 import json
 import re
-from typing import List, Tuple, Any
+from typing import List, Tuple, Any, Optional
 from c4h_agents.utils.logging import get_logger
 
 logger = get_logger()
 
 def get_content_sample(content: str, line_number: int, context_lines: int = 5) -> str:
     """Extract sample lines around a specific line number"""
+    if content is None:
+        return "No content available"
+        
     lines = content.splitlines()
     start = max(0, line_number - context_lines - 1)
     end = min(len(lines), line_number + context_lines)
@@ -25,6 +28,9 @@ def get_content_sample(content: str, line_number: int, context_lines: int = 5) -
 
 def format_with_line_numbers_and_indentation(content: str) -> List[Tuple[int, int, str]]:
     """Format content with line numbers and indentation level tracking"""
+    if content is None:
+        return []
+        
     lines = content.splitlines()
     result = []
     
@@ -37,6 +43,9 @@ def format_with_line_numbers_and_indentation(content: str) -> List[Tuple[int, in
 
 def create_line_json(numbered_lines: List[Tuple[int, int, str]], max_context_lines: int = 30) -> str:
     """Create JSON array with line numbers and indentation"""
+    if not numbered_lines:
+        return json.dumps({"lines": []})
+        
     # Take last N lines for context
     context_lines = numbered_lines[-min(max_context_lines, len(numbered_lines)):]
     
@@ -54,6 +63,10 @@ def parse_json_content(content: str, expected_start_line: int, logger_instance =
     """Parse content with line numbers and indentation from JSON format"""
     log = logger_instance or logger
     numbered_lines = []
+    
+    if content is None:
+        log.error("llm.json_parse_error", error="Content is None")
+        return []
     
     try:
         # Extract JSON from response content
@@ -120,6 +133,9 @@ def parse_json_content(content: str, expected_start_line: int, logger_instance =
 
 def extract_line_objects(content: str) -> List[dict]:
     """Extract individual line objects from content using regex"""
+    if content is None:
+        return []
+        
     line_objects = []
     # Match pattern for individual line objects
     pattern = r'\{\s*"line"\s*:\s*(\d+)\s*,\s*"indent"\s*:\s*(\d+)\s*,\s*"content"\s*:\s*"([^"]*)"\s*\}'
@@ -147,6 +163,11 @@ def extract_line_objects(content: str) -> List[dict]:
 def attempt_repair_parse(content: str, expected_start_line: int, logger_instance = None) -> List[Tuple[int, int, str]]:
     """More aggressive parsing attempt for broken JSON"""
     log = logger_instance or logger
+    
+    if content is None:
+        log.error("llm.repair_parse_failed", error="Content is None")
+        return []
+        
     # Try to manually extract line number, indent, and content
     numbered_lines = []
     
@@ -197,6 +218,10 @@ def attempt_repair_parse(content: str, expected_start_line: int, logger_instance
 
 def numbered_lines_to_content(numbered_lines: List[Tuple[int, int, str]]) -> str:
     """Convert numbered lines back to raw content with proper indentation"""
+    # Handle empty input case
+    if not numbered_lines:
+        return ""
+        
     # Sort by line number to ensure correct order
     sorted_lines = sorted(numbered_lines, key=lambda x: x[0])
     

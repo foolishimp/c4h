@@ -126,17 +126,28 @@ class SolutionDesigner(BaseAgent):
         try:
             logger.info("agent.processing", context_keys=list(context.keys()))
             
-            # Let BaseAgent handle the LLM interaction
-            response = super().process(context)
+            # Format the request directly
+            formatted_request = self._format_request(context)
             
-            # Log raw response for debugging
-            if self._should_log(LogDetail.DEBUG):
-                logger.debug("solution_designer.llm_response",
-                            raw_response=response.data.get("raw_output"),
-                            response_content=response.data.get("response"))
-
-            # Process LLM response using standard pattern
-            return response
+            # Get system message
+            system_message = self._get_system_message()
+            
+            # Create messages
+            messages = [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": formatted_request}
+            ]
+            
+            # Get completion
+            content, raw_response = self._get_completion_with_continuation(messages)
+            
+            # Process using our custom response processor 
+            processed_data = self._process_response(content, raw_response)
+            
+            return AgentResponse(
+                success=True,
+                data=processed_data
+            )
 
         except Exception as e:
             logger.error("solution_designer.process_failed", error=str(e))

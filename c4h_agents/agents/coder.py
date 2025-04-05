@@ -51,21 +51,56 @@ class Coder(BaseAgent):
         self.operation_metrics = CoderMetrics()
         logger.info("coder.initialized", backup_path=str(backup_path))
 
+    def _safely_process_content(self, content: Any) -> Any:
+        """Process content to ensure serializable format"""
+        # Handle ModelResponse objects
+        if hasattr(content, "choices") and hasattr(content, "model"):
+            try:
+                # Extract just the content from ModelResponse
+                return content.choices[0].message.content
+            except (AttributeError, IndexError):
+                # Fallback to string representation
+                return str(content)
+        
+        # Handle dict with potentially non-serializable values
+        if isinstance(content, dict):
+            result = {}
+            for k, v in content.items():
+                # Special handling for known problematic fields
+                if k in ["raw_output", "raw_response"]:
+                    # Handle raw response objects
+                    if hasattr(v, "choices") and hasattr(v, "model"):
+                        result[k] = str(v)
+                    else:
+                        result[k] = v
+                else:
+                    result[k] = v
+            return result
+            
+        # Default case - return as is
+        return content
+
     def process(self, context: Dict[str, Any]) -> AgentResponse:
         """Process code changes using semantic extraction"""
         logger.info("coder.process_start", context_keys=list(context.keys()))
         logger.debug("coder.input_data", data=context)
 
         try:
-            # Get content from input
+            # Get content from input, ensuring it's serializable
             data = self._get_data(context)
+            
+            # Safely process input data to handle ModelResponse objects
+            if isinstance(data, dict) and 'input_data' in data:
+                input_data = self._safely_process_content(data['input_data'])
+                data['input_data'] = input_data
+            
             content = self._get_llm_content(data.get('input_data', {}))
             
+            # Process all changes string content through the iterator
+            input_data = {'content': content}
+            
             # Get changes from iterator 
-            iterator_result = self.iterator.process({
-                'content': content,
-                'input_data': data.get('input_data', {})
-            })
+            iterator_result = self.iterator.process(input_data)
 
             if not iterator_result.success:
                 logger.error("coder.iterator_failed", error=iterator_result.error)
@@ -77,10 +112,20 @@ class Coder(BaseAgent):
             
             # Process each change
             results = []
-            for change in self.iterator:
+            changes = iterator_result.data.get('results', [])
+            
+            if not changes:
+                logger.warning("coder.no_changes_found")
+                return AgentResponse(
+                    success=False,
+                    data={"metrics": vars(self.operation_metrics)},
+                    error="No valid changes found to process"
+                )
+            
+            for change in changes:
                 logger.debug("coder.processing_change", 
-                            type=type(change).__name__,  # See what type we're dealing with
-                            change=repr(change) )              # Original logging
+                           type=type(change).__name__,
+                           change=repr(change))
                 result = self.asset_manager.process_action(change)
                 
                 if result.success:

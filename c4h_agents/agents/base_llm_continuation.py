@@ -77,6 +77,12 @@ class ContinuationHandler:
             
             # Process initial response
             content = self._get_content_from_response(response)
+            if content is None:
+                self.logger.error("llm.empty_content_from_response", 
+                            response_type=type(response).__name__)
+                # Return empty content but keep the response for metadata
+                return "", response
+                
             final_response = response
             
             # Log truncation detection
@@ -124,6 +130,13 @@ class ContinuationHandler:
                     
                     # Extract content from response
                     cont_content = self._get_content_from_response(response)
+                    
+                    # Check for empty content
+                    if cont_content is None:
+                        self.logger.error("llm.empty_continuation_content", 
+                                    attempt=attempt,
+                                    next_line=next_line)
+                        break
                     
                     # Log continuation content sample
                     cont_lines = cont_content.splitlines()
@@ -304,8 +317,24 @@ class ContinuationHandler:
             raise
         
     def _get_content_from_response(self, response):
-        """Extract content from LLM response"""
-        if hasattr(response, 'choices') and response.choices:
-            if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
-                return response.choices[0].message.content
-        return ""
+        """Extract content from LLM response with null safety checks"""
+        if response is None:
+            return None
+            
+        if not hasattr(response, 'choices'):
+            return None
+            
+        if not response.choices:
+            return None
+            
+        if not hasattr(response.choices[0], 'message'):
+            return None
+            
+        if not hasattr(response.choices[0].message, 'content'):
+            return None
+            
+        content = response.choices[0].message.content
+        if content is None:
+            return ""  # Return empty string instead of None for content
+            
+        return content

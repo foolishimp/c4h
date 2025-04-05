@@ -71,12 +71,71 @@ class SemanticIterator(BaseAgent):
         """Get agent name for config lookup"""
         return "semantic_iterator"
 
+    def _serialize_content(self, content: Any) -> Any:
+        """Safely serialize content for processing"""
+        # Handle ModelResponse and similar objects
+        if hasattr(content, "choices") and hasattr(content.choices[0], "message"):
+            try:
+                # Extract the actual content from ModelResponse
+                return content.choices[0].message.content
+            except (AttributeError, IndexError):
+                logger.warning("semantic_iterator.content_extraction_failed", 
+                             error="Failed to extract content from response")
+                return str(content)
+        
+        # Handle raw response objects
+        if hasattr(content, "model_dump_json"):
+            try:
+                return json.loads(content.model_dump_json())
+            except Exception as e:
+                logger.warning("semantic_iterator.model_dump_failed", error=str(e))
+                return str(content)
+                
+        # If it's a dict, we need to check if it contains any non-serializable objects
+        if isinstance(content, dict):
+            try:
+                # Test if the content is JSON serializable
+                sanitized = {}
+                for k, v in content.items():
+                    if k == "raw_output" or k == "raw_response":
+                        if hasattr(v, "model_dump"):
+                            sanitized[k] = v.model_dump()
+                        else:
+                            # For other non-serializable objects, convert to string
+                            sanitized[k] = str(v)
+                    else:
+                        sanitized[k] = v
+                return sanitized
+            except (TypeError, ValueError) as e:
+                # If dict contains non-serializable objects, convert to string
+                logger.warning("semantic_iterator.dict_serialization_failed", error=str(e))
+                return str(content)
+                
+        # Default case, just return the content
+        return content
+
     def process(self, context: Dict[str, Any]) -> AgentResponse:
         """Process extraction request following standard agent interface"""
         try:
-            content = context.get('input_data', context)
+            # Handle potential ModelResponse objects or other non-serializable content
+            if "input_data" in context and hasattr(context["input_data"], "get"):
+                input_data = context["input_data"]
+                # Special handling for response and raw_output
+                for key in ["response", "raw_output", "raw_content"]:
+                    if key in input_data:
+                        input_data[key] = self._serialize_content(input_data[key])
+                content = input_data
+            else:
+                content = self._serialize_content(context.get('input_data', context))
+                
+            # Convert to string if it's a dict for proper processing
             if isinstance(content, dict):
-                content = json.dumps(content, indent=2)
+                try:
+                    content = json.dumps(content, default=str)
+                except (TypeError, ValueError) as e:
+                    logger.warning("semantic_iterator.json_serialization_failed", error=str(e))
+                    content = str(content)
+                    
             instruction = context.get('instruction', '')
             format_hint = context.get('format', 'json')
 
@@ -99,6 +158,13 @@ class SemanticIterator(BaseAgent):
                     results.append(item)
             except StopIteration:
                 pass
+            except Exception as e:
+                logger.error("semantic_iterator.extraction_failed", error=str(e))
+                return AgentResponse(
+                    success=False,
+                    data={},
+                    error=f"Extraction failed: {str(e)}"
+                )
             
             if not results:
                 return AgentResponse(
@@ -169,7 +235,7 @@ class SemanticIterator(BaseAgent):
                         position=self._state.position)
             raise
         except Exception as e:
-            logger.error("iterator.error",
+            logger.error("iterator.error", 
                         error=str(e),
                         mode=self._state.mode,
                         position=self._state.position)
@@ -181,6 +247,9 @@ class SemanticIterator(BaseAgent):
         Sets up iterator state using configuration.
         """
         logger.warning("semantic_iterator.using_deprecated_configure")
+        
+        # Safely serialize the content
+        content = self._serialize_content(content)
         
         self._state = ExtractorState(
             mode=self._state.mode,

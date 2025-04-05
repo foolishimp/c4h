@@ -221,7 +221,7 @@ class BaseLineage:
             return {k: self._serialize_value(v) for k, v in value.items()}
         
         # Handle LLM response objects - check for common response structure
-        if hasattr(value, 'choices') and value.choices:
+        if hasattr(value, "choices") and hasattr(value, "model"):
             try:
                 # Standard LLM response format
                 if hasattr(value.choices[0], 'message') and hasattr(value.choices[0].message, 'content'):
@@ -244,11 +244,13 @@ class BaseLineage:
                 elif hasattr(value.choices[0], 'delta') and hasattr(value.choices[0].delta, 'content'):
                     content = value.choices[0].delta.content
                     return {"content": content}
-            except (AttributeError, IndexError):
-                pass
+            except (AttributeError, IndexError, TypeError) as e:
+                # Log error and fallback to string representation
+                logger.warning("lineage.response_serialization_failed", error=str(e))
+                return str(value)
         
         # Handle StreamedResponse (from BaseLLM._get_completion_with_continuation)
-        if "StreamedResponse" in str(type(value)):
+        if "StreamedResponse" in str(type(value)) or "ModelResponse" in str(type(value)):
             try:
                 if hasattr(value, 'choices') and value.choices:
                     return {"content": value.choices[0].message.content}
@@ -263,9 +265,18 @@ class BaseLineage:
                 "total_tokens": getattr(value, 'total_tokens', 0)
             }
         
-        # Handle custom objects with to_dict method
+        # Handle any object with to_dict or model_dump method
         if hasattr(value, 'to_dict'):
-            return value.to_dict()
+            try:
+                return value.to_dict()
+            except Exception:
+                pass
+                
+        if hasattr(value, 'model_dump'):
+            try:
+                return value.model_dump()
+            except Exception:
+                pass
         
         # Fall back to string representation with object type indicator
         return f"{str(value)} (type: {type(value).__name__})"

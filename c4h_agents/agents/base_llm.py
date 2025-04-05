@@ -191,12 +191,29 @@ class BaseLLM:
             logger.error("litellm.setup_failed", error=str(e))
             # Don't re-raise - litellm setup failure shouldn't be fatal
 
+    
     def _get_llm_content(self, response: Any) -> Any:
         """Extract content from LLM response with robust error handling for different response formats"""
         try:
-            # Handle different response types
+            # Handle None case explicitly
+            if response is None:
+                return ""
+                
+            # Check for ModelResponse by type name as well as structure
+            response_type = type(response).__name__
+            if "ModelResponse" in response_type or "StreamedResponse" in response_type:
+                try:
+                    # Try to extract content using known ModelResponse structure
+                    return response.choices[0].message.content
+                except (AttributeError, IndexError, TypeError) as e:
+                    logger.warning("content.modelresponse_extraction_failed", 
+                                error=str(e),
+                                response_type=response_type)
+                    # Fall through to other extraction methods
+            
+            # Handle different response types by structure
             if hasattr(response, 'choices') and response.choices:
-                # Standard response object
+                # Standard response object 
                 if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
                     content = response.choices[0].message.content
                     if self._should_log(LogDetail.DEBUG):
@@ -213,9 +230,23 @@ class BaseLLM:
             if isinstance(response, str):
                 return response
                 
-            # If response is already processed (dict with 'response' key)
-            if isinstance(response, dict) and 'response' in response:
-                return response['response']
+            # Handle dictionary with content fields - check multiple common field names
+            if isinstance(response, dict):
+                for field in ['response', 'content', 'text', 'output', 'result']:
+                    if field in response and isinstance(response[field], str):
+                        return response[field]
+                        
+                # If dict has 'choices' structure, handle it like a response object
+                if 'choices' in response and response['choices'] and isinstance(response['choices'], list):
+                    choice = response['choices'][0]
+                    if isinstance(choice, dict):
+                        # Check for message.content structure
+                        if 'message' in choice and isinstance(choice['message'], dict):
+                            if 'content' in choice['message']:
+                                return choice['message']['content']
+                        # Check for direct content field
+                        elif 'content' in choice:
+                            return choice['content']
                 
             # Last resort fallback - convert to string
             result = str(response)

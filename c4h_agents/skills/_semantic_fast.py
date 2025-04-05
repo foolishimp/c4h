@@ -71,9 +71,33 @@ class FastExtractor(BaseAgent):
             format=context['config'].format
         )
 
+    def _safely_serialize_content(self, content: Any) -> Any:
+        """Safely convert ModelResponse and other objects to serializable form"""
+        # If it's a ModelResponse object, extract the actual content
+        if hasattr(content, "choices") and hasattr(content.choices[0], "message"):
+            try:
+                return content.choices[0].message.content
+            except (AttributeError, IndexError):
+                logger.warning("fast_extractor.content_extraction_failed")
+                return str(content)
+        
+        # If it's a dictionary with raw_output or raw_response
+        if isinstance(content, dict):
+            for key in ["raw_output", "raw_response"]:
+                if key in content and not isinstance(content[key], (str, int, float, bool, list, dict, type(None))):
+                    # Convert non-serializable objects to strings
+                    content[key] = str(content[key])
+            return content
+        
+        # Default case - return as is
+        return content
+
     def create_iterator(self, content: Any, config: ExtractConfig) -> FastItemIterator:
         """Create iterator for fast extraction - synchronous interface"""
         try:
+            # Safely handle potential ModelResponse objects
+            content = self._safely_serialize_content(content)
+            
             logger.debug("fast_extractor.creating_iterator",
                         content_type=type(content).__name__)
                             
