@@ -142,13 +142,17 @@ class SolutionDesigner(BaseAgent):
             logger.error("solution_designer.process_failed", error=str(e))
             return AgentResponse(success=False, data={}, error=str(e))
 
-    def _process_llm_response(self, content: str, raw_response: Any) -> Dict[str, Any]:
+    def _process_response(self, content: str, raw_response: Any) -> Dict[str, Any]:
         """Process LLM response into standard format"""
         try:
             # Extract content using standard helper
             content = self._get_llm_content(content)
             if not content:
                 raise ValueError("No content in LLM response")
+                
+            # Log content length to help debug continuation issues
+            self.logger.info("solution_designer.response_received", 
+                        content_length=len(content) if content else 0)
 
             return {
                 "changes": content,
@@ -157,13 +161,18 @@ class SolutionDesigner(BaseAgent):
                 "response": content,
                 "timestamp": datetime.utcnow().isoformat()
             }
-
         except Exception as e:
-            logger.error("solution_designer.response_processing_failed", error=str(e))
+            # Continue processing even if there's an error
+            self.logger.error("solution_designer.response_processing_failed", 
+                            error=str(e), 
+                            content_type=type(content).__name__,
+                            content_length=len(str(content)) if content else 0)
+            
+            # Return what we have, even if processing failed
             return {
                 "error": str(e),
                 "raw_output": raw_response,
-                "raw_content": content,
+                "raw_content": str(content),
                 "timestamp": datetime.utcnow().isoformat()
             }
 
