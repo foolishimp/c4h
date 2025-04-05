@@ -63,12 +63,13 @@ class SlowItemIterator:
                     max_attempts=self._max_attempts)
 
         if self._exhausted:
-            logger.debug("slow_iterator.exhausted")
+            logger.debug("slow_iterator.already_exhausted")
             raise StopIteration
 
         if self._position >= self._max_attempts:
             logger.warning("slow_iterator.max_attempts_reached",
                         max_attempts=self._max_attempts)
+            self._exhausted = True
             raise StopIteration
 
         try:
@@ -81,8 +82,8 @@ class SlowItemIterator:
 
             if not agent_response.success:
                 logger.error("slow_iterator.extraction_failed", 
-                            error=agent_response.error,
-                            position=self._position)
+                        error=agent_response.error,
+                        position=self._position)
                 self._exhausted = True
                 raise StopIteration
 
@@ -107,9 +108,10 @@ class SlowItemIterator:
                             attempt=self._current_attempt)
                 return next(self)  # Retry this position
 
-            # Handle completion signal - CHANGE THIS LINE ONLY
+            # Fix: Check for NO_MORE_ITEMS at the start of the response string
             if isinstance(content, str) and content.strip().upper().startswith("NO_MORE_ITEMS"):
-                logger.info("slow_iterator.no_more_items", position=self._position)
+                logger.info("slow_iterator.no_more_items", 
+                        position=self._position)
                 self._exhausted = True
                 raise StopIteration
 
