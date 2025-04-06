@@ -60,69 +60,67 @@ class FastExtractor(BaseAgent):
         return "semantic_fast_extractor"
 
     def _format_request(self, context: Dict[str, Any]) -> str:
-        """
-        Format extraction request for fast mode using config template.
-        Revised to extract core 'response' content if the input context['content']
-        appears to be the full structured data from a previous AgentResponse.
-        """
+        """Format extraction request for fast mode with improved content extraction"""
         # --- Essential Setup ---
         if not context.get('config'):
             logger.error("fast_extractor.missing_config")
             raise ValueError("Extract config required")
 
-        # Get the prompt template defined in the configuration for this skill
+        # Get the prompt template
         extract_template = self._get_prompt('extract')
 
         # --- Extract Core Content ---
-        # Get the raw input content passed to this skill
         raw_input_content = context.get('content', '')
         content_str_for_prompt = ""
 
-        # Check if the input content is a dictionary potentially containing
-        # the structured output (like AgentResponse.data) from a previous agent.
-        if isinstance(raw_input_content, dict) and "response" in raw_input_content:
-            # Extract only the core 'response' field's value (B_core)
-            core_content = raw_input_content.get("response", "")
-            if isinstance(core_content, str):
-                content_str_for_prompt = core_content
-                logger.debug("fast_extractor.extracted_core_response",
-                             input_keys=list(raw_input_content.keys()))
+        # Extract essential content with more aggressive pattern matching
+        if isinstance(raw_input_content, dict):
+            # Try to extract JSON array directly using regex pattern matching
+            content_to_search = json.dumps(raw_input_content, indent=2)
+            
+            # Look for a JSON array pattern first
+            array_match = re.search(r'\[\s*\{\s*"file_path"[^\]]*\}\s*\]', content_to_search, re.DOTALL)
+            if array_match:
+                content_str_for_prompt = array_match.group(0)
+                logger.debug("fast_extractor.extracted_json_array", content_length=len(content_str_for_prompt))
+            # Or look for a "changes" array
+            elif '"changes"' in content_to_search:
+                changes_match = re.search(r'"changes"\s*:\s*(\[\s*\{.*?\}\s*\])', content_to_search, re.DOTALL)
+                if changes_match:
+                    content_str_for_prompt = changes_match.group(1)
+                    logger.debug("fast_extractor.extracted_changes_array", content_length=len(content_str_for_prompt))
+            # Fall back to response field if available
+            elif "response" in raw_input_content:
+                response_content = raw_input_content.get("response", "")
+                if isinstance(response_content, str):
+                    content_str_for_prompt = response_content
+                    logger.debug("fast_extractor.using_response_field", content_length=len(content_str_for_prompt))
             else:
-                # If 'response' value isn't a string, fallback to stringifying it
-                content_str_for_prompt = str(core_content)
-                logger.warning("fast_extractor.core_response_not_string",
-                               type=type(core_content).__name__)
+                # Last resort: use the full content
+                content_str_for_prompt = json.dumps(raw_input_content, indent=2)
+                logger.debug("fast_extractor.using_full_content", content_length=len(content_str_for_prompt))
         else:
-            # If input content is not the expected dictionary structure,
-            # use its string representation directly.
             content_str_for_prompt = str(raw_input_content)
-            logger.debug("fast_extractor.using_raw_input_content")
-
+            logger.debug("fast_extractor.using_raw_input")
 
         # --- Format Final Prompt ---
-        # Format the final request string using the template and extracted/processed content
         try:
             final_prompt = extract_template.format(
-                content=content_str_for_prompt, # <- Embeds only B_core (or original content)
+                content=content_str_for_prompt,
                 instruction=context['config'].instruction,
                 format=context['config'].format
             )
             logger.debug("fast_extractor.formatted_prompt",
-                         prompt_length=len(final_prompt),
-                         content_length=len(content_str_for_prompt))
+                        prompt_length=len(final_prompt),
+                        content_length=len(content_str_for_prompt))
             return final_prompt
         except KeyError as e:
-             logger.error("fast_extractor.format_key_error",
-                          error=str(e),
-                          template_keys_expected=["content", "instruction", "format"],
-                          context_keys=list(context.keys()))
-             # Fallback or re-raise depending on desired robustness
-             raise ValueError(f"Prompt template formatting failed. Missing key: {e}")
+            logger.error("fast_extractor.format_key_error", error=str(e))
+            raise ValueError(f"Prompt template formatting failed. Missing key: {e}")
         except Exception as e:
-             logger.error("fast_extractor.format_failed", error=str(e))
-             raise
-
-
+            logger.error("fast_extractor.format_failed", error=str(e))
+            raise
+        
     def create_iterator(self, content: Any, config: ExtractConfig) -> FastItemIterator:
         """Create iterator for fast extraction - synchronous interface"""
         try:

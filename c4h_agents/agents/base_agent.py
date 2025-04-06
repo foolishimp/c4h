@@ -381,17 +381,18 @@ class BaseAgent(BaseConfig, BaseLLM):
             return str(response)
 
     def _process_response(self, content: str, raw_response: Any) -> Dict[str, Any]:
+        """Process LLM response into standard format without duplicating raw output"""
         try:
+            # Extract content using standard helper
             processed_content = self._get_llm_content(content)
             if self._should_log(LogDetail.DEBUG):
                 logger.debug("agent.processing_response", 
                             content_length=len(str(processed_content)) if processed_content else 0, 
                             response_type=type(raw_response).__name__)
             
-            # Create standard response structure
+            # Create standard response structure WITHOUT including raw_output
             response = {
                 "response": processed_content,
-                "raw_output": str(raw_response),
                 "timestamp": datetime.utcnow().isoformat()
             }
             
@@ -411,7 +412,6 @@ class BaseAgent(BaseConfig, BaseLLM):
             logger.error("response_processing.failed", error=str(e))
             return {
                 "response": str(content),
-                "raw_output": str(raw_response),
                 "timestamp": datetime.utcnow().isoformat(),
                 "error": str(e)
             }

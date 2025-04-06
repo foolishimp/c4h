@@ -68,11 +68,14 @@ class ContinuationHandler:
             
             # Process initial response
             content = self._get_content_from_response(response)
+            self.logger.debug("llm.initial_content", content_preview=content[:100], content_type=type(content).__name__)
             final_response = response
             
             # Format initial content with line numbers and indentation
             numbered_lines = self._format_with_line_numbers_and_indentation(content)
             accumulated_lines = numbered_lines
+            
+            self.logger.debug("llm.initial_numbered_lines", line_count=len(accumulated_lines))
             
             # Continue making requests until we're done or hit max attempts
             next_line = len(accumulated_lines) + 1
@@ -198,12 +201,84 @@ class ContinuationHandler:
             # Convert accumulated lines back to raw content
             final_content = self._numbered_lines_to_content(accumulated_lines)
             
+            # Log the final content for debugging
+            self.logger.debug("llm.final_content_before_cleaning", 
+                        content_preview=final_content[:100],
+                        content_length=len(final_content),
+                        contains_lines_array='{"lines"' in final_content)
+            
+            lines_pattern = r'\s*\{\s*"lines"\s*:\s*\[\s*\]\s*\}\s*$'
+            if re.search(lines_pattern, final_content):
+                # Remove trailing lines array
+                cleaned_content = re.sub(lines_pattern, '', final_content)
+                self.logger.info("llm.removed_trailing_lines_array", 
+                            original_length=len(final_content),
+                            cleaned_length=len(cleaned_content))
+                final_content = cleaned_content
+
+            # Check specifically for trailing "{\"lines\": []}" pattern
+            if content_type in ["json", "json_code", "solution_designer"] and '{"lines":' in final_content:
+                self.logger.debug("llm.contains_lines_array_in_content")
+                # First check for easy case - trailing lines array
+                lines_pattern = r'\s*\{\s*"lines"\s*:\s*\[\s*\]\s*\}\s*$'
+                if re.search(lines_pattern, final_content):
+                    # Remove trailing lines array
+                    cleaned_content = re.sub(lines_pattern, '', final_content)
+                    self.logger.info("llm.removed_trailing_lines_array", 
+                                original_length=len(final_content),
+                                cleaned_length=len(cleaned_content))
+                    final_content = cleaned_content
+                
+                # Next, more complex case - we need to find the primary JSON structure
+                if '{"lines":' in final_content:
+                    self.logger.debug("llm.contains_lines_array_in_content")
+                    
+                    # Attempt to extract a clean JSON structure
+                    if final_content.startswith('[') and ']' in final_content:
+                        # Try to find the end of the JSON array
+                        array_end = final_content.find(']') + 1
+                        if array_end > 0:
+                            potential_json = final_content[:array_end]
+                            try:
+                                # Validate it's proper JSON
+                                json.loads(potential_json)
+                                if len(potential_json) < len(final_content):
+                                    self.logger.info("llm.truncated_to_valid_json_array",
+                                                original_length=len(final_content),
+                                                new_length=len(potential_json))
+                                    final_content = potential_json
+                            except json.JSONDecodeError:
+                                self.logger.warning("llm.json_array_validation_failed")
+                    
+                    elif final_content.startswith('{') and '}' in final_content:
+                        # Try to find the end of the JSON object
+                        obj_end = final_content.find('}') + 1
+                        if obj_end > 0:
+                            potential_json = final_content[:obj_end]
+                            try:
+                                # Validate it's proper JSON
+                                json.loads(potential_json)
+                                if len(potential_json) < len(final_content):
+                                    self.logger.info("llm.truncated_to_valid_json_object",
+                                                original_length=len(final_content),
+                                                new_length=len(potential_json))
+                                    final_content = potential_json
+                            except json.JSONDecodeError:
+                                self.logger.warning("llm.json_object_validation_failed")
+            
+            # Log the final cleaned content
+            self.logger.debug("llm.final_content_after_cleaning", 
+                        content_preview=final_content[:200],
+                        content_length=len(final_content),
+                        contains_lines_array='{"lines"' in final_content)
+            
+            # Update the metrics
+            self.metrics["total_lines"] = len(accumulated_lines)
+            
             # Update response content
             if final_response and hasattr(final_response, 'choices') and final_response.choices:
                 final_response.choices[0].message.content = final_content
                 
-            self.metrics["total_lines"] = len(accumulated_lines)
-            
             return final_content, final_response
             
         except Exception as e:
@@ -215,7 +290,7 @@ class ContinuationHandler:
                         error_type=error_type)
             
             raise
-        
+
     def _format_with_line_numbers_and_indentation(self, content):
         """Format content with line numbers and indentation level tracking"""
         lines = content.splitlines()
