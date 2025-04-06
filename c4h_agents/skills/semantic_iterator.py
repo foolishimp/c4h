@@ -37,6 +37,7 @@ class ExtractorState:
     content: Any = None
     config: Optional[ExtractConfig] = None
     iterator: Optional[Union[FastItemIterator, SlowItemIterator]] = None
+    expected_items: int = 0  # Added to track expected item count
 
 class SemanticIterator(BaseAgent):
     """
@@ -138,9 +139,31 @@ class SemanticIterator(BaseAgent):
                 self._state.config
             )
             
-            # Check if fast extraction succeeded
+            # Check for completeness of fast extraction
+            fast_items_count = len(self._state.iterator) if self._state.iterator else 0
+            
+            # Estimate expected items by counting patterns in content
+            if isinstance(self._state.content, str):
+                expected_items = self._estimate_item_count(self._state.content)
+                self._state.expected_items = expected_items
+                
+                # Determine if fast extraction was successful but incomplete
+                if fast_items_count > 0 and fast_items_count < expected_items and self._allow_fallback:
+                    logger.info("extraction.incomplete_fast_results", 
+                              found=fast_items_count, 
+                              expected=expected_items)
+                    
+                    # Fallback to slow extraction for more reliable results
+                    logger.info("extraction.fallback_to_slow", reason="incomplete_results")
+                    self._state.mode = ExtractionMode.SLOW
+                    self._state.iterator = self._slow_extractor.create_iterator(
+                        self._state.content,
+                        self._state.config
+                    )
+            
+            # Check if fast extraction completely failed
             if not self._state.iterator.has_items() and self._allow_fallback:
-                logger.info("extraction.fallback_to_slow")
+                logger.info("extraction.fallback_to_slow", reason="no_fast_results")
                 self._state.mode = ExtractionMode.SLOW
                 self._state.iterator = self._slow_extractor.create_iterator(
                     self._state.content,
@@ -175,6 +198,26 @@ class SemanticIterator(BaseAgent):
                         position=self._state.position)
             raise StopIteration
 
+    def _estimate_item_count(self, content: str) -> int:
+        """Estimate number of items in content based on key patterns"""
+        # Count file_path occurrences as base estimate
+        file_path_count = content.count('"file_path"')
+        
+        # Additional pattern checks for verification
+        change_type_count = content.count('"type"')
+        diff_count = content.count('"diff"')
+        
+        # Take min to avoid overcounting
+        estimate = min(file_path_count, max(1, change_type_count))
+        
+        logger.debug("iterator.estimated_items", 
+                   estimate=estimate,
+                   file_paths=file_path_count, 
+                   change_types=change_type_count,
+                   diffs=diff_count)
+        
+        return estimate
+        
     def configure(self, content: Any, config: ExtractConfig) -> 'SemanticIterator':
         """
         Legacy configuration method for prefect compatibility.

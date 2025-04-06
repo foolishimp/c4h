@@ -71,34 +71,14 @@ class FastExtractor(BaseAgent):
 
         # --- Extract Core Content ---
         raw_input_content = context.get('content', '')
-        content_str_for_prompt = ""
-
-        # Extract essential content with more aggressive pattern matching
+        
+        # Convert to string if needed
         if isinstance(raw_input_content, dict):
-            # Try to extract JSON array directly using regex pattern matching
-            content_to_search = json.dumps(raw_input_content, indent=2)
-            
-            # Look for a JSON array pattern first
-            array_match = re.search(r'\[\s*\{\s*"file_path"[^\]]*\}\s*\]', content_to_search, re.DOTALL)
-            if array_match:
-                content_str_for_prompt = array_match.group(0)
-                logger.debug("fast_extractor.extracted_json_array", content_length=len(content_str_for_prompt))
-            # Or look for a "changes" array
-            elif '"changes"' in content_to_search:
-                changes_match = re.search(r'"changes"\s*:\s*(\[\s*\{.*?\}\s*\])', content_to_search, re.DOTALL)
-                if changes_match:
-                    content_str_for_prompt = changes_match.group(1)
-                    logger.debug("fast_extractor.extracted_changes_array", content_length=len(content_str_for_prompt))
-            # Fall back to response field if available
-            elif "response" in raw_input_content:
-                response_content = raw_input_content.get("response", "")
-                if isinstance(response_content, str):
-                    content_str_for_prompt = response_content
-                    logger.debug("fast_extractor.using_response_field", content_length=len(content_str_for_prompt))
-            else:
-                # Last resort: use the full content
-                content_str_for_prompt = json.dumps(raw_input_content, indent=2)
-                logger.debug("fast_extractor.using_full_content", content_length=len(content_str_for_prompt))
+            # Use the full content - let the LLM handle the extraction
+            # This is more reliable than regex-based extraction
+            content_str_for_prompt = json.dumps(raw_input_content, indent=2)
+            logger.debug("fast_extractor.using_json_content", 
+                       content_length=len(content_str_for_prompt))
         else:
             content_str_for_prompt = str(raw_input_content)
             logger.debug("fast_extractor.using_raw_input")
@@ -110,6 +90,16 @@ class FastExtractor(BaseAgent):
                 instruction=context['config'].instruction,
                 format=context['config'].format
             )
+            
+            # Add escape sequence handling instructions
+            escape_handling_instructions = """
+CRITICAL ESCAPE SEQUENCE HANDLING:
+- Ensure all backslashes in diff content are properly double-escaped (\\\\)
+- Ensure all quotes in diff content are properly escaped (\")
+- When processing JSON with nested escape sequences, maintain exact character representation
+"""
+            final_prompt = final_prompt + escape_handling_instructions
+            
             logger.debug("fast_extractor.formatted_prompt",
                         prompt_length=len(final_prompt),
                         content_length=len(content_str_for_prompt))
@@ -143,73 +133,74 @@ class FastExtractor(BaseAgent):
                 logger.error("fast_extraction.no_content")
                 return FastItemIterator([])
                 
+            # Attempt to parse the content
+            items = []
+            expected_count = 0
             try:
-                # Check if content contains diff sections that need special handling
-                has_diffs = isinstance(extracted_content, str) and "diff" in extracted_content and \
-                           ("---" in extracted_content or "+++" in extracted_content)
-                
-                if has_diffs:
-                    logger.info("fast_extraction.diff_content_detected")
-                    try:
-                        # Try special diff-aware parsing
-                        items = self._parse_with_diff_handling(extracted_content)
-                        if items:
-                            logger.info("fast_extraction.diff_handling_successful", items_count=len(items))
-                            # Normalize to list
-                            if isinstance(items, dict):
-                                items = [items]
-                            elif not isinstance(items, list):
-                                items = []
-                                
-                            logger.info("fast_extraction.complete", items_found=len(items))
-                            return FastItemIterator(items)
-                    except Exception as e:
-                        logger.warning("fast_extraction.diff_handling_failed", error=str(e))
-                        # Continue to regular parsing methods
-                
-                # Standard JSON parsing with more robust error handling
+                # Use a simplified parsing approach
+                # 1. Try to parse as complete JSON
                 if isinstance(extracted_content, str):
-                    # Find specific problematic characters for debugging
                     try:
-                        json.loads(extracted_content)
-                    except json.JSONDecodeError as e:
-                        problem_char = ord(extracted_content[e.pos]) if e.pos < len(extracted_content) else -1
-                        logger.warning("fast_extraction.specific_char_issue", 
-                                    position=e.pos, 
-                                    char_code=problem_char,
-                                    line=e.lineno, 
-                                    column=e.colno)
-                    
-                    # Try to parse complete structure first
-                    try:
-                        items = json.loads(extracted_content)
+                        parsed_content = json.loads(extracted_content)
                         logger.info("fast_extraction.standard_parse_successful")
-                    except json.JSONDecodeError:
-                        # Try to extract objects using regex approach
-                        items = self._extract_json_objects(extracted_content)
-                        if items:
-                            logger.info("fast_extraction.object_extraction_successful", objects_found=len(items))
-                        else:
-                            # If that fails, fall back to extracting partial valid objects
-                            items = self._extract_valid_objects(extracted_content)
-                            if items:
-                                logger.info("fast_extraction.partial_extraction_successful", objects_found=len(items))
+                        
+                        # Handle both array and object formats
+                        if isinstance(parsed_content, list):
+                            items = parsed_content
+                            expected_count = len(items)
+                        elif isinstance(parsed_content, dict):
+                            # Check for changes array in dict
+                            if "changes" in parsed_content and isinstance(parsed_content["changes"], list):
+                                items = parsed_content["changes"]
+                                expected_count = len(items)
                             else:
-                                logger.error("fast_extraction.all_parsing_methods_failed")
-                                return FastItemIterator([])
+                                items = [parsed_content]
+                                expected_count = 1
+                    except json.JSONDecodeError:
+                        # Fall back to a simpler object extraction
+                        logger.warning("fast_extraction.json_parse_failed", 
+                                    error="Failed to parse complete JSON, trying extract_objects")
+                        # Extract objects with the simpler method
+                        simple_items = self._extract_simple_objects(extracted_content)
+                        if simple_items:
+                            items = simple_items
+                            expected_count = len(self._count_potential_objects(extracted_content))
+                            logger.info("fast_extraction.simple_extraction_successful", 
+                                      objects_found=len(items),
+                                      objects_expected=expected_count)
                 else:
-                    items = extracted_content
+                    # Non-string content, just pass through
+                    items = extracted_content if isinstance(extracted_content, list) else [extracted_content]
+                    expected_count = len(items)
                     
-                # Normalize to list
-                if isinstance(items, dict):
-                    items = [items]
-                elif not isinstance(items, list):
-                    items = []
+                # Validate parsed objects
+                validated_items = []
+                for item in items:
+                    if isinstance(item, dict) and "file_path" in item:
+                        validated_items.append(item)
+                    else:
+                        logger.warning("fast_extraction.invalid_item_skipped", 
+                                      item=str(item)[:100])
+                
+                # Log completion status
+                if validated_items:
+                    logger.info("fast_extraction.complete", 
+                               items_found=len(validated_items),
+                               items_expected=expected_count)
                     
-                logger.info("fast_extraction.complete", items_found=len(items))
-                return FastItemIterator(items)
+                    # Check if we should fall back to slow extraction
+                    if len(validated_items) < expected_count and self._allow_fallback:
+                        logger.warning("fast_extraction.partial_results", 
+                                     extracted=len(validated_items), 
+                                     expected=expected_count)
+                        # Don't fall back here - return what we have
+                        # The semantic_iterator will handle fallback if needed
+                else:
+                    logger.warning("fast_extraction.no_valid_items")
+                    
+                return FastItemIterator(validated_items)
 
-            except json.JSONDecodeError as e:
+            except Exception as e:
                 logger.error("fast_extraction.parse_error", error=str(e))
                 return FastItemIterator([])
 
@@ -217,207 +208,73 @@ class FastExtractor(BaseAgent):
             logger.error("fast_extraction.failed", error=str(e))
             return FastItemIterator([])
 
-    def _parse_with_diff_handling(self, content: str) -> List[Dict]:
-        """Parse JSON content with special handling for diff sections"""
-        # Try to parse as array first, strip potential surrounding text
-        content = content.strip()
+    def _normalize_diff_escapes(self, diff_content: str) -> str:
+        """Normalize escape sequences in diff content for reliable JSON parsing"""
+        # First level: normalize backslashes
+        escaped = diff_content.replace('\\', '\\\\')
+        # Second level: escape quotes
+        escaped = escaped.replace('"', '\\"')
+        return escaped
+    
+    def _count_potential_objects(self, content: str) -> List[int]:
+        """Count potential objects based on standard patterns"""
+        file_path_count = len(re.findall(r'"file_path"', content))
+        type_count = len(re.findall(r'"type"\s*:', content)) 
+        diff_count = len(re.findall(r'"diff"\s*:', content))
         
-        # Try to find JSON array pattern
-        array_match = re.search(r'\[\s*\{.*\}\s*\]', content, re.DOTALL)
-        if array_match:
-            content = array_match.group(0)
+        # Return positions of potential objects
+        return list(range(max(file_path_count, type_count, diff_count)))
         
-        # Extract each object separately to handle problematic diffs
+    def _extract_simple_objects(self, content: str) -> List[Dict]:
+        """Extract objects using simple patterns, falling back to core fields extraction"""
         objects = []
         
-        # Find the start position of each object in the array
-        object_starts = [m.start() for m in re.finditer(r'\{\s*"file_path"|\{\s*"type"|\{\s*"description"', content)]
+        # Try to find complete objects first
+        object_pattern = r'\{\s*"file_path".*?"\s*\}'
+        matches = re.finditer(object_pattern, content, re.DOTALL)
         
-        if not object_starts:
-            # Try different object pattern if none found
-            object_starts = [m.start() for m in re.finditer(r'\s*\{', content)]
-            if not object_starts:
-                logger.warning("fast_extraction.no_object_boundaries_found")
-                return self._extract_json_objects(content)
-        
-        # Add end of content as final boundary
-        if content.rstrip().endswith(']'):
-            # Remove the closing bracket temporarily
-            content = content.rstrip()[:-1].rstrip()
-            
-        # Process each object
-        for i in range(len(object_starts)):
-            start = object_starts[i]
-            end = object_starts[i+1] if i+1 < len(object_starts) else len(content)
-            
-            obj_text = content[start:end].strip()
-            # Fix unclosed objects
-            if not obj_text.endswith('}'):
-                obj_text += '}'
-            # Remove trailing comma if present
-            if obj_text.endswith(',}'):
-                obj_text = obj_text[:-2] + '}'
-                
-            # Handle diff section specially
-            obj_text = self._escape_diff_section(obj_text)
-            
+        for match in matches:
             try:
+                obj_text = match.group(0)
+                # Try to parse as JSON
                 obj = json.loads(obj_text)
-                objects.append(obj)
-                logger.debug("fast_extraction.object_parsed", 
-                          object_index=i, 
-                          object_keys=list(obj.keys()) if isinstance(obj, dict) else None)
-            except json.JSONDecodeError as e:
-                logger.warning("fast_extraction.object_parse_error", 
-                             index=i, 
-                             error=str(e), 
-                             object_start=start, 
-                             object_length=len(obj_text))
-                # Try aggressive repair of this object
-                try:
-                    # Extract known fields directly
-                    file_path_match = re.search(r'"file_path"\s*:\s*"([^"]+)"', obj_text)
-                    type_match = re.search(r'"type"\s*:\s*"([^"]+)"', obj_text)
-                    desc_match = re.search(r'"description"\s*:\s*"([^"]+)"', obj_text)
-                    
-                    # Extract diff section with raw handling
-                    diff_match = re.search(r'"diff"\s*:\s*"(.+?)(?="}\s*$|",\s*")', obj_text, re.DOTALL)
-                    
-                    if file_path_match and type_match and diff_match:
-                        repaired_obj = {
-                            "file_path": file_path_match.group(1),
-                            "type": type_match.group(1),
-                            "description": desc_match.group(1) if desc_match else "No description",
-                            "diff": diff_match.group(1).replace('\\n', '\n').replace('\\"', '"')
-                        }
-                        objects.append(repaired_obj)
-                        logger.info("fast_extraction.object_manually_repaired", index=i)
-                except Exception as repair_error:
-                    logger.error("fast_extraction.repair_failed", error=str(repair_error))
-                
-        return objects
-
-    def _escape_diff_section(self, text: str) -> str:
-        """Escape special characters in diff section properly"""
-        if '"diff":' not in text:
-            return text
-            
-        # Find diff section using regex with relaxed pattern
-        diff_pattern = r'"diff"\s*:\s*"(.*?)(?="}\s*$|",\s*")'
-        
-        def escape_diff(match):
-            diff_content = match.group(1)
-            # Double escape backslashes first
-            escaped = diff_content.replace('\\', '\\\\')
-            # Then escape newlines and quotes
-            escaped = escaped.replace('\n', '\\n').replace('"', '\\"')
-            return f'"diff": "{escaped}'
-        
-        # Replace with properly escaped content
-        try:
-            fixed_text = re.sub(diff_pattern, escape_diff, text, flags=re.DOTALL)
-            return fixed_text
-        except Exception as e:
-            logger.error("fast_extraction.diff_escape_failed", error=str(e))
-            return text
-            
-    def _extract_valid_objects(self, content: str) -> List[Dict]:
-        """Extract valid JSON objects even from malformed JSON"""
-        objects = []
-        start_idx = 0
-        
-        while start_idx < len(content):
-            # Find opening braces
-            obj_start = content.find('{', start_idx)
-            arr_start = content.find('[', start_idx)
-            
-            # Determine which comes first
-            if obj_start < 0 and arr_start < 0:
-                break  # No more JSON structures
-            
-            if (obj_start >= 0 and arr_start >= 0 and obj_start < arr_start) or arr_start < 0:
-                # Object starts first
-                start_pos = obj_start
-                for end_pos in range(start_pos + 1, len(content)):
-                    # Try parsing this substring
-                    try:
-                        obj = json.loads(content[start_pos:end_pos+1])
-                        objects.append(obj)
-                        start_idx = end_pos + 1
-                        break
-                    except json.JSONDecodeError:
-                        continue
-                else:
-                    start_idx = len(content)  # No valid object found
-                    
-            else:
-                # Array starts first
-                start_pos = arr_start
-                for end_pos in range(start_pos + 1, len(content)):
-                    # Try parsing this substring
-                    try:
-                        arr = json.loads(content[start_pos:end_pos+1])
-                        if isinstance(arr, list):
-                            objects.extend(arr)
-                        else:
-                            objects.append(arr)
-                        start_idx = end_pos + 1
-                        break
-                    except json.JSONDecodeError:
-                        continue
-                else:
-                    start_idx = len(content)  # No valid array found
-        
-        return objects
-            
-    def _extract_json_objects(self, text: str) -> List[Dict]:
-        """Extract valid JSON objects from potentially malformed text with continuation metadata"""
-        objects = []
-        
-        # Try to extract complete array first
-        try:
-            array_match = re.search(r'\[\s*\{.*?\}\s*\]', text, re.DOTALL)
-            if array_match:
-                array_text = array_match.group(0)
-                array = json.loads(array_text)
-                if isinstance(array, list) and array:
-                    logger.debug("fast_extraction.array_extracted", 
-                            items=len(array))
-                    return array
-        except json.JSONDecodeError:
-            pass
-        
-        # Try to extract changes object (solution designer format)
-        try:
-            changes_match = re.search(r'{\s*"changes"\s*:\s*\[\s*\{.*?\}\s*\]\s*}', text, re.DOTALL)
-            if changes_match:
-                changes_obj = json.loads(changes_match.group(0))
-                if "changes" in changes_obj and isinstance(changes_obj["changes"], list):
-                    logger.debug("fast_extraction.changes_extracted", 
-                            items=len(changes_obj["changes"]))
-                    return changes_obj["changes"]
-        except json.JSONDecodeError:
-            pass
-        
-        # Fallback to object-by-object extraction
-        object_start = text.find('{')
-        while object_start >= 0:
-            object_end = self._find_matching_bracket(text, object_start)
-            if object_end > object_start:
-                try:
-                    obj_text = text[object_start:object_end+1]
-                    if '"diff"' in obj_text:
-                        obj_text = self._escape_diff_section(obj_text)
-                    obj = json.loads(obj_text)
+                if "file_path" in obj:
                     objects.append(obj)
-                except json.JSONDecodeError:
-                    pass
-                object_start = text.find('{', object_end + 1)
-            else:
-                break
+                    logger.debug("fast_extraction.object_extracted")
+            except json.JSONDecodeError:
+                logger.debug("fast_extraction.object_parse_failed")
         
+        # If we found objects, return them
+        if objects:
+            return objects
+            
+        # Fallback: extract core fields individually
+        file_paths = re.findall(r'"file_path"\s*:\s*"([^"]+)"', content)
+        types = re.findall(r'"type"\s*:\s*"([^"]+)"', content)
+        descriptions = re.findall(r'"description"\s*:\s*"([^"]+)"', content)
+        
+        # Extract diff sections with careful handling
+        diff_sections = []
+        diff_pattern = r'"diff"\s*:\s*"(.*?)(?="}\s*$|",\s*")'
+        matches = re.finditer(diff_pattern, content, re.DOTALL)
+        for match in matches:
+            diff_text = match.group(1)
+            # Un-escape the diff content
+            diff_text = diff_text.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+            diff_sections.append(diff_text)
+        
+        # Assemble objects from extracted fields
+        count = min(len(file_paths), len(types))
+        for i in range(count):
+            obj = {
+                "file_path": file_paths[i],
+                "type": types[i],
+                "description": descriptions[i] if i < len(descriptions) else "No description",
+                "diff": diff_sections[i] if i < len(diff_sections) else ""
+            }
+            objects.append(obj)
+            
         return objects
-
 
     def _find_matching_bracket(self, text: str, start_pos: int, 
                               open_char: str = '{', close_char: str = '}') -> int:
