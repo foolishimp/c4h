@@ -454,7 +454,7 @@ runtime:
 
   # Backup settings  
   backup:
-    enabled: true
+    enabled: false
     path: "./workspaces/backups"  # Use explicit relative path
 
   # Logging configuration
