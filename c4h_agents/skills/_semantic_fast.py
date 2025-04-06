@@ -60,17 +60,68 @@ class FastExtractor(BaseAgent):
         return "semantic_fast_extractor"
 
     def _format_request(self, context: Dict[str, Any]) -> str:
-        """Format extraction request for fast mode using config template"""
+        """
+        Format extraction request for fast mode using config template.
+        Revised to extract core 'response' content if the input context['content']
+        appears to be the full structured data from a previous AgentResponse.
+        """
+        # --- Essential Setup ---
         if not context.get('config'):
             logger.error("fast_extractor.missing_config")
             raise ValueError("Extract config required")
 
+        # Get the prompt template defined in the configuration for this skill
         extract_template = self._get_prompt('extract')
-        return extract_template.format(
-            content=context.get('content', ''),
-            instruction=context['config'].instruction,
-            format=context['config'].format
-        )
+
+        # --- Extract Core Content ---
+        # Get the raw input content passed to this skill
+        raw_input_content = context.get('content', '')
+        content_str_for_prompt = ""
+
+        # Check if the input content is a dictionary potentially containing
+        # the structured output (like AgentResponse.data) from a previous agent.
+        if isinstance(raw_input_content, dict) and "response" in raw_input_content:
+            # Extract only the core 'response' field's value (B_core)
+            core_content = raw_input_content.get("response", "")
+            if isinstance(core_content, str):
+                content_str_for_prompt = core_content
+                logger.debug("fast_extractor.extracted_core_response",
+                             input_keys=list(raw_input_content.keys()))
+            else:
+                # If 'response' value isn't a string, fallback to stringifying it
+                content_str_for_prompt = str(core_content)
+                logger.warning("fast_extractor.core_response_not_string",
+                               type=type(core_content).__name__)
+        else:
+            # If input content is not the expected dictionary structure,
+            # use its string representation directly.
+            content_str_for_prompt = str(raw_input_content)
+            logger.debug("fast_extractor.using_raw_input_content")
+
+
+        # --- Format Final Prompt ---
+        # Format the final request string using the template and extracted/processed content
+        try:
+            final_prompt = extract_template.format(
+                content=content_str_for_prompt, # <- Embeds only B_core (or original content)
+                instruction=context['config'].instruction,
+                format=context['config'].format
+            )
+            logger.debug("fast_extractor.formatted_prompt",
+                         prompt_length=len(final_prompt),
+                         content_length=len(content_str_for_prompt))
+            return final_prompt
+        except KeyError as e:
+             logger.error("fast_extractor.format_key_error",
+                          error=str(e),
+                          template_keys_expected=["content", "instruction", "format"],
+                          context_keys=list(context.keys()))
+             # Fallback or re-raise depending on desired robustness
+             raise ValueError(f"Prompt template formatting failed. Missing key: {e}")
+        except Exception as e:
+             logger.error("fast_extractor.format_failed", error=str(e))
+             raise
+
 
     def create_iterator(self, content: Any, config: ExtractConfig) -> FastItemIterator:
         """Create iterator for fast extraction - synchronous interface"""
@@ -322,57 +373,54 @@ class FastExtractor(BaseAgent):
         return objects
             
     def _extract_json_objects(self, text: str) -> List[Dict]:
-        """Extract valid JSON objects from potentially malformed text"""
+        """Extract valid JSON objects from potentially malformed text with continuation metadata"""
         objects = []
-        # Look for objects that start with { and end with }
+        
+        # Try to extract complete array first
+        try:
+            array_match = re.search(r'\[\s*\{.*?\}\s*\]', text, re.DOTALL)
+            if array_match:
+                array_text = array_match.group(0)
+                array = json.loads(array_text)
+                if isinstance(array, list) and array:
+                    logger.debug("fast_extraction.array_extracted", 
+                            items=len(array))
+                    return array
+        except json.JSONDecodeError:
+            pass
+        
+        # Try to extract changes object (solution designer format)
+        try:
+            changes_match = re.search(r'{\s*"changes"\s*:\s*\[\s*\{.*?\}\s*\]\s*}', text, re.DOTALL)
+            if changes_match:
+                changes_obj = json.loads(changes_match.group(0))
+                if "changes" in changes_obj and isinstance(changes_obj["changes"], list):
+                    logger.debug("fast_extraction.changes_extracted", 
+                            items=len(changes_obj["changes"]))
+                    return changes_obj["changes"]
+        except json.JSONDecodeError:
+            pass
+        
+        # Fallback to object-by-object extraction
         object_start = text.find('{')
         while object_start >= 0:
-            # Find the corresponding closing brace
             object_end = self._find_matching_bracket(text, object_start)
             if object_end > object_start:
-                # Try to parse this segment as JSON
                 try:
                     obj_text = text[object_start:object_end+1]
-                    # Check if this is a diff-containing object
                     if '"diff"' in obj_text:
                         obj_text = self._escape_diff_section(obj_text)
                     obj = json.loads(obj_text)
                     objects.append(obj)
-                    logger.debug("fast_extraction.object_extracted", 
-                               start=object_start,
-                               end=object_end,
-                               length=len(obj_text))
                 except json.JSONDecodeError:
-                    # Not valid JSON, skip this segment
                     pass
-                
-                # Move to the next potential object
                 object_start = text.find('{', object_end + 1)
             else:
-                # No valid closing bracket found
                 break
-                
-        # Look for arrays that start with [ and end with ]
-        array_start = text.find('[')
-        if array_start >= 0:
-            array_end = self._find_matching_bracket(text, array_start, open_char='[', close_char=']')
-            if array_end > array_start:
-                try:
-                    array_text = text[array_start:array_end+1]
-                    array = json.loads(array_text)
-                    if isinstance(array, list) and array:
-                        # If we found a valid array, return its elements
-                        objects.extend(array)
-                        logger.debug("fast_extraction.array_extracted",
-                                   start=array_start,
-                                   end=array_end,
-                                   items=len(array))
-                except json.JSONDecodeError:
-                    # Not valid JSON, ignore
-                    pass
-                    
-        return objects
         
+        return objects
+
+
     def _find_matching_bracket(self, text: str, start_pos: int, 
                               open_char: str = '{', close_char: str = '}') -> int:
         """Find the matching closing bracket position for a given opening bracket"""

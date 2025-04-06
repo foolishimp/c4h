@@ -50,7 +50,7 @@ class AssetManager(BaseAgent):
             self.backup_dir = Path(kwargs.get('backup_dir', 'workspaces/backups')).resolve()
 
         # Configure backup and create merger
-        self.backup_enabled = kwargs.get('backup_enabled', True)
+        self.backup_enabled = kwargs.get('backup_enabled', False)
         if self.backup_enabled:
             self.backup_dir.mkdir(parents=True, exist_ok=True)
             logger.info("asset_manager.backup_enabled", backup_dir=str(self.backup_dir))

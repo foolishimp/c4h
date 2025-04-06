@@ -288,6 +288,7 @@ CRITICAL REQUIREMENTS:
 7. Keep all string literals intact
 8. Return an array of JSON objects with line, indent, and content fields
 9. For solution designer content, ensure proper formatting of diffs and JSON structure
+10. **DO NOT** add any explanatory text or comments after the JSON content as it will break the parsing
 
 Example format:
 {example_json}

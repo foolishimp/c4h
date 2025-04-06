@@ -1,5 +1,5 @@
 #!/bin/bash
-
+rm -rfd tests/test_projects
 # Create project1 directory and files
 mkdir -p tests/test_projects/project1
 cat > tests/test_projects/project1/sample.py << 'EOF'

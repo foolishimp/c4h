@@ -1,5 +1,6 @@
 #!/bin/bash
 
+rm -rfd tests/test_projects
 # Project 1: Java
 mkdir -p tests/test_projects/java_menu/src/main/java/com/example
 cat > tests/test_projects/java_menu/src/main/java/com/example/MenuApp.java << 'EOF'

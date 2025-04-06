@@ -35,13 +35,18 @@ class Coder(BaseAgent):
         
         # Get coder-specific config 
         coder_config = self._get_agent_config()
-        backup_path = Path(coder_config.get('backup', {}).get('path', 'workspaces/backups'))
+        
+        # Get runtime backup settings
+        runtime_config = self.config_node.get_value("runtime") or {}
+        backup_config = runtime_config.get("backup", {})
+        backup_enabled = backup_config.get("enabled", False)  # Default to false
+        backup_path = Path(backup_config.get("path", "workspaces/backups"))
         
         # Create semantic tools
         self.iterator = SemanticIterator(config=config)
         self.merger = SemanticMerge(config=config)
         self.asset_manager = AssetManager(
-            backup_enabled=coder_config.get('backup_enabled', True),
+            backup_enabled=backup_enabled,
             backup_dir=backup_path,
             merger=self.merger,
             config=config
@@ -50,6 +55,7 @@ class Coder(BaseAgent):
         # Initialize metrics
         self.operation_metrics = CoderMetrics()
         logger.info("coder.initialized", backup_path=str(backup_path))
+
 
     def process(self, context: Dict[str, Any]) -> AgentResponse:
         """Process code changes using semantic extraction"""
