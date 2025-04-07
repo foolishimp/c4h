@@ -276,7 +276,7 @@ llm_config:
           {format}
 
           CRITICAL: Return raw JSON array of valid file changes only. Do not include any item without a valid file_path.
-          1. Return ONLY the raw JSON array of valid file changes 
+          1. Return ONLY the extracted objects in a single JSON array
 
     semantic_slow_extractor:
       provider: "openai"
