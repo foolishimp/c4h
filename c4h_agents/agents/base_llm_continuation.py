@@ -1,8 +1,3 @@
-"""
-Enhanced LLM response continuation handling with robust content parsing strategies.
-Path: c4h_agents/agents/base_llm_continuation.py
-"""
-
 from typing import Dict, Any, List, Tuple, Optional, Union
 import time
 import re
@@ -19,42 +14,30 @@ from litellm import completion
 from c4h_agents.agents.types import LLMProvider, LogDetail
 from c4h_agents.utils.logging import get_logger
 
-logger = get_logger()
+# Fallback to standard logger if get_logger fails
+try:
+    logger = get_logger()
+except Exception as e:
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO)
 
 class ContentType(str, Enum):
     """Content types for specialized handling"""
     TEXT = "text"
     CODE = "code"
-    JSON = "json" 
+    JSON = "json"
     JSON_CODE = "json_code"
     DIFF = "diff"
     SOLUTION_DESIGNER = "solution_designer"
-    
-class ParseResult:
-    """Result of parsing a continuation response"""
-    def __init__(self, success: bool, content: List[Tuple[int, int, str]] = None, error: str = None):
-        self.success = success
-        self.content = content or []
-        self.error = error
-        
-    def has_content(self) -> bool:
-        """Check if parsing produced any content"""
-        return bool(self.content)
-        
-    def get_next_line(self) -> int:
-        """Get the next line number after this content"""
-        if not self.content:
-            return 1
-        return max(line[0] for line in self.content) + 1
-        
+
 class ContinuationHandler:
     """
-    Robust LLM response continuation handler with content-type specialized strategies.
-    Implements multiple parsing approaches and fallback mechanisms.
+    Handles LLM response continuations using a sliding window approach.
+    Uses content-aware joining and specialized overlap strategies.
     """
 
     def __init__(self, parent_agent):
-        """Initialize handler with parent agent reference"""
+        """Initialize with parent agent reference"""
         self.parent = parent_agent
         self.model_str = parent_agent.model_str
         self.provider = parent_agent.provider
@@ -66,28 +49,36 @@ class ContinuationHandler:
         self.rate_limit_max_retries = 5
         self.rate_limit_max_backoff = 60
         
-        # Logger setup
-        self.logger = getattr(parent_agent, 'logger', logger)
+        # Overlap configuration
+        self.min_overlap_size = 50
+        self.max_overlap_size = 500
         
-        # Tracking metrics
+        # Logger setup - Use parent agent's logger if available, otherwise fallback
+        self.logger = getattr(parent_agent, 'logger', logger)
+        # Avoid setting level directly; assume it's configured elsewhere
+        # If needed, log a debug message to confirm logger initialization
+        self.logger.debug("ContinuationHandler logger initialized",
+                         extra={"logger_type": type(self.logger).__name__})
+        
+        # Metrics tracking
         self.metrics = {
             "attempts": 0,
-            "total_lines": 0,
             "exact_matches": 0,
-            "hash_matches": 0,
             "token_matches": 0,
+            "fuzzy_matches": 0,
+            "structure_matches": 0,
             "fallbacks": 0,
-            "parsing_errors": 0,
-            "rate_limit_retries": 0
+            "rate_limit_retries": 0,
+            "append_fallbacks": 0
         }
 
     def get_completion_with_continuation(
-            self, 
+            self,
             messages: List[Dict[str, str]],
             max_attempts: Optional[int] = None
         ) -> Tuple[str, Any]:
         """
-        Get completion with multi-strategy continuation handling.
+        Get completion with automatic continuation using sliding window.
         
         Args:
             messages: List of message dictionaries with role and content
@@ -96,940 +87,109 @@ class ContinuationHandler:
         Returns:
             Tuple of (accumulated_content, final_response)
         """
-        # Setup
         attempt = 0
         max_tries = max_attempts or self.max_continuation_attempts
-        accumulated_lines = []
+        accumulated_content = ""
         final_response = None
-        consecutive_failures = 0
-        max_consecutive_failures = 2
         
-        # Detect content type for specialized handling
         content_type = self._detect_content_type(messages)
+        self.logger.info("Starting continuation process",
+                        extra={"model": self.model_str, "content_type": content_type})
         
-        self.logger.info("llm.continuation_starting", 
-                       model=self.model_str, 
-                       content_type=content_type)
-        
-        # Rate limit handling
         rate_limit_retries = 0
         rate_limit_backoff = self.rate_limit_retry_base_delay
         
-        # Initial request with standard parameters
         completion_params = self._build_completion_params(messages)
         
         try:
-            # Make initial request
             response = self._make_llm_request(completion_params)
-            
-            # Process initial response
             content = self._get_content_from_response(response)
-            self.logger.debug("llm.initial_content", 
-                           content_preview=content[:100], 
-                           content_type=type(content).__name__)
+            self.logger.debug("Received initial content",
+                           extra={"content_preview": content[:100], "content_length": len(content)})
             
             final_response = response
+            accumulated_content = content
             
-            # Format initial content with line numbers and indentation
-            numbered_lines = self._format_with_line_numbers_and_indentation(content)
-            accumulated_lines = numbered_lines
-            
-            self.logger.debug("llm.initial_numbered_lines", 
-                           line_count=len(accumulated_lines))
-            
-            # Continue making requests until we're done or hit max attempts
-            next_line = len(accumulated_lines) + 1
-            
-            while next_line > 1 and attempt < max_tries:
+            while attempt < max_tries:
+                finish_reason = getattr(response.choices[0], 'finish_reason', None)
+                if finish_reason != 'length':
+                    self.logger.info("Continuation complete",
+                                  extra={"finish_reason": finish_reason, "attempts": attempt})
+                    break
+                
                 attempt += 1
                 self.metrics["attempts"] += 1
                 
-                # Select appropriate continuation strategy based on content type
-                if content_type == ContentType.SOLUTION_DESIGNER:
-                    continuation_prompt = self._create_solution_designer_continuation(
-                        accumulated_lines, next_line)
-                elif content_type in (ContentType.JSON, ContentType.JSON_CODE):
-                    continuation_prompt = self._create_json_continuation(
-                        accumulated_lines, next_line)
-                else:
-                    # Default line-number based continuation
-                    continuation_prompt = self._create_numbered_continuation_prompt(
-                        self._create_line_json(accumulated_lines), next_line, content_type)
+                overlap = self._calculate_overlap_window(accumulated_content, content_type)
+                continuation_prompt = self._create_continuation_prompt(overlap, content_type)
                 
-                # Prepare continuation message
                 cont_messages = messages.copy()
-                cont_messages.append({"role": "assistant", "content": 
-                                    self._numbered_lines_to_content(accumulated_lines)})
+                cont_messages.append({"role": "assistant", "content": accumulated_content})
                 cont_messages.append({"role": "user", "content": continuation_prompt})
                 
-                self.logger.info("llm.requesting_continuation", 
-                              attempt=attempt, 
-                              next_line=next_line)
+                self.logger.info("Requesting continuation",
+                               extra={"attempt": attempt, "content_type": content_type,
+                                      "overlap_length": len(overlap)})
                 
-                # Make continuation request
                 try:
                     cont_params = completion_params.copy()
                     cont_params["messages"] = cont_messages
                     response = self._make_llm_request(cont_params)
-                    
-                    # Extract content from response
                     cont_content = self._get_content_from_response(response)
                     
-                    # Try multiple parsing strategies
-                    parse_result = self._parse_continuation(
-                        cont_content, next_line, content_type)
+                    joined_content, join_method = self._join_continuations(
+                        accumulated_content, cont_content, content_type)
                     
-                    if parse_result.success and parse_result.has_content():
-                        # Successful parsing
-                        new_lines = parse_result.content
-                        consecutive_failures = 0
-                    else:
-                        # Try repair parsing as fallback
-                        self.logger.warning("llm.parsing_failed", 
-                                         attempt=attempt, 
-                                         error=parse_result.error)
-                        
-                        # Try specialized content type repair
-                        if content_type == ContentType.SOLUTION_DESIGNER:
-                            new_lines = self._repair_solution_designer_parse(
-                                cont_content, next_line)
-                        else:
-                            new_lines = self._attempt_repair_parse(
-                                cont_content, next_line)
-                        
-                        if not new_lines:
-                            consecutive_failures += 1
-                            self.logger.warning("llm.repair_parse_failed", 
-                                             consecutive_failures=consecutive_failures)
-                            
-                            # Multiple failures, use raw content fallback
-                            if consecutive_failures >= max_consecutive_failures:
-                                self.metrics["fallbacks"] += 1
-                                # Add marker and fall back to raw content
-                                new_lines = self._create_raw_fallback(
-                                    cont_content, next_line, attempt)
-                                consecutive_failures = 0  # Reset after fallback
-                            else:
-                                # Try again with a different prompt
-                                continue
-                        else:
-                            consecutive_failures = 0  # Reset on successful repair
-                    
-                    # Successful continuation, update accumulated lines
-                    accumulated_lines.extend(new_lines)
-                    
-                    # Check if response is complete
-                    finish_reason = getattr(response.choices[0], 'finish_reason', None)
-                    
-                    # Update final response
+                    self.metrics[join_method] += 1
+                    accumulated_content = joined_content
                     final_response = response
                     
-                    if finish_reason != 'length':
-                        self.logger.info("llm.continuation_complete", 
-                                      finish_reason=finish_reason)
-                        break
-                    
-                    # Update next line number for next continuation
-                    next_line = len(accumulated_lines) + 1
-                    
                 except litellm.RateLimitError as e:
-                    # Handle rate limit errors with exponential backoff
-                    error_msg = str(e)
-                    
                     rate_limit_retries += 1
                     self.metrics["rate_limit_retries"] += 1
                     
                     if rate_limit_retries > self.rate_limit_max_retries:
-                        self.logger.error("llm.rate_limit_max_retries_exceeded", 
-                                       retry_count=rate_limit_retries,
-                                       error=error_msg[:200])
+                        self.logger.error("Max rate limit retries exceeded",
+                                        extra={"retry_count": rate_limit_retries, "error": str(e)})
                         raise
-                                
-                    # Calculate backoff with jitter
+                    
                     jitter = 0.1 * rate_limit_backoff * (0.5 - random.random())
-                    current_backoff = min(rate_limit_backoff + jitter, 
-                                       self.rate_limit_max_backoff)
+                    current_backoff = min(rate_limit_backoff + jitter, self.rate_limit_max_backoff)
                     
-                    self.logger.warning("llm.rate_limit_backoff", 
-                                     attempt=attempt,
-                                     retry_count=rate_limit_retries,
-                                     backoff_seconds=current_backoff,
-                                     error=error_msg[:200])
+                    self.logger.warning("Rate limit encountered, backing off",
+                                      extra={"attempt": attempt, "retry_count": rate_limit_retries,
+                                             "backoff_seconds": current_backoff, "error": str(e)})
                     
-                    # Apply exponential backoff with base 2
                     time.sleep(current_backoff)
-                    rate_limit_backoff = min(rate_limit_backoff * 2, 
-                                          self.rate_limit_max_backoff)
+                    rate_limit_backoff = min(rate_limit_backoff * 2, self.rate_limit_max_backoff)
                     continue
-                
+                    
                 except Exception as e:
-                    self.logger.error("llm.continuation_failed", error=str(e))
-                    # Add marker for error but continue with what we have
-                    marker = f"----- CONTINUATION ERROR: {str(e)[:100]} -----"
-                    accumulated_lines.append((next_line, 0, marker))
-                    self.metrics["parsing_errors"] += 1
+                    self.logger.error("Continuation attempt failed",
+                                    extra={"attempt": attempt, "error": str(e),
+                                           "stack_trace": traceback.format_exc()})
+                    append_marker = f"\n--- CONTINUATION STITCHING FAILED ---\n"
+                    accumulated_content += append_marker + cont_content
+                    self.metrics["append_fallbacks"] += 1
                     break
             
-            # Convert accumulated lines back to raw content
-            final_content = self._numbered_lines_to_content(accumulated_lines)
+            if content_type in (ContentType.JSON, ContentType.SOLUTION_DESIGNER):
+                accumulated_content = self._clean_json_content(accumulated_content)
             
-            # Clean up content if needed for specific formats
-            if content_type in (ContentType.JSON, ContentType.JSON_CODE, ContentType.SOLUTION_DESIGNER):
-                final_content = self._clean_json_content(final_content, content_type)
-            
-            # Update metrics
-            self.metrics["total_lines"] = len(accumulated_lines)
-            
-            # Update response content
             if final_response and hasattr(final_response, 'choices') and final_response.choices:
-                final_response.choices[0].message.content = final_content
+                final_response.choices[0].message.content = accumulated_content
             
-            self.logger.info("llm.continuation_complete", 
-                          attempts=attempt,
-                          content_type=content_type,
-                          metrics=self.metrics)
+            self.logger.info("Continuation process completed",
+                          extra={"attempts": attempt, "content_type": content_type,
+                                 "metrics": self.metrics, "content_length": len(accumulated_content)})
                 
-            return final_content, final_response
+            return accumulated_content, final_response
             
         except Exception as e:
-            error_msg = str(e)
-            error_type = type(e).__name__
-            
-            self.logger.error("llm.continuation_failed", 
-                           error=error_msg, 
-                           error_type=error_type)
-            
+            self.logger.error("Continuation process failed",
+                           extra={"error": str(e), "stack_trace": traceback.format_exc(),
+                                  "content_so_far": accumulated_content[:200]})
             raise
-
-    def _parse_continuation(self, content: str, expected_start_line: int, 
-                           content_type: str) -> ParseResult:
-        """
-        Parse continuation content using multiple strategies.
-        
-        Args:
-            content: Response content to parse
-            expected_start_line: Expected starting line number
-            content_type: Type of content for specialized handling
-            
-        Returns:
-            ParseResult with success status and parsed content
-        """
-        try:
-            # 1. Try to parse as JSON format first
-            json_lines = self._parse_json_content(content, expected_start_line)
-            if json_lines:
-                return ParseResult(True, json_lines)
-                
-            # 2. Try content-type specific parsing
-            if content_type == ContentType.SOLUTION_DESIGNER:
-                sd_lines = self._parse_solution_designer_content(content, expected_start_line)
-                if sd_lines:
-                    return ParseResult(True, sd_lines)
-            
-            # 3. Try pattern-based extraction
-            pattern_lines = self._extract_line_patterns(content, expected_start_line)
-            if pattern_lines:
-                return ParseResult(True, pattern_lines)
-                
-            # 4. All strategies failed
-            return ParseResult(False, error="No parsing strategy succeeded")
-            
-        except Exception as e:
-            self.logger.error("llm.parse_continuation_failed", error=str(e))
-            return ParseResult(False, error=f"Parsing error: {str(e)}")
-
-    def _parse_solution_designer_content(self, content: str, expected_start_line: int) -> List[Tuple[int, int, str]]:
-        """
-        Special parsing for solution_designer content with diff awareness.
-        
-        Args:
-            content: Content to parse
-            expected_start_line: Expected starting line number
-            
-        Returns:
-            List of (line_number, indent, content) tuples
-        """
-        try:
-            # Try to find diff sections and format them properly
-            if "--- " in content and "+++ " in content:
-                # Extract raw diff blocks
-                diff_pattern = r'(-{3}.*?)\n(\+{3}.*?)(?=\n-{3}|\Z)'
-                diff_matches = re.finditer(diff_pattern, content, re.DOTALL)
-                
-                numbered_lines = []
-                current_line = expected_start_line
-                
-                for match in diff_matches:
-                    diff_block = match.group(0)
-                    lines = diff_block.splitlines()
-                    
-                    for line in lines:
-                        # Preserve indentation
-                        indent = len(line) - len(line.lstrip())
-                        numbered_lines.append((current_line, indent, line))
-                        current_line += 1
-                
-                if numbered_lines:
-                    return numbered_lines
-                    
-            # If no diff blocks found, try other strategies
-            # Look for file_path fields which typically indicate solution_designer objects
-            file_path_pattern = r'"file_path"\s*:\s*"([^"]+)"'
-            if re.search(file_path_pattern, content):
-                # Try to extract as regular text with minimal parsing
-                lines = content.splitlines()
-                numbered_lines = []
-                
-                for i, line in enumerate(lines):
-                    indent = len(line) - len(line.lstrip())
-                    numbered_lines.append((expected_start_line + i, indent, line))
-                
-                return numbered_lines
-                
-            return None
-            
-        except Exception as e:
-            self.logger.error("llm.solution_designer_parse_error", error=str(e))
-            return None
-
-    def _extract_line_patterns(self, content: str, expected_start_line: int) -> List[Tuple[int, int, str]]:
-        """
-        Extract line patterns with regular expressions.
-        
-        Args:
-            content: Content to parse
-            expected_start_line: Expected starting line number
-            
-        Returns:
-            List of (line_number, indent, content) tuples
-        """
-        numbered_lines = []
-        
-        # Look for patterns like "Line X: content" or "X: content"
-        patterns = [
-            r'(?:line|Line)?\s*(\d+)\s*:\s*(.*?)$',  # Line 5: content
-            r'(\d+)[.:\)]\s*(.*?)$',                 # 5. content or 5: content
-            r'L(\d+):\s*(.*?)$'                      # L5: content
-        ]
-        
-        for pattern in patterns:
-            line_matches = []
-            for match in re.finditer(pattern, content, re.MULTILINE):
-                try:
-                    line_num = int(match.group(1))
-                    line_text = match.group(2).strip()
-                    indent = len(line_text) - len(line_text.lstrip())
-                    line_matches.append((line_num, indent, line_text))
-                except (ValueError, IndexError):
-                    continue
-            
-            if line_matches:
-                # Check if we need to adjust line numbers
-                line_matches.sort(key=lambda x: x[0])
-                if line_matches[0][0] != expected_start_line:
-                    offset = expected_start_line - line_matches[0][0]
-                    line_matches = [(ln + offset, indent, text) 
-                                  for ln, indent, text in line_matches]
-                
-                return line_matches
-        
-        return numbered_lines
-
-    def _create_raw_fallback(self, content: str, expected_start_line: int, 
-                             attempt: int) -> List[Tuple[int, int, str]]:
-        """
-        Create fallback content when all parsing fails.
-        
-        Args:
-            content: Raw content to use as fallback
-            expected_start_line: Expected starting line number
-            attempt: Current continuation attempt number
-            
-        Returns:
-            List of (line_number, indent, content) tuples
-        """
-        # Add marker line to indicate parsing failure
-        marker = f"----- CONTINUATION PARSING FAILED (ATTEMPT {attempt}) -----"
-        raw_fallback = [(expected_start_line, 0, marker)]
-        
-        # Process raw content line by line
-        raw_lines = content.splitlines()
-        if raw_lines:
-            for i, line in enumerate(raw_lines):
-                indent = len(line) - len(line.lstrip())
-                raw_fallback.append((expected_start_line + i + 1, indent, line))
-        else:
-            # No line breaks, just add the whole content
-            raw_fallback.append((expected_start_line + 1, 0, content))
-            
-        self.logger.warning("llm.using_raw_content_fallback", 
-                         raw_lines_count=len(raw_lines) if raw_lines else 1)
-        
-        return raw_fallback
-
-    def _create_solution_designer_continuation(self, accumulated_lines: List[Tuple[int, int, str]], 
-                                            next_line: int) -> str:
-        """Create specialized continuation prompt for solution_designer content."""
-        # Get context lines
-        context_json = self._create_line_json(accumulated_lines, max_context_lines=30)
-        
-        # Create example with solution_designer format
-        example = [
-            {"line": next_line, "indent": 0, "content": "    {"},
-            {"line": next_line+1, "indent": 2, "content": "      \"file_path\": \"path/to/file.py\","},
-            {"line": next_line+2, "indent": 2, "content": "      \"type\": \"modify\","},
-            {"line": next_line+3, "indent": 2, "content": "      \"description\": \"Updated function\","}
-        ]
-        example_json = json.dumps({"lines": example}, indent=2)
-        
-        # Special prompt for solution_designer - FIX HERE - DOUBLE THE CURLY BRACES
-        prompt = f"""
-    Continue the solution_designer content from line {next_line}.
-
-    CRITICAL REQUIREMENTS FOR SOLUTION DESIGNER FORMAT:
-    1. Start with line {next_line} exactly
-    2. Use the exact JSON format with line numbers and indentation
-    3. NEVER output raw diff content directly (+/- prefixed lines)
-    4. ALL content must be in the JSON lines array format
-    5. Each line of diff content must be inside a {{"line": X, "indent": Y, "content": "..."}} structure
-    6. Preserve proper escaping of special characters in the content field
-    7. Remember you are continuing inside a larger JSON structure 
-    8. Maintain proper escaping of quotes (\") and newlines (\\n) in diff content
-
-    Example format:
-    {example_json}
-
-    Previous content (for context) has been provided in the previous message.
-
-    Your continuation starting from line {next_line}:
-    ```json
-    {{
-    "lines": [
-        // Your continuation lines here, starting with line {next_line}
-    ]
-    }}
-"""
-        return prompt
-
-    def _create_json_continuation(self, accumulated_lines: List[Tuple[int, int, str]], 
-                                next_line: int) -> str:
-        """
-        Create specialized continuation prompt for JSON content.
-        
-        Args:
-            accumulated_lines: Previously accumulated content lines
-            next_line: Next line number to continue from
-            
-        Returns:
-            Continuation prompt optimized for JSON format
-        """
-        # Get context lines
-        context_json = self._create_line_json(accumulated_lines, max_context_lines=30)
-        
-        # Create example with JSON format
-        example = [
-            {"line": next_line, "indent": 4, "content": "\"key\": \"value\","},
-            {"line": next_line+1, "indent": 4, "content": "\"nested\": {"},
-            {"line": next_line+2, "indent": 8, "content": "    \"array\": ["},
-            {"line": next_line+3, "indent": 12, "content": "        \"item1\","}
-        ]
-        example_json = json.dumps({"lines": example}, indent=2)
-        
-        # Special prompt for JSON
-        prompt = f"""
-Continue the JSON content from line {next_line}.
-
-CRITICAL REQUIREMENTS FOR JSON FORMAT:
-1. Start with line {next_line} exactly
-2. Use the exact JSON format with line numbers and indentation
-3. Preserve proper JSON structure and nesting
-4. Each line should maintain appropriate indentation
-5. Remember to properly escape nested quotes and special characters
-6. Be aware of arrays, objects, and strings that need to be completed
-7. ALL content must be in the lines array JSON format, never raw JSON objects
-
-Example format:
-{example_json}
-
-Previous content (for context) has been provided in the previous message.
-
-Your continuation starting from line {next_line}:
-```json
-{{
-  "lines": [
-    // Your continuation lines here, starting with line {next_line}
-  ]
-}}
-```
-"""
-        return prompt
-
-    def _format_with_line_numbers_and_indentation(self, content: str) -> List[Tuple[int, int, str]]:
-        """
-        Format content with line numbers and indentation tracking.
-        
-        Args:
-            content: Raw content to format
-            
-        Returns:
-            List of (line_number, indent, content) tuples
-        """
-        lines = content.splitlines()
-        result = []
-        
-        for i, line in enumerate(lines):
-            # Calculate leading whitespace (indentation)
-            indent = len(line) - len(line.lstrip())
-            result.append((i+1, indent, line))
-        
-        return result
-        
-    def _create_line_json(self, numbered_lines: List[Tuple[int, int, str]], 
-                         max_context_lines: int = 30) -> str:
-        """
-        Create JSON array with line numbers and indentation.
-        
-        Args:
-            numbered_lines: List of (line_number, indent, content) tuples
-            max_context_lines: Maximum number of context lines to include
-            
-        Returns:
-            JSON string representing the context lines
-        """
-        # Take last N lines for context
-        context_lines = numbered_lines[-min(max_context_lines, len(numbered_lines)):]
-        
-        lines_data = []
-        for line_num, indent, content in context_lines:
-            lines_data.append({
-                "line": line_num,
-                "indent": indent,
-                "content": content
-            })
-            
-        return json.dumps({"lines": lines_data}, indent=2)
-        
-    def _create_numbered_continuation_prompt(self, context_json: str, 
-                                           next_line: int, 
-                                           content_type: str) -> str:
-        """
-        Create continuation prompt with numbered line and indentation instructions.
-        
-        Args:
-            context_json: JSON string with context lines
-            next_line: Next line number
-            content_type: Type of content being continued
-            
-        Returns:
-            Continuation prompt
-        """
-        # Get appropriate example based on content type
-        if content_type == ContentType.CODE:
-            example = [
-                {"line": next_line, "indent": 4, "content": "def example_function():"},
-                {"line": next_line+1, "indent": 8, "content": "    return \"Hello World\""},
-                {"line": next_line+2, "indent": 0, "content": ""},
-                {"line": next_line+3, "indent": 0, "content": "# This is a comment"}
-            ]
-        elif content_type in (ContentType.JSON, ContentType.JSON_CODE):
-            example = [
-                {"line": next_line, "indent": 4, "content": "\"key\": \"value\","},
-                {"line": next_line+1, "indent": 4, "content": "\"nested\": {"},
-                {"line": next_line+2, "indent": 8, "content": "    \"array\": ["},
-                {"line": next_line+3, "indent": 12, "content": "        \"item1\","}
-            ]
-        elif content_type == ContentType.SOLUTION_DESIGNER:
-            example = [
-                {"line": next_line, "indent": 0, "content": "    {"},
-                {"line": next_line+1, "indent": 2, "content": "      \"file_path\": \"path/to/file.py\","},
-                {"line": next_line+2, "indent": 2, "content": "      \"type\": \"modify\","},
-                {"line": next_line+3, "indent": 2, "content": "      \"description\": \"Updated function\","}
-            ]
-        else:
-            example = [
-                {"line": next_line, "indent": 0, "content": "Your continued content here"},
-                {"line": next_line+1, "indent": 0, "content": "Next line of content"}
-            ]
-
-        example_json = json.dumps({"lines": example}, indent=2)
-
-        prompt = f"""
-Continue the {content_type} content from line {next_line}.
-
-CRITICAL REQUIREMENTS:
-1. Start with line {next_line} exactly
-2. Use the exact same JSON format with line numbers and indentation
-3. Preserve proper indentation for code/structured content
-4. Do not modify or repeat any previous lines
-5. Maintain exact indentation levels matching the content type
-6. Do not escape newlines in content (write actual newlines, not \\n)
-7. Keep all string literals intact
-8. Return an array of JSON objects with line, indent, and content fields
-9. For solution designer content, ensure proper formatting of diffs and JSON structure
-10. **DO NOT** add any explanatory text or comments after the JSON content as it will break the parsing
-
-Example format:
-{example_json}
-
-Previous content (for context) has been provided in the previous message.
-
-Your continuation starting from line {next_line}:
-```json
-{{
-  "lines": [
-    // Your continuation lines here, starting with line {next_line}
-  ]
-}}
-```
-"""
-        return prompt
-
-    def _parse_json_content(self, content: str, expected_start_line: int) -> List[Tuple[int, int, str]]:
-        """
-        Parse content with line numbers and indentation from JSON format.
-        
-        Args:
-            content: Content to parse
-            expected_start_line: Expected starting line number
-            
-        Returns:
-            List of (line_number, indent, content) tuples or None if parsing fails
-        """
-        numbered_lines = []
-        try:
-            # Try to extract content from different formats
-            json_content = None
-            
-            # 1. Look for markdown code blocks
-            json_match = re.search(r'```(?:json)?\s*([\s\S]+?)\s*```', content)
-            if json_match:
-                json_content = json_match.group(1)
-                
-            # 2. Look for direct JSON object
-            elif not json_content:
-                json_match = re.search(r'(\{\s*"lines"\s*:\s*\[[\s\S]+?\]\s*\})', content)
-                if json_match:
-                    json_content = json_match.group(1)
-                    
-            # 3. Use raw content as fallback
-            if not json_content:
-                json_content = content
-            
-            # Try to parse the JSON content
-            try:
-                data = json.loads(json_content)
-            except json.JSONDecodeError:
-                # Look for JSON array and wrap it
-                array_match = re.search(r'\[\s*\{\s*"line"[\s\S]+?\}\s*\]', content)
-                if array_match:
-                    try:
-                        array_json = '{"lines": ' + array_match.group(0) + '}'
-                        data = json.loads(array_json)
-                    except json.JSONDecodeError:
-                        # Extract line objects from text
-                        line_objects = self._extract_line_objects(content)
-                        if line_objects:
-                            data = {"lines": line_objects}
-                        else:
-                            return None
-                else:
-                    return None
-            
-            # Extract lines from the data
-            lines = data.get("lines", [])
-            if not lines and isinstance(data, list):
-                lines = data
-            
-            # Process line objects
-            min_line_num = float('inf')
-            for line_data in lines:
-                try:
-                    line_num = line_data.get("line")
-                    if line_num is None:
-                        continue
-                        
-                    indent = line_data.get("indent", 0)
-                    line_text = line_data.get("content", "")
-                    
-                    # Track lowest line number
-                    if line_num < min_line_num:
-                        min_line_num = line_num
-                        
-                    numbered_lines.append((line_num, indent, line_text))
-                except (TypeError, AttributeError):
-                    continue
-            
-            # Check if we need to adjust line numbers
-            if numbered_lines and min_line_num != float('inf') and min_line_num != expected_start_line:
-                # Adjust line numbers
-                offset = expected_start_line - min_line_num
-                adjusted_lines = []
-                for line_num, indent, text in numbered_lines:
-                    adjusted_line_num = line_num + offset
-                    adjusted_lines.append((adjusted_line_num, indent, text))
-                numbered_lines = adjusted_lines
-            
-            # Sort and deduplicate
-            if numbered_lines:
-                # Sort by line number
-                numbered_lines.sort(key=lambda x: x[0])
-                
-                # Deduplicate
-                deduped_lines = []
-                seen_line_nums = set()
-                for ln in numbered_lines:
-                    if ln[0] not in seen_line_nums:
-                        deduped_lines.append(ln)
-                        seen_line_nums.add(ln[0])
-                
-                return deduped_lines
-            
-            return None
-            
-        except Exception as e:
-            self.logger.error("llm.json_parse_error", error=str(e))
-            return None
-
-    def _extract_line_objects(self, content: str) -> List[Dict[str, Any]]:
-        """
-        Extract individual line objects using regex.
-        
-        Args:
-            content: Content to extract from
-            
-        Returns:
-            List of line objects or empty list if extraction fails
-        """
-        line_objects = []
-        
-        # Try multiple patterns
-        patterns = [
-            # Standard JSON format
-            r'\{\s*"line"\s*:\s*(\d+)[^}]*"indent"\s*:\s*(\d+)[^}]*"content"\s*:\s*"([^"]*)"',
-            # Alternative format without quotes for keys
-            r'\{\s*line\s*:\s*(\d+)[^}]*indent\s*:\s*(\d+)[^}]*content\s*:\s*"([^"]*)"',
-            # Format with equal signs
-            r'line\s*=\s*(\d+)[^,}]*indent\s*=\s*(\d+)[^,}]*content\s*=\s*"([^"]*)"'
-        ]
-        
-        for pattern in patterns:
-            matches = re.finditer(pattern, content)
-            for match in matches:
-                try:
-                    line_num = int(match.group(1))
-                    indent = int(match.group(2))
-                    content_text = match.group(3)
-                    
-                    # Unescape content
-                    content_text = content_text.replace('\\"', '"').replace('\\\\', '\\')
-                    
-                    line_objects.append({
-                        "line": line_num,
-                        "indent": indent,
-                        "content": content_text
-                    })
-                except (ValueError, IndexError):
-                    continue
-                    
-        return line_objects
-
-    def _repair_solution_designer_parse(self, content: str, expected_start_line: int) -> List[Tuple[int, int, str]]:
-        """
-        Special repair for solution_designer content.
-        
-        Args:
-            content: Content to repair
-            expected_start_line: Expected starting line number
-            
-        Returns:
-            List of (line_number, indent, content) tuples or None if repair fails
-        """
-        try:
-            # Check if this is solution_designer content by looking for specific patterns
-            is_solution = re.search(r'"file_path"\s*:|"diff"\s*:|"type"\s*:\s*"(?:create|modify|delete)"', content)
-            if not is_solution:
-                return None
-                
-            # Try to handle the solution_designer format specially
-            # 1. Look for diff content
-            if '+++' in content and '---' in content:
-                # This likely contains raw diff content
-                lines = content.splitlines()
-                numbered_lines = []
-                
-                for i, line in enumerate(lines):
-                    # Calculate indentation
-                    indent = len(line) - len(line.lstrip())
-                    
-                    # Special handling for diff lines
-                    if line.startswith('+') or line.startswith('-') or line.startswith('@'):
-                        # Increase indent for diff lines for better readability
-                        indent += 2
-                    
-                    numbered_lines.append((expected_start_line + i, indent, line))
-                
-                return numbered_lines
-            
-            # 2. Try to extract any objects
-            file_path_match = re.search(r'"file_path"\s*:\s*"([^"]+)"', content)
-            if file_path_match:
-                # This looks like a solution_designer object
-                # Just format as regular text with basic structure
-                lines = content.splitlines()
-                numbered_lines = []
-                
-                for i, line in enumerate(lines):
-                    indent = len(line) - len(line.lstrip())
-                    numbered_lines.append((expected_start_line + i, indent, line))
-                
-                return numbered_lines
-            
-            # Couldn't repair with special handling
-            return None
-            
-        except Exception as e:
-            self.logger.error("llm.solution_designer_repair_failed", error=str(e))
-            return None
-
-    def _attempt_repair_parse(self, content: str, expected_start_line: int) -> List[Tuple[int, int, str]]:
-        """
-        Attempt flexible repair parsing for general content.
-        
-        Args:
-            content: Content to repair parse
-            expected_start_line: Expected starting line number
-            
-        Returns:
-            List of (line_number, indent, content) tuples or None if repair fails
-        """
-        numbered_lines = []
-        
-        # Try flexible pattern matches
-        patterns = [
-            # Line number at start of line
-            r'^\s*(\d+)[\s:.-]+(.*)$',
-            # Common patterns like "Line X:"
-            r'(?:line|Line)?\s*(\d+)[^\n]*:\s*([^\n]*)',
-            # Numbered list items
-            r'(\d+)[.:\)]\s*([^\n]*)',
-            # Line prefixes
-            r'L(\d+):\s*([^\n]*)'
-        ]
-        
-        for pattern in patterns:
-            matches = re.finditer(pattern, content, re.MULTILINE)
-            for match in matches:
-                try:
-                    line_num = int(match.group(1))
-                    line_text = match.group(2).strip()
-                    indent = len(line_text) - len(line_text.lstrip())
-                    numbered_lines.append((line_num, indent, line_text))
-                except (ValueError, IndexError):
-                    continue
-        
-        # If we found lines, sort and adjust line numbers if needed
-        if numbered_lines:
-            numbered_lines.sort(key=lambda x: x[0])
-            
-            # Check if we need to adjust line numbers
-            if numbered_lines[0][0] != expected_start_line:
-                offset = expected_start_line - numbered_lines[0][0]
-                adjusted_lines = [(ln[0] + offset, ln[1], ln[2]) for ln in numbered_lines]
-                numbered_lines = adjusted_lines
-            
-            # Deduplicate
-            deduped_lines = []
-            seen_line_nums = set()
-            for ln in numbered_lines:
-                if ln[0] not in seen_line_nums:
-                    deduped_lines.append(ln)
-                    seen_line_nums.add(ln[0])
-            
-            return deduped_lines
-        
-        # If all pattern matching failed, fall back to raw content processing
-        raw_lines = content.splitlines()
-        if raw_lines:
-            # Process raw content line by line
-            result = []
-            for i, line in enumerate(raw_lines):
-                indent = len(line) - len(line.lstrip())
-                result.append((expected_start_line + i, indent, line))
-            return result
-        
-        # No lines found at all
-        return None
-
-    def _numbered_lines_to_content(self, numbered_lines: List[Tuple[int, int, str]]) -> str:
-        """
-        Convert numbered lines back to raw content.
-        
-        Args:
-            numbered_lines: List of (line_number, indent, content) tuples
-            
-        Returns:
-            Raw content string
-        """
-        # Sort by line number to ensure correct order
-        sorted_lines = sorted(numbered_lines, key=lambda x: x[0])
-        
-        # Extract content with preserved indentation
-        content_lines = [line[2] for line in sorted_lines]
-        
-        return "\n".join(content_lines)
-
-    def _clean_json_content(self, content: str, content_type: str) -> str:
-        """
-        Clean JSON content by removing artifacts and fixing structure.
-        
-        Args:
-            content: Content to clean
-            content_type: Type of content
-            
-        Returns:
-            Cleaned content
-        """
-        # Remove any trailing {"lines": []} pattern
-        lines_pattern = r'\s*\{\s*"lines"\s*:\s*\[\s*\]\s*\}\s*$'
-        if re.search(lines_pattern, content):
-            cleaned_content = re.sub(lines_pattern, '', content)
-            self.logger.info("llm.removed_trailing_lines_array", 
-                          original_length=len(content),
-                          cleaned_length=len(cleaned_content))
-            content = cleaned_content
-        
-        # For JSON content, ensure we have a complete object/array
-        if content_type in (ContentType.JSON, ContentType.JSON_CODE, ContentType.SOLUTION_DESIGNER):
-            if '{"lines":' in content:
-                # Try to extract any JSON array if embedded in lines array
-                if content.startswith('[') and ']' in content:
-                    # Find end of array
-                    array_end = content.find(']') + 1
-                    if array_end > 0:
-                        try:
-                            # Validate JSON array
-                            potential_json = content[:array_end]
-                            json.loads(potential_json)
-                            if len(potential_json) < len(content):
-                                content = potential_json
-                        except json.JSONDecodeError:
-                            pass
-                
-                # Try to extract any JSON object
-                elif content.startswith('{') and '}' in content:
-                    # Find end of object
-                    obj_end = content.find('}') + 1
-                    if obj_end > 0:
-                        try:
-                            # Validate JSON object
-                            potential_json = content[:obj_end]
-                            json.loads(potential_json)
-                            if len(potential_json) < len(content):
-                                content = potential_json
-                        except json.JSONDecodeError:
-                            pass
-        
-        return content
 
     def _detect_content_type(self, messages: List[Dict[str, str]]) -> str:
         """
@@ -1041,42 +201,567 @@ Your continuation starting from line {next_line}:
         Returns:
             Content type string
         """
-        # Extract content from messages
-        content = ""
-        for msg in messages:
-            if msg.get("role") == "user":
-                content = msg.get("content", "")
-                break
-        
-        # Check for solution_designer format
-        is_solution_designer = any('"changes":' in msg.get("content", "") and 
-                                '"file_path":' in msg.get("content", "") and 
-                                '"diff":' in msg.get("content", "")
-                                for msg in messages)
-                                
-        # Check for specific content types
-        is_code = any("```" in msg.get("content", "") or "def " in msg.get("content", "")
-                    for msg in messages if msg.get("role") == "user")
-        is_json = any("json" in msg.get("content", "").lower() or 
-                    msg.get("content", "").strip().startswith("{") or 
-                    msg.get("content", "").strip().startswith("[")
-                    for msg in messages if msg.get("role") == "user")
-        is_diff = any("--- " in msg.get("content", "") and "+++ " in msg.get("content", "")
-                    for msg in messages if msg.get("role") == "user")
-        
-        # Determine content type
-        if is_solution_designer:
-            return ContentType.SOLUTION_DESIGNER
-        elif is_code and is_json:
-            return ContentType.JSON_CODE
-        elif is_code:
-            return ContentType.CODE
-        elif is_json:
-            return ContentType.JSON
-        elif is_diff:
-            return ContentType.DIFF
-        else:
+        try:
+            content = ""
+            for msg in messages:
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    break
+            
+            is_solution_designer = any('"changes":' in msg.get("content", "") and 
+                                    '"file_path":' in msg.get("content", "") and 
+                                    '"diff":' in msg.get("content", "")
+                                    for msg in messages if msg.get("role") == "user")
+            is_code = any("```" in msg.get("content", "") or "def " in msg.get("content", "")
+                        for msg in messages if msg.get("role") == "user")
+            is_json = any("json" in msg.get("content", "").lower() or 
+                        msg.get("content", "").strip().startswith("{") or 
+                        msg.get("content", "").strip().startswith("[")
+                        for msg in messages if msg.get("role") == "user")
+            is_diff = any("--- " in msg.get("content", "") and "+++ " in msg.get("content", "")
+                        for msg in messages if msg.get("role") == "user")
+            
+            if is_solution_designer:
+                detected_type = ContentType.SOLUTION_DESIGNER
+            elif is_code and is_json:
+                detected_type = ContentType.JSON_CODE
+            elif is_code:
+                detected_type = ContentType.CODE
+            elif is_json:
+                detected_type = ContentType.JSON
+            elif is_diff:
+                detected_type = ContentType.DIFF
+            else:
+                detected_type = ContentType.TEXT
+                
+            self.logger.debug("Content type detected", extra={"type": detected_type})
+            return detected_type
+        except Exception as e:
+            self.logger.error("Content type detection failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
             return ContentType.TEXT
+
+    def _calculate_overlap_window(self, content: str, content_type: str) -> str:
+        """
+        Calculate appropriate overlap window based on content type.
+        
+        Args:
+            content: Content to extract overlap from
+            content_type: Type of content for specialized handling
+            
+        Returns:
+            Overlap window
+        """
+        try:
+            if content_type == ContentType.SOLUTION_DESIGNER:
+                window_size = min(max(len(content) // 3, 200), self.max_overlap_size)
+            elif content_type in (ContentType.JSON, ContentType.JSON_CODE):
+                window_size = min(max(len(content) // 3, 150), self.max_overlap_size)
+            elif content_type == ContentType.CODE:
+                window_size = min(max(len(content) // 4, 100), self.max_overlap_size)
+            else:
+                window_size = min(max(len(content) // 5, 80), self.max_overlap_size)
+            
+            window = content[-window_size:]
+            
+            if content_type in (ContentType.JSON, ContentType.JSON_CODE, ContentType.SOLUTION_DESIGNER):
+                adjusted_window = self._align_json_window(window)
+                if adjusted_window:
+                    window = adjusted_window
+            elif content_type == ContentType.CODE:
+                adjusted_window = self._align_code_window(window)
+                if adjusted_window:
+                    window = adjusted_window
+            
+            self.logger.debug("Overlap window calculated",
+                            extra={"window_size": len(window), "content_type": content_type})
+            return window
+        except Exception as e:
+            self.logger.error("Overlap window calculation failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return content[-self.min_overlap_size:]
+
+    def _align_json_window(self, window: str) -> Optional[str]:
+        """
+        Align window with JSON structure boundaries.
+        
+        Args:
+            window: Current window
+            
+        Returns:
+            Adjusted window or None if no adjustment needed
+        """
+        try:
+            open_braces = window.count('{')
+            close_braces = window.count('}')
+            open_brackets = window.count('[')
+            close_brackets = window.count(']')
+            
+            if open_braces == close_braces and open_brackets == close_brackets:
+                return window
+                
+            if open_braces > close_braces:
+                brace_balance = 0
+                for i in range(len(window) - 1, -1, -1):
+                    if window[i] == '}':
+                        brace_balance += 1
+                    elif window[i] == '{':
+                        brace_balance -= 1
+                        if brace_balance < 0:
+                            return window[i:]
+                            
+            if open_brackets > close_brackets:
+                bracket_balance = 0
+                for i in range(len(window) - 1, -1, -1):
+                    if window[i] == ']':
+                        bracket_balance += 1
+                    elif window[i] == '[':
+                        bracket_balance -= 1
+                        if bracket_balance < 0:
+                            return window[i:]
+            
+            return window
+        except Exception as e:
+            self.logger.error("JSON window alignment failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return window
+
+    def _align_code_window(self, window: str) -> Optional[str]:
+        """
+        Align window with code block boundaries.
+        
+        Args:
+            window: Current window
+            
+        Returns:
+            Adjusted window or None if no adjustment needed
+        """
+        try:
+            lines = window.split('\n')
+            if len(lines) <= 1:
+                return window
+            
+            first_line = lines[0]
+            first_indent = len(first_line) - len(first_line.lstrip())
+            
+            if first_indent > 0:
+                for i, line in enumerate(lines):
+                    if line.strip() and len(line) - len(line.lstrip()) < first_indent:
+                        return '\n'.join(lines[i:])
+            
+            return window
+        except Exception as e:
+            self.logger.error("Code window alignment failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return window
+
+    def _create_continuation_prompt(self, overlap: str, content_type: str) -> str:
+        """
+        Create continuation prompt based on content type.
+        
+        Args:
+            overlap: Overlap window
+            content_type: Type of content
+            
+        Returns:
+            Continuation prompt
+        """
+        try:
+            if content_type == ContentType.SOLUTION_DESIGNER:
+                prompt = """
+I need you to continue the following content exactly from where it left off.
+
+CRITICAL REQUIREMENTS:
+1. You are continuing a Solution Designer response with JSON structure
+2. Maintain the exact structure including proper escaping of quotation marks
+3. Continue precisely where the text ends, never repeating any content
+4. For diff sections, ensure proper escaping of newlines (\\n) and quotes (\")
+5. Never output explanatory text or comments outside the JSON structure
+6. Complete any unfinished JSON objects, arrays, or properties
+"""
+            elif content_type in (ContentType.JSON, ContentType.JSON_CODE):
+                prompt = """
+I need you to continue the following content exactly from where it left off.
+
+CRITICAL REQUIREMENTS:
+1. You are continuing a JSON structure
+2. Maintain the exact structure with proper nesting
+3. Continue precisely where the text ends, never repeating any content
+4. Ensure proper escaping of special characters
+5. Complete any unfinished JSON objects, arrays, or properties
+6. Never add explanatory text or comments outside the JSON structure
+"""
+            elif content_type == ContentType.CODE:
+                prompt = """
+I need you to continue the following content exactly from where it left off.
+
+CRITICAL REQUIREMENTS:
+1. You are continuing code
+2. Maintain consistent indentation and coding style
+3. Continue precisely where the text ends, never repeating any content
+4. Complete any unfinished functions, blocks, or statements
+5. Never add explanatory text or comments outside the code
+"""
+            else:
+                prompt = """
+I need you to continue the following content exactly from where it left off.
+
+CRITICAL REQUIREMENTS:
+1. Continue precisely where the text ends, never repeating any content
+2. Maintain the same style, formatting, and tone as the original
+3. Do not add any explanatory text, headers, or comments
+"""
+            
+            prompt += """
+Here's the content to continue. Continue FROM THE EXACT END of this text:
+
+------------BEGIN CONTENT------------
+{}
+------------END CONTENT------------
+
+Continue exactly from where this leaves off, maintaining the same format and structure.
+""".format(overlap)
+            
+            self.logger.debug("Continuation prompt created",
+                            extra={"content_type": content_type, "prompt_length": len(prompt)})
+            return prompt
+        except Exception as e:
+            self.logger.error("Continuation prompt creation failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return f"Continue from: {overlap}"
+
+    def _join_continuations(
+        self,
+        previous: str,
+        current: str,
+        content_type: str
+    ) -> Tuple[str, str]:
+        """
+        Join continuations using multiple strategies with simplified failure fallback.
+        
+        Args:
+            previous: Previous content
+            current: Current continuation
+            content_type: Type of content
+            
+        Returns:
+            Tuple of (joined_content, join_method)
+        """
+        self.logger.debug("Attempting to join continuations",
+                        extra={"prev_length": len(previous), "curr_length": len(current),
+                               "content_type": content_type})
+        
+        exact_match = self._find_exact_overlap(previous, current)
+        if exact_match:
+            joined = previous + current[len(exact_match):]
+            self.logger.debug("Exact match found", extra={"overlap_length": len(exact_match)})
+            return joined, "exact_matches"
+        
+        token_match = self._find_token_match(previous, current)
+        if token_match:
+            position, confidence = token_match
+            if confidence >= 0.7:
+                joined = previous + current[position:]
+                self.logger.debug("Token match found",
+                                extra={"position": position, "confidence": confidence})
+                return joined, "token_matches"
+        
+        if content_type == ContentType.SOLUTION_DESIGNER:
+            solution_join = self._join_solution_designer(previous, current)
+            if solution_join:
+                self.logger.debug("Solution designer join successful")
+                return solution_join, "structure_matches"
+        elif content_type in (ContentType.JSON, ContentType.JSON_CODE):
+            json_join = self._join_json_content(previous, current)
+            if json_join:
+                self.logger.debug("JSON join successful")
+                return json_join, "structure_matches"
+        
+        fuzzy_match = self._find_fuzzy_match(previous, current)
+        if fuzzy_match:
+            self.logger.debug("Fuzzy match found")
+            return fuzzy_match, "fuzzy_matches"
+        
+        append_marker = f"\n--- UNABLE TO GUARANTEE STITCHING ---\n"
+        joined = previous + append_marker + current
+        self.logger.warning("Unable to guarantee stitching, using append fallback",
+                          extra={"content_type": content_type})
+        return joined, "append_fallbacks"
+
+    def _find_exact_overlap(self, previous: str, current: str) -> Optional[str]:
+        """
+        Find exact overlap between previous and current content.
+        
+        Args:
+            previous: Previous content
+            current: Current continuation
+            
+        Returns:
+            Overlap text if found, None otherwise
+        """
+        try:
+            min_size = min(self.min_overlap_size, len(previous), len(current))
+            max_size = min(self.max_overlap_size, len(previous), len(current))
+            
+            for size in range(max_size, min_size - 1, -10):
+                overlap = previous[-size:]
+                if current.startswith(overlap):
+                    return overlap
+            
+            for size in range(min_size, max_size + 1):
+                if size % 10 == 0:
+                    continue
+                overlap = previous[-size:]
+                if current.startswith(overlap):
+                    return overlap
+                    
+            return None
+        except Exception as e:
+            self.logger.error("Exact overlap detection failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return None
+
+    def _find_token_match(self, previous: str, current: str) -> Optional[Tuple[int, float]]:
+        """
+        Find token-based overlap between previous and current content.
+        
+        Args:
+            previous: Previous content
+            current: Current continuation
+            
+        Returns:
+            Tuple of (position, confidence) if match found, None otherwise
+        """
+        try:
+            prev_tokens = self._tokenize(previous[-1000:])
+            curr_tokens = self._tokenize(current[:1000])
+            
+            if not prev_tokens or not curr_tokens:
+                self.logger.debug("No tokens available for matching")
+                return None
+                
+            best_match_len = 0
+            best_match_pos = 0
+            
+            for i in range(len(prev_tokens) - 4):
+                prev_seq = prev_tokens[i:i+5]
+                for j in range(len(curr_tokens) - 4):
+                    curr_seq = curr_tokens[j:j+5]
+                    if prev_seq == curr_seq:
+                        match_len = 5
+                        while (i + match_len < len(prev_tokens) and 
+                               j + match_len < len(curr_tokens) and 
+                               prev_tokens[i + match_len] == curr_tokens[j + match_len]):
+                            match_len += 1
+                        if match_len > best_match_len:
+                            best_match_len = match_len
+                            best_match_pos = j
+            
+            if best_match_len >= 5:
+                char_pos = 0
+                for k in range(best_match_pos):
+                    char_pos += len(curr_tokens[k]) + 1
+                confidence = min(best_match_len / 10, 1.0)
+                return char_pos, confidence
+                
+            return None
+        except Exception as e:
+            self.logger.error("Token match detection failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return None
+
+    def _tokenize(self, text: str) -> List[str]:
+        """
+        Simple tokenization for token matching.
+        
+        Args:
+            text: Text to tokenize
+            
+        Returns:
+            List of tokens
+        """
+        try:
+            return re.findall(r'\w+|[^\w\s]', text)
+        except Exception as e:
+            self.logger.error("Tokenization failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return text.split()
+
+    def _find_fuzzy_match(self, previous: str, current: str) -> Optional[str]:
+        """
+        Find fuzzy match using hash-based approach.
+        
+        Args:
+            previous: Previous content
+            current: Current continuation
+            
+        Returns:
+            Joined content if match found, None otherwise
+        """
+        try:
+            prev_norm = ''.join(previous.lower().split())
+            curr_norm = ''.join(current.lower().split())
+            
+            for window_size in [100, 70, 50, 30]:
+                if len(prev_norm) < window_size or len(curr_norm) < window_size:
+                    continue
+                prev_hash = hashlib.md5(prev_norm[-window_size:].encode()).hexdigest()
+                for i in range(len(curr_norm) - window_size + 1):
+                    curr_window = curr_norm[i:i+window_size]
+                    curr_hash = hashlib.md5(curr_window.encode()).hexdigest()
+                    if prev_hash == curr_hash:
+                        char_pos = len(current) * i // len(curr_norm)
+                        return previous + current[char_pos:]
+            return None
+        except Exception as e:
+            self.logger.error("Fuzzy match detection failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return None
+
+    def _join_solution_designer(self, previous: str, current: str) -> Optional[str]:
+        """
+        Join solution designer content with structure awareness.
+        
+        Args:
+            previous: Previous content
+            current: Current continuation
+            
+        Returns:
+            Joined content if successful, None otherwise
+        """
+        try:
+            open_braces = previous.count('{') - previous.count('}')
+            open_brackets = previous.count('[') - previous.count(']')
+            open_quotes = previous.count('"') % 2
+            
+            if open_braces == 0 and open_brackets == 0 and open_quotes == 0:
+                if re.match(r'^\s*\{', current):
+                    if re.search(r',\s*$', previous) or re.search(r'\[\s*$', previous):
+                        return previous + current
+                    elif re.search(r'\}\s*$', previous):
+                        return previous + ',\n' + current
+            
+            patterns = [
+                r'"file_path"\s*:\s*"[^"]+"\s*,',
+                r'"type"\s*:\s*"[^"]+"\s*,',
+                r'"description"\s*:\s*"[^"]+"\s*,',
+                r'"diff"\s*:\s*"'
+            ]
+            
+            for pattern in patterns:
+                prev_match = re.search(f'({pattern})\\s*$', previous)
+                if prev_match:
+                    curr_match = re.search(f'^\\s*({pattern})', current)
+                    if curr_match:
+                        return previous + current[curr_match.end():]
+            
+            if '"diff": "' in previous and not previous.endswith('"'):
+                diff_markers = ['---', '+++', '@@', '+', '-']
+                for marker in diff_markers:
+                    if current.startswith(marker):
+                        return previous + current
+            
+            return None
+        except Exception as e:
+            self.logger.error("Solution designer join failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return None
+
+    def _join_json_content(self, previous: str, current: str) -> Optional[str]:
+        """
+        Join JSON content with structure awareness.
+        
+        Args:
+            previous: Previous content
+            current: Current continuation
+            
+        Returns:
+            Joined content if successful, None otherwise
+        """
+        try:
+            open_braces = previous.count('{') - previous.count('}')
+            open_brackets = previous.count('[') - previous.count(']')
+            open_quotes = previous.count('"') % 2
+            
+            if open_braces > 0 or open_brackets > 0:
+                prop_pattern = r'"[^"]+"\s*:\s*'
+                if re.search(prop_pattern + r'$', previous):
+                    return previous + current
+                if previous.rstrip().endswith(','):
+                    return previous + current
+                if previous.rstrip().endswith('{') or previous.rstrip().endswith('['):
+                    return previous + current
+            
+            return None
+        except Exception as e:
+            self.logger.error("JSON join failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return None
+
+    def _structure_aware_join(self, previous: str, current: str, content_type: str) -> str:
+        """
+        Join content with structure awareness as fallback.
+        
+        Args:
+            previous: Previous content
+            current: Current continuation
+            content_type: Type of content
+            
+        Returns:
+            Joined content
+        """
+        try:
+            previous = previous.rstrip()
+            current = current.lstrip()
+            
+            if content_type in (ContentType.JSON, ContentType.JSON_CODE, ContentType.SOLUTION_DESIGNER):
+                if previous.endswith('}') and (current.startswith('{') or current.startswith('"')):
+                    return previous + ',\n' + current
+                elif previous.endswith('"') and current.startswith('"'):
+                    return previous + ',\n' + current
+                elif previous.endswith('}') and not current.startswith('}') and not current.startswith(']'):
+                    return previous + ',\n' + current
+            elif content_type == ContentType.CODE:
+                if not previous.endswith('\n') and not current.startswith('\n'):
+                    return previous + '\n' + current
+            
+            return previous + '\n' + current
+        except Exception as e:
+            self.logger.error("Structure-aware join failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return previous + '\n' + current
+
+    def _clean_json_content(self, content: str) -> str:
+        """
+        Clean up JSON content by removing artifacts and fixing structure.
+        
+        Args:
+            content: Content to clean
+            
+        Returns:
+            Cleaned content
+        """
+        try:
+            if '{' in content and '}' in content:
+                open_braces = content.count('{')
+                close_braces = content.count('}')
+                if open_braces > close_braces:
+                    missing = open_braces - close_braces
+                    content += '\n' + '}' * missing
+                    self.logger.debug("Added missing closing braces", extra={"count": missing})
+                
+                open_brackets = content.count('[')
+                close_brackets = content.count(']')
+                if open_brackets > close_brackets:
+                    missing = open_brackets - close_brackets
+                    content += '\n' + ']' * missing
+                    self.logger.debug("Added missing closing brackets", extra={"count": missing})
+                    
+            return content
+        except Exception as e:
+            self.logger.error("JSON cleaning failed",
+                           extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return content
 
     def _build_completion_params(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
         """
@@ -1088,27 +773,28 @@ Your continuation starting from line {next_line}:
         Returns:
             Dictionary of completion parameters
         """
-        completion_params = {
-            "model": self.model_str,
-            "messages": messages,
-        }
-
-        # Only add temperature for providers that support it
-        if self.provider.value != "openai":
-            completion_params["temperature"] = self.temperature
+        try:
+            completion_params = {
+                "model": self.model_str,
+                "messages": messages,
+            }
+            if self.provider.value != "openai":
+                completion_params["temperature"] = self.temperature
             
-        # Add provider-specific params
-        provider_config = self.parent._get_provider_config(self.provider)
-        
-        # Add model-specific parameters from config
-        model_params = provider_config.get("model_params", {})
-        if model_params:
-            completion_params.update(model_params)
-        
-        if "api_base" in provider_config:
-            completion_params["api_base"] = provider_config["api_base"]
+            provider_config = self.parent._get_provider_config(self.provider)
+            model_params = provider_config.get("model_params", {})
+            if model_params:
+                completion_params.update(model_params)
+            
+            if "api_base" in provider_config:
+                completion_params["api_base"] = provider_config["api_base"]
                 
-        return completion_params
+            self.logger.debug("Completion parameters built", extra={"params": completion_params})
+            return completion_params
+        except Exception as e:
+            self.logger.error("Completion params build failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            raise
 
     def _make_llm_request(self, completion_params: Dict[str, Any]) -> Any:
         """
@@ -1121,35 +807,32 @@ Your continuation starting from line {next_line}:
             LLM response
         """
         try:
-            # Configure litellm
             litellm.retry = True
             litellm.max_retries = 3
             litellm.retry_wait = 2
             litellm.max_retry_wait = 60
             litellm.retry_exponential = True
-                
-            # Filter to only supported parameters
+            
             safe_params = {
-                k: v for k, v in completion_params.items() 
+                k: v for k, v in completion_params.items()
                 if k in ['model', 'messages', 'temperature', 'max_tokens', 'top_p', 'stream']
             }
             
-            # Add API base from provider config
             provider_config = self.parent._get_provider_config(self.provider)
             if "api_base" in provider_config:
                 safe_params["api_base"] = provider_config["api_base"]
-                    
+                
+            self.logger.debug("Making LLM request", extra={"params": safe_params})
             response = completion(**safe_params)
             return response
-            
         except litellm.RateLimitError as e:
-            self.logger.warning("llm.rate_limit_error", error=str(e)[:200])
+            self.logger.warning("Rate limit error in LLM request", extra={"error": str(e)})
             raise
-            
         except Exception as e:
-            self.logger.error("llm.request_error", error=str(e))
+            self.logger.error("LLM request failed",
+                           extra={"error": str(e), "stack_trace": traceback.format_exc()})
             raise
-        
+
     def _get_content_from_response(self, response: Any) -> str:
         """
         Extract content from LLM response.
@@ -1160,7 +843,16 @@ Your continuation starting from line {next_line}:
         Returns:
             Content string
         """
-        if hasattr(response, 'choices') and response.choices:
-            if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
-                return response.choices[0].message.content
-        return ""
+        try:
+            if hasattr(response, 'choices') and response.choices:
+                if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
+                    content = response.choices[0].message.content
+                    self.logger.debug("Content extracted from response",
+                                   extra={"content_preview": content[:100]})
+                    return content
+            self.logger.warning("No content found in response")
+            return ""
+        except Exception as e:
+            self.logger.error("Content extraction failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return ""
