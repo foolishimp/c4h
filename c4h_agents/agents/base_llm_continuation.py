@@ -53,10 +53,11 @@ class ContinuationHandler:
         self.min_overlap_size = 50
         self.max_overlap_size = 500
         
+        # Stitching retry configuration
+        self.max_stitching_retries = 2  # Max retries per stitching strategy
+        
         # Logger setup - Use parent agent's logger if available, otherwise fallback
         self.logger = getattr(parent_agent, 'logger', logger)
-        # Avoid setting level directly; assume it's configured elsewhere
-        # If needed, log a debug message to confirm logger initialization
         self.logger.debug("ContinuationHandler logger initialized",
                          extra={"logger_type": type(self.logger).__name__})
         
@@ -69,7 +70,8 @@ class ContinuationHandler:
             "structure_matches": 0,
             "fallbacks": 0,
             "rate_limit_retries": 0,
-            "append_fallbacks": 0
+            "append_fallbacks": 0,
+            "stitching_retries": 0
         }
 
     def get_completion_with_continuation(
@@ -78,7 +80,7 @@ class ContinuationHandler:
             max_attempts: Optional[int] = None
         ) -> Tuple[str, Any]:
         """
-        Get completion with automatic continuation using sliding window.
+        Get completion with automatic continuation using sliding window, with retry strategies for stitching failures.
         
         Args:
             messages: List of message dictionaries with role and content
@@ -131,46 +133,80 @@ class ContinuationHandler:
                                extra={"attempt": attempt, "content_type": content_type,
                                       "overlap_length": len(overlap)})
                 
-                try:
-                    cont_params = completion_params.copy()
-                    cont_params["messages"] = cont_messages
-                    response = self._make_llm_request(cont_params)
-                    cont_content = self._get_content_from_response(response)
+                stitching_success = False
+                stitching_attempts = 0
+                
+                while stitching_attempts <= self.max_stitching_retries and not stitching_success:
+                    try:
+                        cont_params = completion_params.copy()
+                        cont_params["messages"] = cont_messages
+                        response = self._make_llm_request(cont_params)
+                        cont_content = self._get_content_from_response(response)
+                        
+                        joined_content, join_method = self._join_continuations(
+                            accumulated_content, cont_content, content_type)
+                        
+                        if join_method != "append_fallbacks":  # Successful stitching
+                            self.metrics[join_method] += 1
+                            accumulated_content = joined_content
+                            final_response = response
+                            stitching_success = True
+                        else:
+                            # Stitching failed, try a strategy
+                            stitching_attempts += 1
+                            self.metrics["stitching_retries"] += 1
+                            
+                            if stitching_attempts == 1:  # Strategy 1: Resubmission
+                                self.logger.warning("Stitching failed, retrying LLM request",
+                                                  extra={"attempt": attempt, "stitching_attempt": stitching_attempts})
+                                continue
+                            
+                            elif stitching_attempts == 2:  # Strategy 2: Follow-up prompt
+                                self.logger.warning("Stitching failed, sending follow-up prompt",
+                                                  extra={"attempt": attempt, "stitching_attempt": stitching_attempts})
+                                cont_messages[-1]["content"] = self._create_follow_up_prompt(accumulated_content, content_type)
+                                continue
+                            
+                            elif stitching_attempts == 3:  # Strategy 3: Request overlap again
+                                self.logger.warning("Stitching failed, requesting overlap again",
+                                                  extra={"attempt": attempt, "stitching_attempt": stitching_attempts})
+                                cont_messages[-1]["content"] = self._create_overlap_request_prompt(overlap, content_type)
+                                continue
+                            
+                    except litellm.RateLimitError as e:
+                        rate_limit_retries += 1
+                        self.metrics["rate_limit_retries"] += 1
+                        
+                        if rate_limit_retries > self.rate_limit_max_retries:
+                            self.logger.error("Max rate limit retries exceeded",
+                                            extra={"retry_count": rate_limit_retries, "error": str(e)})
+                            raise
+                        
+                        jitter = 0.1 * rate_limit_backoff * (0.5 - random.random())
+                        current_backoff = min(rate_limit_backoff + jitter, self.rate_limit_max_backoff)
+                        
+                        self.logger.warning("Rate limit encountered, backing off",
+                                          extra={"attempt": attempt, "retry_count": rate_limit_retries,
+                                                 "backoff_seconds": current_backoff, "error": str(e)})
+                        
+                        time.sleep(current_backoff)
+                        rate_limit_backoff = min(rate_limit_backoff * 2, self.rate_limit_max_backoff)
+                        continue
                     
-                    joined_content, join_method = self._join_continuations(
-                        accumulated_content, cont_content, content_type)
-                    
-                    self.metrics[join_method] += 1
-                    accumulated_content = joined_content
-                    final_response = response
-                    
-                except litellm.RateLimitError as e:
-                    rate_limit_retries += 1
-                    self.metrics["rate_limit_retries"] += 1
-                    
-                    if rate_limit_retries > self.rate_limit_max_retries:
-                        self.logger.error("Max rate limit retries exceeded",
-                                        extra={"retry_count": rate_limit_retries, "error": str(e)})
-                        raise
-                    
-                    jitter = 0.1 * rate_limit_backoff * (0.5 - random.random())
-                    current_backoff = min(rate_limit_backoff + jitter, self.rate_limit_max_backoff)
-                    
-                    self.logger.warning("Rate limit encountered, backing off",
-                                      extra={"attempt": attempt, "retry_count": rate_limit_retries,
-                                             "backoff_seconds": current_backoff, "error": str(e)})
-                    
-                    time.sleep(current_backoff)
-                    rate_limit_backoff = min(rate_limit_backoff * 2, self.rate_limit_max_backoff)
-                    continue
-                    
-                except Exception as e:
-                    self.logger.error("Continuation attempt failed",
-                                    extra={"attempt": attempt, "error": str(e),
-                                           "stack_trace": traceback.format_exc()})
-                    append_marker = f"\n--- CONTINUATION STITCHING FAILED ---\n"
+                    except Exception as e:
+                        self.logger.error("Continuation attempt failed",
+                                        extra={"attempt": attempt, "error": str(e),
+                                               "stack_trace": traceback.format_exc()})
+                        stitching_attempts += 1
+                        self.metrics["stitching_retries"] += 1
+                        continue
+                
+                if not stitching_success:  # All retries failed, append and break
+                    append_marker = f"\n--- CONTINUATION STITCHING FAILED AFTER RETRIES ---\n"
                     accumulated_content += append_marker + cont_content
                     self.metrics["append_fallbacks"] += 1
+                    self.logger.error("All stitching retries failed, appending content",
+                                    extra={"attempt": attempt, "content_type": content_type})
                     break
             
             if content_type in (ContentType.JSON, ContentType.SOLUTION_DESIGNER):
@@ -191,16 +227,86 @@ class ContinuationHandler:
                                   "content_so_far": accumulated_content[:200]})
             raise
 
-    def _detect_content_type(self, messages: List[Dict[str, str]]) -> str:
+    def _create_follow_up_prompt(self, previous_content: str, content_type: str) -> str:
         """
-        Detect content type from messages for specialized handling.
+        Create a follow-up prompt to request continuation after stitching failure.
         
         Args:
-            messages: List of message dictionaries
+            previous_content: The content to continue from
+            content_type: Type of content
             
         Returns:
-            Content type string
+            Follow-up prompt
         """
+        try:
+            prompt = f"""
+The previous continuation attempt failed to align properly. Please continue exactly from the end of this content:
+
+--- PREVIOUS CONTENT ---
+{previous_content[-self.max_overlap_size:]}
+--- END PREVIOUS CONTENT ---
+
+CRITICAL REQUIREMENTS:
+1. Start precisely at the end of the provided content
+2. Do not repeat any previous content
+3. Maintain the same format and structure as the previous content
+"""
+            if content_type == ContentType.SOLUTION_DESIGNER:
+                prompt += "4. Ensure proper JSON structure with escaped quotes and newlines in diff sections\n"
+            elif content_type in (ContentType.JSON, ContentType.JSON_CODE):
+                prompt += "4. Ensure proper JSON structure with correct nesting and escaping\n"
+            elif content_type == ContentType.CODE:
+                prompt += "4. Maintain consistent code indentation and style\n"
+            
+            self.logger.debug("Follow-up prompt created",
+                            extra={"content_type": content_type, "prompt_length": len(prompt)})
+            return prompt
+        except Exception as e:
+            self.logger.error("Follow-up prompt creation failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return f"Continue exactly from the end of: {previous_content[-self.max_overlap_size:]}"
+
+    def _create_overlap_request_prompt(self, overlap: str, content_type: str) -> str:
+        """
+        Create a prompt to request the LLM to provide the continuation with the specified overlap.
+        
+        Args:
+            overlap: The overlap segment to include
+            content_type: Type of content
+            
+        Returns:
+            Overlap request prompt
+        """
+        try:
+            prompt = f"""
+The previous continuation did not align correctly. Please provide the continuation starting with this exact overlap:
+
+--- REQUIRED OVERLAP ---
+{overlap}
+--- END REQUIRED OVERLAP ---
+
+CRITICAL REQUIREMENTS:
+1. Begin your response with the exact overlap provided above
+2. Continue seamlessly from where the overlap ends
+3. Do not add any additional text or comments before the overlap
+"""
+            if content_type == ContentType.SOLUTION_DESIGNER:
+                prompt += "4. Maintain proper JSON structure with escaped quotes and newlines in diff sections\n"
+            elif content_type in (ContentType.JSON, ContentType.JSON_CODE):
+                prompt += "4. Maintain proper JSON structure with correct nesting and escaping\n"
+            elif content_type == ContentType.CODE:
+                prompt += "4. Maintain consistent code indentation and style\n"
+            
+            self.logger.debug("Overlap request prompt created",
+                            extra={"content_type": content_type, "prompt_length": len(prompt)})
+            return prompt
+        except Exception as e:
+            self.logger.error("Overlap request prompt creation failed",
+                            extra={"error": str(e), "stack_trace": traceback.format_exc()})
+            return f"Start with this exact text and continue: {overlap}"
+
+    def _detect_content_type(self, messages: List[Dict[str, str]]) -> str:
+        """Detect content type from messages for specialized handling."""
         try:
             content = ""
             for msg in messages:
@@ -242,16 +348,7 @@ class ContinuationHandler:
             return ContentType.TEXT
 
     def _calculate_overlap_window(self, content: str, content_type: str) -> str:
-        """
-        Calculate appropriate overlap window based on content type.
-        
-        Args:
-            content: Content to extract overlap from
-            content_type: Type of content for specialized handling
-            
-        Returns:
-            Overlap window
-        """
+        """Calculate appropriate overlap window based on content type."""
         try:
             if content_type == ContentType.SOLUTION_DESIGNER:
                 window_size = min(max(len(content) // 3, 200), self.max_overlap_size)
@@ -282,15 +379,7 @@ class ContinuationHandler:
             return content[-self.min_overlap_size:]
 
     def _align_json_window(self, window: str) -> Optional[str]:
-        """
-        Align window with JSON structure boundaries.
-        
-        Args:
-            window: Current window
-            
-        Returns:
-            Adjusted window or None if no adjustment needed
-        """
+        """Align window with JSON structure boundaries."""
         try:
             open_braces = window.count('{')
             close_braces = window.count('}')
@@ -327,15 +416,7 @@ class ContinuationHandler:
             return window
 
     def _align_code_window(self, window: str) -> Optional[str]:
-        """
-        Align window with code block boundaries.
-        
-        Args:
-            window: Current window
-            
-        Returns:
-            Adjusted window or None if no adjustment needed
-        """
+        """Align window with code block boundaries."""
         try:
             lines = window.split('\n')
             if len(lines) <= 1:
@@ -356,16 +437,7 @@ class ContinuationHandler:
             return window
 
     def _create_continuation_prompt(self, overlap: str, content_type: str) -> str:
-        """
-        Create continuation prompt based on content type.
-        
-        Args:
-            overlap: Overlap window
-            content_type: Type of content
-            
-        Returns:
-            Continuation prompt
-        """
+        """Create continuation prompt based on content type."""
         try:
             if content_type == ContentType.SOLUTION_DESIGNER:
                 prompt = """
@@ -436,17 +508,7 @@ Continue exactly from where this leaves off, maintaining the same format and str
         current: str,
         content_type: str
     ) -> Tuple[str, str]:
-        """
-        Join continuations using multiple strategies with simplified failure fallback.
-        
-        Args:
-            previous: Previous content
-            current: Current continuation
-            content_type: Type of content
-            
-        Returns:
-            Tuple of (joined_content, join_method)
-        """
+        """Join continuations using multiple strategies with simplified failure fallback."""
         self.logger.debug("Attempting to join continuations",
                         extra={"prev_length": len(previous), "curr_length": len(current),
                                "content_type": content_type})
@@ -489,16 +551,7 @@ Continue exactly from where this leaves off, maintaining the same format and str
         return joined, "append_fallbacks"
 
     def _find_exact_overlap(self, previous: str, current: str) -> Optional[str]:
-        """
-        Find exact overlap between previous and current content.
-        
-        Args:
-            previous: Previous content
-            current: Current continuation
-            
-        Returns:
-            Overlap text if found, None otherwise
-        """
+        """Find exact overlap between previous and current content."""
         try:
             min_size = min(self.min_overlap_size, len(previous), len(current))
             max_size = min(self.max_overlap_size, len(previous), len(current))
@@ -522,16 +575,7 @@ Continue exactly from where this leaves off, maintaining the same format and str
             return None
 
     def _find_token_match(self, previous: str, current: str) -> Optional[Tuple[int, float]]:
-        """
-        Find token-based overlap between previous and current content.
-        
-        Args:
-            previous: Previous content
-            current: Current continuation
-            
-        Returns:
-            Tuple of (position, confidence) if match found, None otherwise
-        """
+        """Find token-based overlap between previous and current content."""
         try:
             prev_tokens = self._tokenize(previous[-1000:])
             curr_tokens = self._tokenize(current[:1000])
@@ -571,15 +615,7 @@ Continue exactly from where this leaves off, maintaining the same format and str
             return None
 
     def _tokenize(self, text: str) -> List[str]:
-        """
-        Simple tokenization for token matching.
-        
-        Args:
-            text: Text to tokenize
-            
-        Returns:
-            List of tokens
-        """
+        """Simple tokenization for token matching."""
         try:
             return re.findall(r'\w+|[^\w\s]', text)
         except Exception as e:
@@ -588,16 +624,7 @@ Continue exactly from where this leaves off, maintaining the same format and str
             return text.split()
 
     def _find_fuzzy_match(self, previous: str, current: str) -> Optional[str]:
-        """
-        Find fuzzy match using hash-based approach.
-        
-        Args:
-            previous: Previous content
-            current: Current continuation
-            
-        Returns:
-            Joined content if match found, None otherwise
-        """
+        """Find fuzzy match using hash-based approach."""
         try:
             prev_norm = ''.join(previous.lower().split())
             curr_norm = ''.join(current.lower().split())
@@ -619,16 +646,7 @@ Continue exactly from where this leaves off, maintaining the same format and str
             return None
 
     def _join_solution_designer(self, previous: str, current: str) -> Optional[str]:
-        """
-        Join solution designer content with structure awareness.
-        
-        Args:
-            previous: Previous content
-            current: Current continuation
-            
-        Returns:
-            Joined content if successful, None otherwise
-        """
+        """Join solution designer content with structure awareness."""
         try:
             open_braces = previous.count('{') - previous.count('}')
             open_brackets = previous.count('[') - previous.count(']')
@@ -668,16 +686,7 @@ Continue exactly from where this leaves off, maintaining the same format and str
             return None
 
     def _join_json_content(self, previous: str, current: str) -> Optional[str]:
-        """
-        Join JSON content with structure awareness.
-        
-        Args:
-            previous: Previous content
-            current: Current continuation
-            
-        Returns:
-            Joined content if successful, None otherwise
-        """
+        """Join JSON content with structure awareness."""
         try:
             open_braces = previous.count('{') - previous.count('}')
             open_brackets = previous.count('[') - previous.count(']')
@@ -699,17 +708,7 @@ Continue exactly from where this leaves off, maintaining the same format and str
             return None
 
     def _structure_aware_join(self, previous: str, current: str, content_type: str) -> str:
-        """
-        Join content with structure awareness as fallback.
-        
-        Args:
-            previous: Previous content
-            current: Current continuation
-            content_type: Type of content
-            
-        Returns:
-            Joined content
-        """
+        """Join content with structure awareness as fallback."""
         try:
             previous = previous.rstrip()
             current = current.lstrip()
@@ -732,15 +731,7 @@ Continue exactly from where this leaves off, maintaining the same format and str
             return previous + '\n' + current
 
     def _clean_json_content(self, content: str) -> str:
-        """
-        Clean up JSON content by removing artifacts and fixing structure.
-        
-        Args:
-            content: Content to clean
-            
-        Returns:
-            Cleaned content
-        """
+        """Clean up JSON content by removing artifacts and fixing structure."""
         try:
             if '{' in content and '}' in content:
                 open_braces = content.count('{')
@@ -764,15 +755,7 @@ Continue exactly from where this leaves off, maintaining the same format and str
             return content
 
     def _build_completion_params(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
-        """
-        Build parameters for LLM completion request.
-        
-        Args:
-            messages: List of message dictionaries
-            
-        Returns:
-            Dictionary of completion parameters
-        """
+        """Build parameters for LLM completion request."""
         try:
             completion_params = {
                 "model": self.model_str,
@@ -797,15 +780,7 @@ Continue exactly from where this leaves off, maintaining the same format and str
             raise
 
     def _make_llm_request(self, completion_params: Dict[str, Any]) -> Any:
-        """
-        Make LLM request with rate limit handling.
-        
-        Args:
-            completion_params: Completion request parameters
-            
-        Returns:
-            LLM response
-        """
+        """Make LLM request with rate limit handling."""
         try:
             litellm.retry = True
             litellm.max_retries = 3
@@ -834,15 +809,7 @@ Continue exactly from where this leaves off, maintaining the same format and str
             raise
 
     def _get_content_from_response(self, response: Any) -> str:
-        """
-        Extract content from LLM response.
-        
-        Args:
-            response: LLM response object
-            
-        Returns:
-            Content string
-        """
+        """Extract content from LLM response."""
         try:
             if hasattr(response, 'choices') and response.choices:
                 if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):

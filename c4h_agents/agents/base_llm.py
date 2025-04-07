@@ -10,13 +10,14 @@ import litellm
 from litellm import completion
 from c4h_agents.agents.types import LLMProvider, LogDetail
 from c4h_agents.utils.logging import get_logger
-from c4h_agents.agents.base_llm_continuation import ContinuationHandler
+from c4h_agents.agents.continuation.continuation_handler import ContinuationHandler  # Updated import
 
 logger = get_logger()
 
 class BaseLLM:
     """LLM interaction layer"""
     _continuation_handler = None
+
     def __init__(self):
         """Initialize LLM support"""
         self.provider = None
@@ -26,7 +27,7 @@ class BaseLLM:
         self.log_level = LogDetail.BASIC
 
     def _get_completion_with_continuation(
-            self, 
+            self,
             messages: List[Dict[str, str]],
             max_attempts: Optional[int] = None
         ) -> Tuple[str, Any]:
@@ -47,7 +48,7 @@ class BaseLLM:
                 messages=messages
             )
             return response.choices[0].message.content, response
-        
+
     def _process_response(self, content: str, raw_response: Any) -> Dict[str, Any]:
         """
         Process LLM response with comprehensive validation and logging.
@@ -78,7 +79,7 @@ class BaseLLM:
                 logger_to_use.debug("agent.processing_response",
                             content_length=len(str(processed_content)) if processed_content else 0,
                             response_type=type(raw_response).__name__,
-                            continuation_attempts=self.metrics["continuation_attempts"])
+                            continuation_attempts=self.metrics.get("continuation_attempts", 0))
 
             # Build standard response structure
             response = {
@@ -102,7 +103,7 @@ class BaseLLM:
 
         except Exception as e:
             error_msg = str(e)
-            logger.error("response_processing.failed", 
+            logger.error("response_processing.failed",
                         error=error_msg,
                         content_type=type(content).__name__)
             return {
@@ -117,7 +118,7 @@ class BaseLLM:
         if self.provider == LLMProvider.OPENAI:
             return f"openai/{self.model}"
         elif self.provider == LLMProvider.ANTHROPIC:
-            return f"anthropic/{self.model}" 
+            return f"anthropic/{self.model}"
         elif self.provider == LLMProvider.GEMINI:
             return f"google/{self.model}"
         else:
@@ -170,15 +171,14 @@ class BaseLLM:
                 # Only configure if explicitly enabled
                 if agent_thinking_config and agent_thinking_config.get("enabled", False) is True:
                     # Ensure litellm is configured to pass through the 'thinking' parameter
-                    # This ensures the parameter will be added to the Anthropic API call
                     litellm.excluded_params = list(litellm.excluded_params) if hasattr(litellm, "excluded_params") else []
                     if "thinking" not in litellm.excluded_params:
                         litellm.excluded_params.append("thinking")
                         logger.debug("litellm.extended_thinking_support_configured",
-                                model=self.model)
+                                    model=self.model)
             
             if self._should_log(LogDetail.DEBUG):
-                logger.debug("litellm.configured", 
+                logger.debug("litellm.configured",
                             provider=self.provider.serialize(),
                             retry_settings={
                                 "enabled": litellm.retry,
@@ -219,8 +219,8 @@ class BaseLLM:
                 
             # Last resort fallback - convert to string
             result = str(response)
-            logger.warning("content.extraction_fallback", 
-                        response_type=type(response).__name__, 
+            logger.warning("content.extraction_fallback",
+                        response_type=type(response).__name__,
                         content_preview=result[:100] if len(result) > 100 else result)
             return result
         except Exception as e:
@@ -231,7 +231,7 @@ class BaseLLM:
         """Check if current log level includes the specified detail level"""
         log_levels = {
             LogDetail.MINIMAL: 0,
-            LogDetail.BASIC: 1, 
+            LogDetail.BASIC: 1,
             LogDetail.DETAILED: 2,
             LogDetail.DEBUG: 3
         }
@@ -240,3 +240,8 @@ class BaseLLM:
         target_level = LogDetail(level) if isinstance(level, str) else level
         
         return log_levels[target_level] <= log_levels[current_level]
+
+    def _get_agent_name(self) -> str:
+        """Get the agent name (placeholder method, implement as needed)"""
+        # Placeholder implementation; adjust based on your actual needs
+        return "default_agent"
