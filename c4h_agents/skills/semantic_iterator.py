@@ -1,11 +1,12 @@
 """
-Semantic iterator with standardized BaseAgent implementation.
+Semantic iterator with improved preprocessing for more reliable extraction.
 Path: c4h_agents/skills/semantic_iterator.py
 """
 
 from typing import List, Dict, Any, Optional, Iterator, Union
 from dataclasses import dataclass
 import json
+import re
 from config import locate_config
 from c4h_agents.agents.base_agent import BaseAgent, AgentResponse 
 from skills.shared.types import ExtractConfig
@@ -43,6 +44,9 @@ class SemanticIterator(BaseAgent):
     """
     Agent responsible for semantic extraction using configurable modes.
     Follows standard BaseAgent pattern while maintaining iterator protocol.
+    
+    Enhanced with robust preprocessing to handle JSON-wrapped content
+    and escape sequence normalization.
     """
     
     def __init__(self, config: Dict[str, Any] = None):
@@ -72,12 +76,88 @@ class SemanticIterator(BaseAgent):
         """Get agent name for config lookup"""
         return "semantic_iterator"
 
+    def _preprocess_content(self, content: Any) -> str:
+        """
+        Preprocess content before extraction by handling JSON wrapping and normalizing escape sequences.
+        
+        This is a critical new function to improve extraction reliability.
+        """
+        try:
+            # Start with logging the input type
+            logger.debug("preprocessing.start", 
+                       content_type=type(content).__name__,
+                       is_dict=isinstance(content, dict),
+                       is_str=isinstance(content, str))
+            
+            # Handle JSON object with response field
+            if isinstance(content, dict):
+                # Check if this is a response wrapper
+                if "response" in content:
+                    logger.info("preprocessing.unwrapping_json_response")
+                    content = content["response"]
+                elif "llm_output" in content and isinstance(content["llm_output"], dict):
+                    if "content" in content["llm_output"]:
+                        logger.info("preprocessing.unwrapping_llm_output_content")
+                        content = content["llm_output"]["content"]
+                # Convert any remaining dict to JSON string
+                elif not isinstance(content, str):
+                    logger.debug("preprocessing.converting_dict_to_json")
+                    content = json.dumps(content, indent=2)
+            
+            # Convert to string if needed
+            if not isinstance(content, str):
+                logger.debug("preprocessing.converting_to_string")
+                content = str(content)
+            
+            # Handle triple-escaped sequences that might appear in nested JSON
+            # This ensures consistent handling of escaped characters
+            if '\\\\\\\\' in content or '\\\\\"' in content:
+                logger.info("preprocessing.normalizing_triple_escapes")
+                content = content.replace('\\\\\\\\', '\\\\')
+                content = content.replace('\\\\\"', '\\"')
+            
+            # Try to detect any JSON string wrapping the actual content
+            if content.strip().startswith('"') and content.strip().endswith('"'):
+                try:
+                    # Check if this might be a JSON string that needs unescaping
+                    decoded = json.loads(f"{{{content}}}")
+                    if isinstance(decoded, dict) and len(decoded) == 1:
+                        inner_value = next(iter(decoded.values()))
+                        if isinstance(inner_value, str) and "===CHANGE_BEGIN===" in inner_value:
+                            logger.info("preprocessing.unwrapped_json_string")
+                            content = inner_value
+                except (json.JSONDecodeError, ValueError):
+                    # Not valid JSON, keep original
+                    pass
+            
+            # Detect standard change blocks
+            change_count = content.count("===CHANGE_BEGIN===")
+            if change_count > 0:
+                logger.info("preprocessing.detected_change_blocks", count=change_count)
+            
+            logger.debug("preprocessing.complete", 
+                        result_type=type(content).__name__, 
+                        length=len(content) if hasattr(content, "__len__") else 0,
+                        change_count=change_count)
+            
+            return content
+        except Exception as e:
+            logger.error("preprocessing.failed", error=str(e))
+            # Return original content on error
+            if isinstance(content, str):
+                return content
+            return str(content)
+
     def process(self, context: Dict[str, Any]) -> AgentResponse:
         """Process extraction request following standard agent interface"""
         try:
+            # Get input data from context
             content = context.get('input_data', context)
-            if isinstance(content, dict):
-                content = json.dumps(content, indent=2)
+            
+            # Apply preprocessing before extraction
+            preprocessed_content = self._preprocess_content(content)
+            
+            # Get extraction parameters
             instruction = context.get('instruction', '')
             format_hint = context.get('format', 'json')
 
@@ -88,7 +168,7 @@ class SemanticIterator(BaseAgent):
             
             self._state = ExtractorState(
                 mode=self._state.mode,
-                content=content,
+                content=preprocessed_content,
                 config=extract_config
             )
             
@@ -200,18 +280,27 @@ class SemanticIterator(BaseAgent):
 
     def _estimate_item_count(self, content: str) -> int:
         """Estimate number of items in content based on key patterns"""
-        # Count file_path occurrences as base estimate
+        # Count ===CHANGE_BEGIN=== occurrences as most reliable estimate
+        change_begin_count = content.count("===CHANGE_BEGIN===")
+        change_end_count = content.count("===CHANGE_END===")
+        
+        # Also count file_path occurrences as alternate estimate
         file_path_count = content.count('"file_path"')
         
         # Additional pattern checks for verification
         change_type_count = content.count('"type"')
         diff_count = content.count('"diff"')
         
-        # Take min to avoid overcounting
-        estimate = min(file_path_count, max(1, change_type_count))
+        # Use most reliable count, prioritizing change markers
+        if change_begin_count > 0 and change_begin_count == change_end_count:
+            estimate = change_begin_count
+        else:
+            # Take the most conservative estimate to avoid missing items
+            estimate = min(file_path_count, max(1, change_type_count))
         
         logger.debug("iterator.estimated_items", 
                    estimate=estimate,
+                   change_blocks=change_begin_count,
                    file_paths=file_path_count, 
                    change_types=change_type_count,
                    diffs=diff_count)
@@ -225,15 +314,18 @@ class SemanticIterator(BaseAgent):
         """
         logger.warning("semantic_iterator.using_deprecated_configure")
         
+        # Apply preprocessing before setting up state
+        preprocessed_content = self._preprocess_content(content)
+        
         self._state = ExtractorState(
             mode=self._state.mode,
-            content=content,
+            content=preprocessed_content,
             config=config,
             position=0
         )
         
         logger.debug("iterator.configured",
                     mode=self._state.mode,
-                    content_type=type(content).__name__)
+                    content_type=type(preprocessed_content).__name__)
                     
         return self
