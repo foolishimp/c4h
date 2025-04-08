@@ -54,6 +54,7 @@ tests/.DS_Store
 *.txt
 !requirements.txt
 *.old
+*.out
 tests/test_projects/project1/sample.py
 tests/test_projects/project2/main.py
 tests/test_projects/project2/utils.py

@@ -63,39 +63,33 @@ def get_content_from_response(response: Any, logger) -> str:
         return ""
 
 def detect_content_type(messages: List[Dict[str, str]], logger) -> ContentType:
-    """Detect content type from messages."""
+    """Detect content type from messages with simplified logic."""
     try:
         content = next((msg.get("content", "") for msg in messages if msg.get("role") == "user"), "")
         
-        is_solution_designer = any('"changes":' in msg.get("content", "") and 
-                                  '"file_path":' in msg.get("content", "") and 
-                                  '"diff":' in msg.get("content", "")
-                                  for msg in messages if msg.get("role") == "user")
-        is_code = any("```" in msg.get("content", "") or "def " in msg.get("content", "")
-                     for msg in messages if msg.get("role") == "user")
-        is_json = any("json" in msg.get("content", "").lower() or 
-                     msg.get("content", "").strip().startswith("{") or 
-                     msg.get("content", "").strip().startswith("[")
-                     for msg in messages if msg.get("role") == "user")
-        is_diff = any("--- " in msg.get("content", "") and "+++ " in msg.get("content", "")
-                     for msg in messages if msg.get("role") == "user")
-        
-        if is_solution_designer:
-            detected_type = ContentType.SOLUTION_DESIGNER
-        elif is_code and is_json:
-            detected_type = ContentType.JSON_CODE
-        elif is_code:
-            detected_type = ContentType.CODE
-        elif is_json:
-            detected_type = ContentType.JSON
-        elif is_diff:
-            detected_type = ContentType.DIFF
-        else:
-            detected_type = ContentType.TEXT
+        # Check for specific solution designer format first
+        if any("===CHANGE_BEGIN===" in msg.get("content", "")
+              for msg in messages if msg.get("role") == "assistant"):
+            return ContentType.SOLUTION_DESIGNER
             
-        logger.debug("Content type detected", extra={"type": detected_type})
-        return detected_type
+        # Then check for JSON and code patterns
+        is_json = content.strip().startswith("{") or content.strip().startswith("[")
+        is_code = "```" in content or any(keyword in content for keyword in ["function", "class", "def ", "import "])
+        is_diff = "--- " in content and "+++ " in content
+        
+        # More specific types first
+        if is_diff:
+            return ContentType.DIFF
+        elif is_json and is_code:
+            return ContentType.JSON_CODE
+        elif is_json:
+            return ContentType.JSON
+        elif is_code:
+            return ContentType.CODE
+        
+        # Default to text for everything else
+        return ContentType.TEXT
     except Exception as e:
         logger.error("Content type detection failed",
                      extra={"error": str(e), "stack_trace": traceback.format_exc()})
-        return ContentType.TEXT
+        return ContentType.TEXT  # Default to TEXT on error
