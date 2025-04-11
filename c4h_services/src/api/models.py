@@ -1,10 +1,10 @@
 """
-API request and response models for workflow service.
+API request and response models for workflow service with enhanced configuration handling.
 Path: c4h_services/src/api/models.py
 """
 
-from pydantic import BaseModel, Field, model_validator
-from typing import Dict, Any, Optional, List, Literal
+from pydantic import BaseModel, Field, model_validator, root_validator
+from typing import Dict, Any, Optional, List, Literal, Union, Tuple
 
 class WorkflowRequest(BaseModel):
     """
@@ -108,3 +108,35 @@ class JobStatus(BaseModel):
     storage_path: Optional[str] = Field(default=None, description="Path where job results are stored")
     error: Optional[str] = Field(default=None, description="Error message if status is error")
     changes: Optional[List[Dict[str, Any]]] = Field(default=None, description="List of changes made by the job")
+
+# Enhanced models for multi-config support
+
+class MultiConfigJobRequest(BaseModel):
+    """Job request model supporting multiple configuration dictionaries for server-side merging"""
+    configs: List[Dict[str, Any]] = Field(..., description="List of configuration dictionaries to merge (right-to-left priority)")
+    
+    @model_validator(mode='after')
+    def validate_configs(self) -> 'MultiConfigJobRequest':
+        """Validate that configs is a non-empty list"""
+        if not self.configs:
+            raise ValueError("configs list cannot be empty")
+        return self
+
+# For backward compatibility, we'll accept either the original JobRequest or the new MultiConfigJobRequest
+JobRequestUnion = Union[JobRequest, MultiConfigJobRequest]
+
+class MergeRequest(BaseModel):
+    """Request model for configuration merge utility endpoint"""
+    configs: List[Dict[str, Any]] = Field(..., description="List of configuration dictionaries to merge (right-to-left priority)")
+    include_system_config: bool = Field(default=True, description="Whether to include system_config as base")
+    
+    @model_validator(mode='after')
+    def validate_configs(self) -> 'MergeRequest':
+        """Validate that configs is a non-empty list"""
+        if not self.configs:
+            raise ValueError("configs list cannot be empty")
+        return self
+
+class MergeResponse(BaseModel):
+    """Response model for configuration merge utility endpoint"""
+    merged_config: Dict[str, Any] = Field(..., description="Resulting merged configuration")

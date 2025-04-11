@@ -1,5 +1,5 @@
 """
-API service implementation focused exclusively on team-based orchestration.
+API service implementation with enhanced configuration handling and multi-config support.
 Path: c4h_services/src/api/service.py
 """
 
@@ -14,10 +14,12 @@ import json
 import uuid
 from datetime import datetime
 
-from c4h_agents.config import deep_merge
+from c4h_agents.config import deep_merge, load_config
+from c4h_agents.config import create_config_node
 from c4h_agents.core.project import Project
 from c4h_services.src.api.models import (WorkflowRequest, WorkflowResponse, 
-                                        JobRequest, JobResponse, JobStatus)
+                                        JobRequest, JobResponse, JobStatus,
+                                        MultiConfigJobRequest, MergeRequest, MergeResponse, JobRequestUnion)
 from c4h_services.src.orchestration.orchestrator import Orchestrator
 from c4h_services.src.utils.lineage_utils import load_lineage_file, prepare_context_from_lineage
 
@@ -28,6 +30,7 @@ logger = get_logger()
 workflow_storage: Dict[str, Dict[str, Any]] = {}
 job_storage: Dict[str, Dict[str, Any]] = {}
 job_to_workflow_map: Dict[str, str] = {}
+system_config_path = Path("config/system_config.yml")
 
 def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
     """
@@ -47,6 +50,7 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
     
     # Store default config in app state
     app.state.default_config = default_config or {}
+    app.state.system_config_path = system_config_path
     
     # Create orchestrator
     app.state.orchestrator = Orchestrator(app.state.default_config)
@@ -224,20 +228,21 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
     Enhanced Jobs API endpoints for the C4H Agent System.
     These endpoints should replace the existing ones in service.py.
     """
-
+    
     @app.post("/api/v1/jobs", response_model=JobResponse)
-    async def create_job(request: JobRequest):
+    async def create_job(request: JobRequestUnion):
         """
         Create a new job with structured configuration.
         Maps the job request to workflow request format and executes the workflow.
         
+        Supports both traditional JobRequest format and new MultiConfigJobRequest format.
         Job Request Structure:
         - workorder: Contains project and intent information
         - team: Contains LLM and orchestration configuration
         - runtime: Contains runtime settings and environment config
         
         Args:
-            request: JobRequest containing workorder, team, and runtime configuration
+            request: JobRequest or MultiConfigJobRequest containing configuration
             
         Returns:
             JobResponse with job ID and status information
@@ -247,26 +252,62 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             job_id = f"job_{timestamp}_{str(uuid.uuid4())[:8]}"
             
-            logger.info("jobs.request_received", 
-                    job_id=job_id, 
-                    project_path=request.workorder.project.path,
-                    has_team_config=request.team is not None,
-                    has_runtime_config=request.runtime is not None)
-            
-            # Map job request to workflow request format
-            try:
-                workflow_request = map_job_to_workflow_request(request)
-                logger.debug("jobs.request_mapped", 
+            # Handle different request formats
+            if isinstance(request, MultiConfigJobRequest):
+                logger.info("jobs.multi_config_request_received", 
                         job_id=job_id, 
-                        workflow_request_keys=list(workflow_request.dict().keys()))
-            except Exception as e:
-                logger.error("jobs.request_mapping_failed", 
+                        configs_count=len(request.configs))
+                
+                # Merge configurations from right to left (rightmost has lowest priority)
+                merged_config = app.state.default_config.copy()
+                for config in reversed(request.configs):
+                    merged_config = deep_merge(merged_config, config)
+                    
+                logger.debug("jobs.configs_merged", 
+                        job_id=job_id,
+                        merged_config_keys=list(merged_config.keys()))
+                
+                # Create a workflow request directly from the merged config
+                try:
+                    # Extract project path from merged config
+                    config_node = create_config_node(merged_config)
+                    project_path = config_node.get_value("workorder.project.path")
+                    intent = config_node.get_value("workorder.intent")
+                    
+                    if not project_path:
+                        raise ValueError("Missing required workorder.project.path in merged configuration")
+                    if not intent:
+                        raise ValueError("Missing required workorder.intent in merged configuration")
+                        
+                    workflow_request = WorkflowRequest(
+                        project_path=project_path,
+                        intent=intent,
+                        app_config=merged_config
+                    )
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Invalid merged configuration: {str(e)}")
+            else:
+                # Traditional JobRequest format
+                logger.info("jobs.traditional_request_received", 
                         job_id=job_id, 
-                        error=str(e))
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Invalid job configuration: {str(e)}"
-                )
+                        project_path=request.workorder.project.path,
+                        has_team_config=request.team is not None,
+                        has_runtime_config=request.runtime is not None)
+                
+                # Map job request to workflow request format
+                try:
+                    workflow_request = map_job_to_workflow_request(request)
+                    logger.debug("jobs.request_mapped", 
+                            job_id=job_id, 
+                            workflow_request_keys=list(workflow_request.dict().keys()))
+                except Exception as e:
+                    logger.error("jobs.request_mapping_failed", 
+                            job_id=job_id, 
+                            error=str(e))
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Invalid job configuration: {str(e)}"
+                    )
             
             # Call the workflow endpoint with the mapped request
             try:
@@ -421,6 +462,49 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
                     error=str(e),
                     error_type=type(e).__name__)
             raise HTTPException(status_code=500, detail=f"Job status check failed: {str(e)}")
+
+    @app.post("/api/v1/configs/merge", response_model=MergeResponse)
+    async def merge_configs(request: MergeRequest):
+        """
+        Utility endpoint to merge multiple configuration dictionaries.
+        
+        Merges configurations from right to left (rightmost has lowest priority).
+        Optionally includes system_config as the base configuration.
+        
+        Args:
+            request: MergeRequest containing configs to merge
+            
+        Returns:
+            MergeResponse with the merged configuration
+        """
+        try:
+            # Start with system config if requested
+            if request.include_system_config:
+                # Try to load system config from disk
+                try:
+                    system_config = load_config(app.state.system_config_path)
+                    merged_config = system_config.copy()
+                    logger.debug("configs.merge.using_system_config", 
+                            system_config_keys=list(system_config.keys()))
+                except Exception as e:
+                    logger.warning("configs.merge.system_config_load_failed", 
+                            error=str(e))
+                    # Fall back to default config
+                    merged_config = app.state.default_config.copy()
+            else:
+                # Start with empty dict
+                merged_config = {}
+            
+            # Merge configurations from right to left
+            for i, config in enumerate(reversed(request.configs)):
+                merged_config = deep_merge(merged_config, config)
+                logger.debug(f"configs.merge.step_{i+1}", config_keys=list(config.keys()))
+            
+            return MergeResponse(merged_config=merged_config)
+            
+        except Exception as e:
+            logger.error("configs.merge.failed", error=str(e))
+            raise HTTPException(status_code=500, detail=f"Configuration merge failed: {str(e)}")
 
     """
     Enhanced Jobs API functions for the C4H Agent System.
