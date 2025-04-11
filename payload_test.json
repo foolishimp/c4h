@@ -1,0 +1,39 @@
+{
+  "configs": [
+    {
+      "workorder": {
+        "project": {
+          "path": "/Users/jim/src/apps/c4h_editor/backend/",
+          "workspace_root": "workspaces"
+        },
+        "intent": {
+          "description": "# Refactor Editor Backend API Client for Direct Multi-Config Job Submission\n\n## Goal\nUpdate the C4H Editor Backend's service layer to assemble and **directly submit a list** of configuration objects (potentially including overrides from different sources) to the modified C4H Service `POST /api/v1/jobs` endpoint. The editor backend should **not** call the separate `/configs/merge` utility endpoint as part of the job submission process.\n\n## Core Algorithm Context (from C4H Service Refactor)\n- **Motivation:** The C4H Service now handles merging internally. This allows the editor backend (and ultimately the frontend) to simply collect configuration pieces (e.g., a base Workorder, a base Team config, a small override dictionary) and send them as a list, letting the server determine the final configuration based on the list order (leftmost = highest priority).\n- The C4H Service `POST /api/v1/jobs` endpoint accepts `List[Dict[str, Any]]`.\n- The C4H Service **internally** performs the sequential, right-to-left merge.\n- A separate utility endpoint `POST /api/v1/configs/merge` exists but is **not** used for standard job submission.\n\n## Required Changes\n\n1.  **Update Job Submission Logic (`backend/services/c4h_service.py` or similar):**\n    - Modify the function sending requests to C4H Service `POST /api/v1/jobs`.\n    - This function should accept or gather a *list* of configuration objects/references.\n    - Ensure the request body sent is a JSON array `[...]` containing these configuration objects in the correct priority order (leftmost = highest priority).\n2.  **Update API Route Handler (`backend/api/routes/jobs.py` -> `create_job`):**\n    - Adjust the input model or logic to collect configuration sources into a list before passing to the service layer function.\n3.  **Update Models (`backend/models/job.py`):** Modify local models if needed to handle lists of configurations.\n4.  **Add Logging:** Log the list being sent to the C4H Service `/jobs` endpoint.\n\n## Design Principles to Follow\n- Clear separation between API interaction and route handling.\n- Robust error handling.\n\n## Files to Analyze/Modify (Primary)\n- `backend/services/c4h_service.py`\n- `backend/api/routes/jobs.py`\n- `backend/models/job.py`\n"
+        }
+      }
+    },
+    {
+      "team": {
+        "llm_config": {
+          "agents": {
+            "discovery": {
+              "temperature": 0,
+              "tartxt_config": {
+                "script_path": "/Users/jim/src/apps/c4h/c4h_agents/skills/tartxt.py", 
+                "input_paths": ["backend/services/", "backend/api/routes/", "backend/models/", "/Users/jim/src/apps/c4h_projects/docs/design_docs/c4h_api_doc_v1.md", "/Users/jim/src/apps/c4h_projects/docs/design_docs/Jobs_Design_Guide_0402.md", "/Users/jim/src/apps/c4h_projects/docs/design_docs/Config_Design_Principles.md"],
+                "exclusions": ["**/__pycache__/**", "**/*.pyc"]
+              }
+            },
+            "solution_designer": { "provider": "anthropic", "model": "claude-3-7-sonnet-20250219" },
+            "coder": { "provider": "anthropic", "model": "claude-3-7-sonnet-20250219" }
+          }
+        }
+      }
+    },
+    {
+      "runtime": {
+        "logging": { "level": "INFO", "format": "structured", "agent_level": "DEBUG" },
+        "backup": { "enabled": true }
+      }
+    }
+  ]
+}

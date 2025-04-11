@@ -31,74 +31,105 @@ class Orchestrator:
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize orchestrator with configuration.
-        
         Args:
             config: Complete configuration dictionary
         """
-        self.config = config
-        self.config_node = create_config_node(config)
-        # Update logger with config
+        # Use a unique ID for this instance for clearer logging
+        self.instance_id = str(uuid.uuid4())[:4]
+        # Get logger early
+        global_logger = get_logger(config) # Use config for potential log settings
+        self.logger = global_logger.bind(orchestrator_instance=self.instance_id)
+
+        self.logger.info("orchestrator.__init__.start", config_keys=list(config.keys()) if config else "None")
+
+        self.config = config if config else {} # Ensure self.config is always a dict
+        self.config_node = create_config_node(self.config)
         self.teams = {}
-        logger = get_logger(config)
         self.loaded_teams = set()
-        
+
         # Load team configurations
-        self._load_teams()
-        
-        logger.info("orchestrator.initialized", 
-                  teams_loaded=len(self.teams),
-                  team_ids=list(self.teams.keys()))
-    
+        try:
+             self._load_teams()
+             self.logger.info("orchestrator.__init__.complete",
+                    teams_loaded=len(self.teams),
+                    team_ids=list(self.teams.keys()))
+        except Exception as e:
+             self.logger.error("orchestrator.__init__.load_teams_failed", error=str(e))
+             # Attempt to load default teams as a fallback during init failure
+             self.logger.warning("orchestrator.__init__.attempting_default_load_on_error")
+             try:
+                 self._load_default_teams()
+                 self.logger.info("orchestrator.__init__.default_teams_loaded_after_error", teams_loaded=len(self.teams))
+             except Exception as default_e:
+                  self.logger.error("orchestrator.__init__.default_team_load_failed", error=str(default_e))
+
     def _load_teams(self) -> None:
         """
         Load team configurations from config.
         Creates Team instances for each team configuration.
         """
+        # Access config via the instance attribute self.config_node
         teams_config = self.config_node.get_value("orchestration.teams") or {}
-        
+
+        # Add detailed logging about what config _load_teams is seeing
+        self.logger.debug("_load_teams.config_check",
+                          has_orchestration_key="orchestration" in self.config,
+                          has_teams_key="teams" in self.config.get("orchestration", {}),
+                          teams_config_retrieved=bool(teams_config),
+                          teams_config_keys=list(teams_config.keys()) if teams_config else [])
+
         if not teams_config:
-            logger.warning("orchestrator.no_teams_found")
+            self.logger.warning("orchestrator.no_teams_found") # KEEP this warning
             # Load default teams for backward compatibility
             self._load_default_teams()
             return
-            
+
+        # Clear existing teams before loading
+        self.teams = {}
+        loaded_count = 0
         for team_id, team_config in teams_config.items():
             try:
                 # Get basic team info
                 name = team_config.get("name", team_id)
-                
+                self.logger.debug("_load_teams.processing_team", team_id=team_id, name=name)
+
                 # Get task configurations
                 tasks = []
                 for task_config in team_config.get("tasks", []):
                     agent_class = task_config.get("agent_class")
                     if not agent_class:
-                        logger.error("orchestrator.missing_agent_class", team_id=team_id, task=task_config)
+                        self.logger.error("orchestrator.missing_agent_class", team_id=team_id, task=task_config)
                         continue
-                        
+
                     # Create task config
+                    # Ensure the *current* orchestrator config is used for merging task overrides
+                    task_specific_override = task_config.get("config", {})
+                    final_task_config = deep_merge(self.config, task_specific_override)
+
                     agent_config = AgentTaskConfig(
                         agent_class=agent_class,
-                        config=deep_merge(self.config, task_config.get("config", {})),
+                        config=final_task_config, # Pass the potentially merged config
                         task_name=task_config.get("name"),
                         requires_approval=task_config.get("requires_approval", False),
                         max_retries=task_config.get("max_retries", 3),
                         retry_delay_seconds=task_config.get("retry_delay_seconds", 30)
                     )
-                    
                     tasks.append(agent_config)
-                
+
                 # Create team
                 self.teams[team_id] = Team(
                     team_id=team_id,
                     name=name,
                     tasks=tasks,
-                    config=team_config
+                    config=team_config # Store the team-specific config part
                 )
-                logger.info("orchestrator.team_loaded", team_id=team_id, name=name, tasks=len(tasks))
-                
+                loaded_count += 1
+                self.logger.info("orchestrator.team_loaded", team_id=team_id, name=name, tasks=len(tasks))
+
             except Exception as e:
-                logger.error("orchestrator.team_load_failed", team_id=team_id, error=str(e))
-    
+                self.logger.error("orchestrator.team_load_failed", team_id=team_id, error=str(e))
+        self.logger.debug("_load_teams.finished", loaded_count=loaded_count, final_team_keys=list(self.teams.keys()))
+
     def _load_default_teams(self) -> None:
         """
         Load default teams for backward compatibility.
@@ -146,7 +177,6 @@ class Orchestrator:
         logger.info("orchestrator.default_teams_loaded", 
                   teams=["discovery", "solution", "coder"])
     
-
     def execute_workflow(
         self, 
         entry_team: str = "discovery",
@@ -295,15 +325,18 @@ class Orchestrator:
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
         Initialize workflow configuration with consistent defaults and parameter handling.
-        
         Args:
             project_path: Path to the project
             intent_desc: Description of the intent
-            config: Base configuration
-            
+            config: Base configuration (This should be the merged config from the request)
+
         Returns:
             Tuple of (prepared_config, context_dict)
         """
+        # Use a logger specific to this instance if available, else use global
+        instance_logger = getattr(self, 'logger', logger)
+        instance_logger.debug("initialize_workflow.entry", config_keys=list(config.keys()))
+
         try:
             # Ensure config is a dictionary
             prepared_config = config.copy() if config else {}
@@ -312,20 +345,31 @@ class Orchestrator:
             if not project_path:
                 project_path = prepared_config.get('project', {}).get('path')
                 if not project_path:
+                    instance_logger.error("initialize_workflow.missing_project_path") # Added logging
                     raise ValueError("No project path specified in arguments or config")
 
             # Convert Path objects to string for consistency
             if isinstance(project_path, Path):
                 project_path = str(project_path)
-                
+            instance_logger.debug("initialize_workflow.project_path_normalized", path=project_path) # Added logging
+
             # Ensure project config exists
             if 'project' not in prepared_config:
                 prepared_config['project'] = {}
             prepared_config['project']['path'] = project_path
 
-            # Generate workflow ID with embedded timestamp
-            time_str = datetime.now().strftime('%H%M')
-            workflow_id = f"wf_{time_str}_{uuid.uuid4()}"
+            # Generate workflow ID with embedded timestamp if not already present
+            # Use config_node for safer access
+            config_node = create_config_node(prepared_config)
+            workflow_id = config_node.get_value("workflow_run_id") or \
+                          config_node.get_value("system.runid")
+            if not workflow_id:
+                time_str = datetime.now().strftime('%H%M')
+                workflow_id = f"wf_{time_str}_{uuid.uuid4()}"
+                instance_logger.warning("initialize_workflow.generating_new_workflow_id", new_id=workflow_id) # Added logging
+            else:
+                 instance_logger.debug("initialize_workflow.using_existing_workflow_id", id=workflow_id) # Added logging
+
 
             # Configure system namespace
             if 'system' not in prepared_config:
@@ -349,43 +393,75 @@ class Orchestrator:
             else:
                 prepared_config['orchestration']['enabled'] = True
 
+            # --- DETAILED LOGGING FOR TARTXT CONFIG ---
+            instance_logger.debug("initialize_workflow.checking_tartxt_config")
             # Add default configs for crucial components
-            
-            # 1. Ensure tartxt_config defaults
-            if 'llm_config' not in prepared_config:
-                prepared_config['llm_config'] = {}
-            if 'agents' not in prepared_config['llm_config']:
-                prepared_config['llm_config']['agents'] = {}
-            if 'discovery' not in prepared_config['llm_config']['agents']:
-                prepared_config['llm_config']['agents']['discovery'] = {}
-                
-            # Add default tartxt_config if not present
+            if 'llm_config' not in prepared_config: prepared_config['llm_config'] = {}
+            if 'agents' not in prepared_config['llm_config']: prepared_config['llm_config']['agents'] = {}
+            if 'discovery' not in prepared_config['llm_config']['agents']: prepared_config['llm_config']['agents']['discovery'] = {}
+
             discovery_config = prepared_config['llm_config']['agents']['discovery']
+            instance_logger.debug("initialize_workflow.discovery_config_retrieved", config_keys=list(discovery_config.keys()))
+
             if 'tartxt_config' not in discovery_config:
                 discovery_config['tartxt_config'] = {}
-                
+                instance_logger.warning("initialize_workflow.created_empty_tartxt_config") # Added logging
+
             tartxt_config = discovery_config['tartxt_config']
+            instance_logger.debug("initialize_workflow.tartxt_config_retrieved", config_keys=list(tartxt_config.keys()), current_script_path=tartxt_config.get('script_path')) # Added logging
 
             # Ensure script_path is set (handle both possible key names)
-            if 'script_path' not in tartxt_config and 'script_base_path' not in tartxt_config:
-                # Try to locate the script in the package
-                import c4h_agents
-                agent_path = Path(c4h_agents.__file__).parent
-                script_path = agent_path / "skills" / "tartxt.py"
-                if script_path.exists():
-                    tartxt_config['script_path'] = str(script_path)
+            # Check if script_path is already correctly set and is a non-empty string
+            current_script_path = tartxt_config.get('script_path')
+            script_path_valid = isinstance(current_script_path, str) and current_script_path.strip()
+
+            if not script_path_valid:
+                instance_logger.warning("initialize_workflow.script_path_missing_or_invalid", current_value=current_script_path) # Added logging
+                # Fallback 1: Check script_base_path
+                script_base = tartxt_config.get('script_base_path')
+                if isinstance(script_base, str) and script_base.strip():
+                     tartxt_config['script_path'] = f"{script_base}/tartxt.py"
+                     instance_logger.info("initialize_workflow.script_path_set_from_base", new_path=tartxt_config['script_path']) # Added logging
                 else:
-                    # Fallback to a relative path if the package path is not found
-                    tartxt_config['script_path'] = "c4h_agents/skills/tartxt.py"
-            elif 'script_base_path' in tartxt_config and 'script_path' not in tartxt_config:
-                # Convert script_base_path to script_path
-                script_base = tartxt_config['script_base_path']
-                tartxt_config['script_path'] = f"{script_base}/tartxt.py"
+                    # Fallback 2: Try to locate the script in the package
+                    instance_logger.info("initialize_workflow.attempting_package_lookup") # Added logging
+                    script_path_found_in_package = None
+                    try:
+                        import c4h_agents
+                        import importlib.resources as pkg_resources
+                        # Use importlib.resources for better package data access
+                        with pkg_resources.path(c4h_agents.skills, 'tartxt.py') as script_path_obj:
+                            if script_path_obj.exists():
+                                script_path_found_in_package = str(script_path_obj.resolve())
+                                instance_logger.info("initialize_workflow.script_path_found_in_package", path=script_path_found_in_package) # Added logging
+                    except Exception as pkg_err:
+                         instance_logger.warning("initialize_workflow.package_lookup_failed", error=str(pkg_err)) # Added logging
+
+                    if script_path_found_in_package:
+                         tartxt_config['script_path'] = script_path_found_in_package
+                    else:
+                        # Fallback 3: Use a default relative path if nothing else worked
+                        default_relative = "c4h_agents/skills/tartxt.py"
+                        tartxt_config['script_path'] = default_relative
+                        instance_logger.warning("initialize_workflow.using_default_relative_path", path=default_relative) # Added logging
+
+            # Final check of the script path before exiting
+            final_script_path = tartxt_config.get('script_path')
+            instance_logger.debug("initialize_workflow.final_script_path_check", path=final_script_path, type=type(final_script_path).__name__) # Added logging
+
+            # Check if the final path is None or empty string AFTER all attempts
+            if not isinstance(final_script_path, str) or not final_script_path.strip():
+                 instance_logger.error("initialize_workflow.final_script_path_is_invalid", path_value=final_script_path) # Added logging
+                 # Raise error here to prevent the TypeError later
+                 raise ValueError(f"Could not determine a valid script_path for tartxt. Final value was: {final_script_path}")
 
             # Ensure input_paths is set
             if 'input_paths' not in tartxt_config:
                 tartxt_config['input_paths'] = ["./"]
-                
+                instance_logger.debug("initialize_workflow.set_default_input_paths") # Added logging
+            # --- END OF TARTXT CONFIG LOGGING ---
+
+
             # Prepare consistent context dictionary
             context = {
                 "project_path": project_path,
@@ -393,16 +469,19 @@ class Orchestrator:
                 "workflow_run_id": workflow_id,
                 "system": {"runid": workflow_id},
                 "timestamp": timestamp,
-                "config": prepared_config
+                "config": prepared_config # Pass the fully prepared config
             }
-            
-            logger.info("workflow.initialized", 
-                    workflow_id=workflow_id,
-                    project_path=project_path,
-                    tartxt_config_keys=list(tartxt_config.keys()))
-                    
+
+            instance_logger.info("workflow.initialized", # cite: 1460
+                        workflow_id=workflow_id,
+                        project_path=project_path,
+                        tartxt_script_path=tartxt_config.get('script_path'), # Log final path used
+                        tartxt_config_keys=list(tartxt_config.keys()))
+
             return prepared_config, context
-            
+
         except Exception as e:
-            logger.error("workflow.initialization_failed", error=str(e))
+            instance_logger.error("workflow.initialization_failed", error=str(e)) # cite: 1461
+            # Re-raise the exception to ensure the calling function knows about the failure
             raise
+
