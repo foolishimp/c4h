@@ -1,0 +1,117 @@
+===CHANGE_BEGIN===
+FILE: ./tests/test_projects/project1/sample.py
+TYPE: modify
+DESCRIPTION: Add logging and lineage tracking to greet and calculate_sum functions
+DIFF:
+--- a/tests/test_projects/project1/sample.py
++++ b/tests/test_projects/project1/sample.py
+@@ -1,10 +1,20 @@
++import logging
++import uuid
++
++# Basic logging configuration
++logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
++logger = logging.getLogger(__name__)
++
+ def greet(name):
+-    print(f"Hello, {name}!")
++    trace_id = str(uuid.uuid4())
++    logger.info(f"[trace_id: {trace_id}] Entering greet function for name: {name}")
++    result = f"Hello, {name}!"
++    logger.info(f"[trace_id: {trace_id}] Exiting greet function for name: {name}")
++    return result, trace_id
+
+ def calculate_sum(numbers):
++    trace_id = str(uuid.uuid4())
++    logger.info(f"[trace_id: {trace_id}] Entering calculate_sum with {len(numbers)} numbers.")
+     result = sum(numbers)
++    logger.info(f"[trace_id: {trace_id}] Calculated sum: {result}")
++    return result, trace_id
+
+ if __name__ == "__main__":
+-    greet("World")
+-    print(calculate_sum([1, 2, 3, 4, 5]))
++    greeting, greet_trace = greet("World")
++    print(f"Greeting Result (Trace: {greet_trace}): {greeting}")
++    sum_result, sum_trace = calculate_sum([1, 2, 3, 4, 5])
++    print(f"Sum Result (Trace: {sum_trace}): {sum_result}")
+===CHANGE_END===
+
+===CHANGE_BEGIN===
+FILE: ./tests/test_projects/project2/utils.py
+TYPE: modify
+DESCRIPTION: Add logging and lineage tracking to utility functions
+DIFF:
+--- a/tests/test_projects/project2/utils.py
++++ b/tests/test_projects/project2/utils.py
+@@ -1,12 +1,24 @@
++import logging
++import uuid
++
++# Basic logging configuration
++logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
++logger = logging.getLogger(__name__)
++
+ def format_name(name):
+     """Format name by stripping whitespace and converting to title case"""
+-    return name.strip().title()
++    trace_id = str(uuid.uuid4())
++    logger.info(f"[trace_id: {trace_id}] Formatting name: '{name}'")
++    formatted_name = name.strip().title()
++    logger.info(f"[trace_id: {trace_id}] Formatted name result: '{formatted_name}'")
++    return formatted_name, trace_id
+
+ def validate_age(age):
+     """Validate age is an integer between 0 and 150"""
++    trace_id = str(uuid.uuid4())
++    logger.info(f"[trace_id: {trace_id}] Validating age: {age}")
+     if not isinstance(age, int):
++        logger.error(f"[trace_id: {trace_id}] Validation Error: Age must be an integer.")
+         raise TypeError("Age must be an integer")
+     if age < 0 or age > 150:
++        logger.error(f"[trace_id: {trace_id}] Validation Error: Age out of range (0-150).")
+         raise ValueError("Age must be between 0 and 150")
+-    return age
++    logger.info(f"[trace_id: {trace_id}] Age validation successful.")
++    return age, trace_id
+===CHANGE_END===
+
+===CHANGE_BEGIN===
+FILE: ./tests/test_projects/project2/main.py
+TYPE: modify
+DESCRIPTION: Update main.py to use logging and lineage tracking from utils
+DIFF:
+--- a/tests/test_projects/project2/main.py
++++ b/tests/test_projects/project2/main.py
+@@ -1,14 +1,24 @@
++import logging
++import uuid
+ from utils import format_name, validate_age
+
++# Basic logging configuration (can be centralized later)
++logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
++logger = logging.getLogger(__name__)
++
+ def process_user(user_data):
+     """Process user data and return formatted string"""
+-    name = format_name(user_data["name"])
+-    age = validate_age(user_data["age"])
+-    return f"{name} is {age} years old"
++    parent_trace_id = str(uuid.uuid4())
++    logger.info(f"[trace_id: {parent_trace_id}] Starting processing for user: {user_data.get('name')}")
++    name, name_trace = format_name(user_data["name"])
++    age, age_trace = validate_age(user_data["age"])
++    result_string = f"{name} is {age} years old"
++    logger.info(f"[trace_id: {parent_trace_id}] Finished processing user. Result: '{result_string}'. Related traces: name={name_trace}, age={age_trace}")
++    return result_string, parent_trace_id
+
+ if __name__ == "__main__":
+     test_data = {
+         "name": "john doe",
+         "age": 25
+     }
+-    print(process_user(test_data))
++    processed_info, main_trace = process_user(test_data)
++    print(processed_info)
++    logger.info(f"[trace_id: {main_trace}] Main execution finished.")
+===CHANGE_END===

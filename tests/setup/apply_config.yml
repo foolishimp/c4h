@@ -1,0 +1,9 @@
+# apply_config.yml
+workorder:
+  project:
+    path: "tests/test_projects" # Runner executed from /Users/jim/src/apps/c4h
+  intent:
+    description: "Apply logging/lineage from jobs_coder_01_actual.diff"
+runtime:
+  backup:
+    enabled: true
