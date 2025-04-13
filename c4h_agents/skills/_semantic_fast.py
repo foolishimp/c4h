@@ -106,11 +106,13 @@ CRITICAL ESCAPE SEQUENCE HANDLING:
 
         logger.debug("deterministic_parse.attempting", content_length=len(content))
         parsed_items = []
+        # Improved regex: More robust whitespace handling, non-greedy matching for fields,
+        # and explicit handling of content until ===CHANGE_END===
         pattern = re.compile(
             r"===CHANGE_BEGIN===\s*"
-            r"FILE:\s*(?P<file_path>.*?)\s*"
-            r"TYPE:\s*(?P<type>.*?)\s*"
-            r"DESCRIPTION:\s*(?P<description>.*?)\s*"
+            r"FILE:\s*(?P<file_path>[^\n]*?)\s*" # Match until newline
+            r"TYPE:\s*(?P<type>[^\n]*?)\s*"       # Match until newline
+            r"DESCRIPTION:\s*(?P<description>[^\n]*?)\s*" # Match until newline
             r"DIFF:\s*(?P<diff>.*?)\s*"
             r"===CHANGE_END===",
             re.DOTALL | re.MULTILINE

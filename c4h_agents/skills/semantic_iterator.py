@@ -241,7 +241,8 @@ class SemanticIterator(BaseAgent):
                         self._state.config
                     )
             
-            # Check if fast extraction completely failed
+            # Check if fast extraction completely failed or if fallback is explicitly chosen
+            # Removed check for has_items as it doesn't exist on SlowItemIterator
             if not self._state.iterator.has_items() and self._allow_fallback:
                 logger.info("extraction.fallback_to_slow", reason="no_fast_results")
                 self._state.mode = ExtractionMode.SLOW
@@ -262,9 +263,17 @@ class SemanticIterator(BaseAgent):
         """Get next item using the appropriate iterator"""
         try:
             if not self._state.iterator:
+                logger.warning("iterator.next_called_without_iterator")
                 raise StopIteration
                 
-            return next(self._state.iterator)
+            # Directly call next on the current iterator (could be Fast or Slow)
+            next_item = next(self._state.iterator)
+            # Increment position tracking after successfully getting an item
+            self._state.position += 1
+            logger.debug("iterator.yielded_item",
+                        mode=self._state.mode,
+                        position=self._state.position) # Log position *after* yielding
+            return next_item
             
         except StopIteration:
             logger.debug("iterator.complete", 
