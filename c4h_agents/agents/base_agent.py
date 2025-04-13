@@ -49,6 +49,7 @@ class BaseAgent(BaseConfig, BaseLLM):
 
         # --- ADDED: Log the full configuration received by the agent ---
         try:
+            # Use default=str for safe serialization of non-standard types like datetime
             config_dump = json.dumps(self.config, indent=2, default=str)
             logger.debug(f"{agent_name}.__init__.received_config", config_json=config_dump)
         except Exception as e:

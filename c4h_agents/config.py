@@ -180,26 +180,11 @@ def get_by_path(data: Dict[str, Any], path: List[str]) -> Any:
     try:
         current = data
         for key in path:
-            if isinstance(current, dict):
-                if key not in current:
+            if isinstance(current, dict): # Check if current level is a dict
+                if key not in current:    # Check if key exists in dict
                     return None
-                current = current[key]
-            # Handle objects that support attribute access but aren't dictionaries
-            elif hasattr(current, key) and not isinstance(current, (str, int, float, bool)):
-                try:
-                    current = getattr(current, key)
-                except (AttributeError, TypeError):
-                    return None
-            elif isinstance(current, str):
-                try:
-                    parsed = json.loads(current)
-                    if isinstance(parsed, dict) and key in parsed:
-                        current = parsed[key]
-                    else:
-                        return None
-                except json.JSONDecodeError:
-                    return None
-            else:
+                current = current[key]    # Move down one level
+            else: # If not a dict, cannot traverse further
                 return None
         return current
     except Exception as e:
