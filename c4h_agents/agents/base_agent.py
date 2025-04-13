@@ -1,11 +1,3 @@
-"""
-Base agent implementation with enhanced lineage tracking.
-Path: c4h_agents/agents/base_agent.py
-
-Updates:
-- Initialize logger with configuration to ensure proper truncation
-"""
-
 # Original imports...
 from typing import Dict, Any, Optional, List, Tuple
 import structlog
@@ -46,15 +38,6 @@ class BaseAgent(BaseConfig, BaseLLM):
             
         # Store agent ID in system namespace
         self.config["system"]["agent_id"] = self.agent_id
-
-        # --- ADDED: Log the full configuration received by the agent ---
-        try:
-            # Use default=str for safe serialization of non-standard types like datetime
-            config_dump = json.dumps(self.config, indent=2, default=str)
-            logger.debug(f"{agent_name}.__init__.received_config", config_json=config_dump)
-        except Exception as e:
-            logger.error(f"{agent_name}.__init__.config_dump_failed", error=str(e))
-        # --- END ADDED ---
             
         # 
         # Resolve provider, model, and temperature using hierarchical lookup
@@ -102,7 +85,16 @@ class BaseAgent(BaseConfig, BaseLLM):
             })
             
         # Update to pass configuration to logger
-        self.logger = get_logger(self.config).bind(**log_context)
+        # Bind context directly to the logger obtained using the config
+        self.logger = get_logger(self.config).bind(**log_context) #
+        
+        # --- ADDED: Log the full configuration received by the agent ---
+        try:
+            # Use default=str for safe serialization of non-standard types like datetime
+            self.logger.debug(f"{agent_name}.__init__.received_config", config_data=self.config) # Use self.logger and pass dict directly
+        except Exception as e:
+            self.logger.error(f"{agent_name}.__init__.config_dump_failed", error=str(e)) # Use self.logger
+        # --- END ADDED ---
         
         # Initialize lineage tracking with the full configuration
         self.lineage = None
@@ -110,10 +102,11 @@ class BaseAgent(BaseConfig, BaseLLM):
             # Log what run_id we're using
             run_id = self._get_workflow_run_id()
             if run_id:
-                logger.debug(f"{agent_name}.using_workflow_run_id", 
+                # --- MODIFIED: Use self.logger ---
+                self.logger.debug(f"{agent_name}.using_workflow_run_id",
                             run_id=run_id, 
-                            source="config", 
-                            config_keys=list(self.config.keys()))
+                            config_keys=list(self.config.keys()), 
+                            source="config")
             
             self.lineage = BaseLineage(
                 namespace="c4h_agents",
@@ -125,12 +118,12 @@ class BaseAgent(BaseConfig, BaseLLM):
             self.run_id = self.lineage.run_id
             
         except Exception as e:
-            logger.error(f"{agent_name}.lineage_init_failed", error=str(e))
+            self.logger.error(f"{agent_name}.lineage_init_failed", error=str(e)) # Use self.logger
             # Generate run ID if lineage fails
             self.run_id = str(uuid.uuid4())
 
-        logger.info(f"{agent_name}.initialized", 
-                    run_id=self.run_id,
+        self.logger.info(f"{agent_name}.initialized", # Use self.logger
+                    run_id=self.run_id, #
                     continuation_settings={
                         "max_attempts": self.max_continuation_attempts,
                         "token_buffer": self.continuation_token_buffer
@@ -196,7 +189,7 @@ class BaseAgent(BaseConfig, BaseLLM):
 
     def _process(self, context: Dict[str, Any]) -> AgentResponse:
         try:
-            if self._should_log(LogDetail.DETAILED):
+            if self._should_log(LogDetail.DETAILED): # Use self.logger below
                 logger.info("agent.processing", context_keys=list(context.keys()) if context else None)
             
             # Prepare lineage tracking context
@@ -204,10 +197,10 @@ class BaseAgent(BaseConfig, BaseLLM):
             agent_execution_id = lineage_context.get("agent_execution_id")
             parent_id = lineage_context.get("parent_id")
             
-            logger.debug("agent.lineage_context", 
+            self.logger.debug("agent.lineage_context", # Use self.logger
                         agent_id=self.agent_id,
                         agent_execution_id=agent_execution_id,
-                        parent_id=parent_id,
+                        parent_id=parent_id, #
                         workflow_run_id=lineage_context.get("workflow_run_id"))
             
             # Extract data from context
@@ -217,8 +210,8 @@ class BaseAgent(BaseConfig, BaseLLM):
             system_message = self._get_system_message()
             user_message = self._format_request(data)
             
-            if self._should_log(LogDetail.DEBUG):
-                logger.debug("agent.messages",
+            if self._should_log(LogDetail.DEBUG): # Use self.logger below
+                self.logger.debug("agent.messages",
                             system_length=len(system_message),
                             user_length=len(user_message),
                             agent_execution_id=agent_execution_id,
@@ -248,7 +241,7 @@ class BaseAgent(BaseConfig, BaseLLM):
                 # Process response
                 processed_data = self._process_response(content, raw_response)
                 
-                # Add execution metadata to processed data
+                # Add execution metadata
                 processed_data["execution_metadata"] = {
                     "agent_execution_id": agent_execution_id,
                     "parent_id": parent_id,
@@ -264,10 +257,10 @@ class BaseAgent(BaseConfig, BaseLLM):
                 # Track lineage if enabled
                 if lineage_enabled:
                     try:
-                        logger.debug("lineage.tracking_attempt", 
+                        self.logger.debug("lineage.tracking_attempt", # Use self.logger
                                     agent=self._get_agent_name(), 
                                     agent_execution_id=agent_execution_id,
-                                    parent_id=parent_id,
+                                    parent_id=parent_id, #
                                     has_context=bool(lineage_context), 
                                     has_messages=bool(messages), 
                                     has_metrics=hasattr(raw_response, 'usage'))
@@ -280,17 +273,18 @@ class BaseAgent(BaseConfig, BaseLLM):
                                 response=raw_response,
                                 metrics=response_metrics
                             )
-                        logger.info("lineage.tracking_complete", 
+                        self.logger.info("lineage.tracking_complete", # Use self.logger
                                 agent=self._get_agent_name(),
                                 agent_execution_id=agent_execution_id)
-                    except Exception as e:
+                    except Exception as e: # Use self.logger below
                         logger.error("lineage.tracking_failed", 
                                     error=str(e), 
                                     error_type=type(e).__name__, 
                                     agent=self._get_agent_name(),
                                     agent_execution_id=agent_execution_id)
                 else:
-                    logger.debug("lineage.tracking_skipped",
+                    # --- MODIFIED: Use self.logger ---
+                    self.logger.debug("lineage.tracking_skipped",
                             has_lineage=hasattr(self, 'lineage'),
                             lineage_enabled=getattr(self.lineage, 'enabled', False) if hasattr(self, 'lineage') else False,
                             agent=self._get_agent_name())
@@ -319,7 +313,7 @@ class BaseAgent(BaseConfig, BaseLLM):
                             response={"error": str(e)},
                             metrics={"error": True}
                         )
-                    except Exception as lineage_error:
+                    except Exception as lineage_error: # Use self.logger below
                         logger.error("lineage.failure_tracking_failed", 
                                     error=str(lineage_error),
                                     original_error=str(e))
@@ -361,40 +355,77 @@ class BaseAgent(BaseConfig, BaseLLM):
         return str(context)
     
     def _get_llm_content(self, response: Any) -> Any:
-        """Extract content from LLM response with robust error handling for different response formats"""
-        try:
-            # Handle different response types
-            if hasattr(response, 'choices') and response.choices:
-                # Standard response object
-                if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
-                    content = response.choices[0].message.content
-                    if self._should_log(LogDetail.DEBUG):
-                        logger.debug("content.extracted_from_model", content_length=len(content) if content else 0)
-                    return content
-                # Handle delta format (used in streaming)
-                elif hasattr(response.choices[0], 'delta') and hasattr(response.choices[0].delta, 'content'):
-                    content = response.choices[0].delta.content
-                    if self._should_log(LogDetail.DEBUG):
-                        logger.debug("content.extracted_from_delta", content_length=len(content) if content else 0)
-                    return content
-            
-            # If we have a simple string content
-            if isinstance(response, str):
-                return response
-                
-            # If response is already processed (dict with 'response' key)
-            if isinstance(response, dict) and 'response' in response:
-                return response['response']
-                
-            # Last resort fallback - convert to string
-            result = str(response)
-            logger.warning("content.extraction_fallback", 
-                        response_type=type(response).__name__, 
-                        content_preview=result[:100] if len(result) > 100 else result)
-            return result
-        except Exception as e:
-            logger.error("content_extraction.failed", error=str(e))
-            return str(response)
+            """Extract content from LLM response or context data with robust error handling."""
+            # --- Enhanced Logging ---
+            # Use self.logger which should be initialized in BaseAgent.__init__
+            logger_to_use = getattr(self, 'logger', get_logger()) # Fallback just in case
+            response_repr = repr(response)
+            logger_to_use.debug("_get_llm_content.received",
+                        input_type=type(response).__name__,
+                        input_repr_preview=response_repr[:200] + "..." if len(response_repr) > 200 else response_repr)
+            # --- End Enhanced Logging ---
+            try:
+                # 1. Handle standard LLM response objects (LiteLLM format)
+                if hasattr(response, 'choices') and response.choices:
+                    logger_to_use.debug("_get_llm_content.checking_choices")
+                    # Standard completion response
+                    if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
+                        content = response.choices[0].message.content
+                        logger_to_use.debug("content.extracted_from_model", content_length=len(content) if content else 0)
+                        return content
+                    # Delta format (streaming)
+                    elif hasattr(response.choices[0], 'delta') and hasattr(response.choices[0].delta, 'content'):
+                        content = response.choices[0].delta.content
+                        logger_to_use.debug("content.extracted_from_delta", content_length=len(content) if content else 0)
+                        return content
+
+                # 2. Handle direct string input
+                if isinstance(response, str):
+                    logger_to_use.debug("content.extracted_direct_string", content_length=len(response))
+                    return response
+
+                # 3. Handle dictionary inputs (common for context passing)
+                if isinstance(response, dict):
+                    logger_to_use.debug("_get_llm_content.checking_dict_keys", keys=list(response.keys()))
+                    
+                    # Check common keys/structures where content might reside
+                    
+                    # --- ADDED/MODIFIED NESTED CHECK ---
+                    # Check for {'response': {'content': '...'}} <--- This handles the case from the last logs
+                    if 'response' in response and isinstance(response['response'], dict):
+                        logger_to_use.debug("_get_llm_content.checking_nested_dict_in_response_key")
+                        if 'content' in response['response'] and isinstance(response['response']['content'], str):
+                            logger_to_use.debug("content.extracted_from_nested_dict_response_content_key", content_length=len(response['response']['content']))
+                            return response['response']['content']
+                    
+                    # Check for {'response': '...'} (string value)
+                    if 'response' in response and isinstance(response['response'], str):
+                        logger_to_use.debug("content.extracted_from_dict_response_key (string)", content_length=len(response['response']))
+                        return response['response']
+                    # --- END ADDED/MODIFIED CHECK ---
+
+                    # Check for {'content': '...'}
+                    if 'content' in response and isinstance(response['content'], str):
+                        logger_to_use.debug("content.extracted_from_dict_content_key", content_length=len(response['content']))
+                        return response['content']
+                    
+                    # Check for apply_diff structure {'llm_output': {'content': '...'}}
+                    if 'llm_output' in response and isinstance(response['llm_output'], dict):
+                        logger_to_use.debug("_get_llm_content.checking_dict_llm_output_key", llm_output_keys=list(response['llm_output'].keys()))
+                        if 'content' in response['llm_output'] and isinstance(response['llm_output']['content'], str):
+                            logger_to_use.debug("content.extracted_from_dict_llm_output_content_key", content_length=len(response['llm_output']['content']))
+                            return response['llm_output']['content']
+
+                # 4. Last resort fallback - convert to string
+                result = str(response)
+                logger_to_use.warning("content.extraction_fallback",
+                            response_type=type(response).__name__,
+                            content_preview=result[:100] if len(result) > 100 else result)
+                return result
+            except Exception as e:
+                logger_to_use.error("content_extraction.failed", error=str(e))
+                # Return string representation on error
+                return str(response)
 
     def _process_response(self, content: str, raw_response: Any) -> Dict[str, Any]:
         """Process LLM response into standard format without duplicating raw output"""

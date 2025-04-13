@@ -1,4 +1,3 @@
-# Path: c4h_agents/skills/_semantic_fast.py
 """
 Fast extraction mode implementation using standardized LLM response handling.
 Refactored to prioritize deterministic parsing for known formats.
@@ -95,60 +94,68 @@ CRITICAL ESCAPE SEQUENCE HANDLING:
             raise
 
     def _try_deterministic_parse(self, content: str) -> Optional[List[Dict[str, Any]]]:
-        """Attempt deterministic parsing for '===CHANGE_BEGIN===' format"""
-        if not isinstance(content, str):
-            logger.debug("deterministic_parse.skipping", reason="Input is not a string", content_type=type(content).__name__)
-            return None
+            """Attempt deterministic parsing for '===CHANGE_BEGIN===' format"""
+            if not isinstance(content, str):
+                logger.debug("deterministic_parse.skipping", reason="Input is not a string", content_type=type(content).__name__)
+                return None
 
-        if "===CHANGE_BEGIN===" not in content:
-            logger.debug("deterministic_parse.skipping", reason="No change markers found")
-            return None
+            if "===CHANGE_BEGIN===" not in content:
+                logger.debug("deterministic_parse.skipping", reason="No change markers found")
+                return None
 
-        logger.debug("deterministic_parse.attempting", content_length=len(content))
-        parsed_items = []
-        # Improved regex: More robust whitespace handling, non-greedy matching for fields,
-        # and explicit handling of content until ===CHANGE_END===
-        pattern = re.compile(
-            r"===CHANGE_BEGIN===\s*"
-            r"FILE:\s*(?P<file_path>[^\n]*?)\s*" # Match until newline
-            r"TYPE:\s*(?P<type>[^\n]*?)\s*"       # Match until newline
-            r"DESCRIPTION:\s*(?P<description>[^\n]*?)\s*" # Match until newline
-            r"DIFF:\s*(?P<diff>.*?)\s*"
-            r"===CHANGE_END===",
-            re.DOTALL | re.MULTILINE
-        )
+            # --- ADDED: Log the exact content being parsed ---
+            logger.debug("deterministic_parse.attempting", content_length=len(content), content_to_parse=content)
+            # --- END ADDED ---
 
-        matches = list(pattern.finditer(content))
-        logger.debug("deterministic_parse.matches_found", count=len(matches))
+            parsed_items = []
+            # Refined regex again: More explicit boundaries, especially for DIFF content
+            pattern = re.compile(
+                r"===CHANGE_BEGIN===\s*"
+                r"FILE:(?P<file_path>.*?)\n"                # Capture non-greedily until newline
+                r"TYPE:(?P<type>.*?)\n"                  # Capture non-greedily until newline
+                r"DESCRIPTION:(?P<description>.*?)\n"      # Capture non-greedily until newline
+                r"DIFF:\s*\n(?P<diff>.*?)\n?"               # Capture DIFF content after newline, non-greedily
+                r"===CHANGE_END===",
+                # Using DOTALL allows '.' to match newlines within the DIFF section
+                re.DOTALL | re.MULTILINE
+            )
 
-        for match in matches:
-            data = match.groupdict()
-            logger.debug("deterministic_parse.match_data", file_path=data.get('file_path'), type=data.get('type'))
+            matches = list(pattern.finditer(content))
+            logger.debug("deterministic_parse.matches_found", count=len(matches))
 
-            if not data.get('file_path'):
-                logger.warning("deterministic_parse.missing_field", field="file_path", match_data=data)
-                continue
-            if not data.get('type'):
-                logger.warning("deterministic_parse.missing_field", field="type", match_data=data)
-                continue
-            if data.get('diff') is None:
-                logger.warning("deterministic_parse.missing_field", field="diff", match_data=data)
-                continue
+            for match in matches:
+                data = match.groupdict()
+                logger.debug("deterministic_parse.match_data", file_path=data.get('file_path'), type=data.get('type'))
 
-            item = {
-                "file_path": data['file_path'].strip(),
-                "type": data['type'].strip(),
-                "description": data['description'].strip(),
-                "diff": data['diff'].strip('\n')
-            }
-            parsed_items.append(item)
-            logger.debug("deterministic_parse.item_extracted", file_path=item["file_path"])
+                if not data.get('file_path'):
+                    logger.warning("deterministic_parse.missing_field", field="file_path", match_data=data)
+                    continue
+                if not data.get('type'):
+                    logger.warning("deterministic_parse.missing_field", field="type", match_data=data)
+                    continue
+                if data.get('diff') is None:
+                    # Allow empty diffs, but log a warning if it was truly missing vs empty
+                    if "DIFF:" not in match.group(0).split("DESCRIPTION:", 1)[1]:
+                        logger.warning("deterministic_parse.missing_field", field="diff", match_data=data)
+                    # If DIFF: is present but content is empty, that's okay (e.g., delete file)
+                    data['diff'] = '' # Ensure key exists even if empty
 
-        if parsed_items:
-            logger.info("deterministic_parse.success", items_found=len(parsed_items))
-        else:
-            logger.warning("deterministic_parse.failed", reason="No valid items extracted")
-        return parsed_items if parsed_items else None
+                item = {
+                    "file_path": data['file_path'].strip(),
+                    "type": data['type'].strip(),
+                    "description": data['description'].strip(),
+                    # Strip only leading/trailing whitespace/newlines from the diff itself
+                    "diff": data['diff'].strip()
+                }
+                parsed_items.append(item)
+                logger.debug("deterministic_parse.item_extracted", file_path=item["file_path"])
+
+            if parsed_items:
+                logger.info("deterministic_parse.success", items_found=len(parsed_items))
+            else:
+                logger.warning("deterministic_parse.failed", reason="No valid items extracted")
+            return parsed_items if parsed_items else None
+
 
     def create_iterator(self, content: Any, config: ExtractConfig) -> FastItemIterator:
         """Create iterator, trying deterministic parsing then LLM fallback"""

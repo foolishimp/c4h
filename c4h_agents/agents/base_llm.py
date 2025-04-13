@@ -229,40 +229,88 @@ class BaseLLM:
             # Don't re-raise - litellm setup failure shouldn't be fatal
 
     def _get_llm_content(self, response: Any) -> Any:
-        """Extract content from LLM response with robust error handling for different response formats"""
-        try:
-            # Handle different response types
-            if hasattr(response, 'choices') and response.choices:
-                # Standard response object
-                if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
-                    content = response.choices[0].message.content
-                    if self._should_log(LogDetail.DEBUG):
-                        logger.debug("content.extracted_from_model", content_length=len(content) if content else 0)
-                    return content
-                # Handle delta format (used in streaming)
-                elif hasattr(response.choices[0], 'delta') and hasattr(response.choices[0].delta, 'content'):
-                    content = response.choices[0].delta.content
-                    if self._should_log(LogDetail.DEBUG):
-                        logger.debug("content.extracted_from_delta", content_length=len(content) if content else 0)
-                    return content
-            
-            # If we have a simple string content
-            if isinstance(response, str):
-                return response
+            """Extract content from LLM response or context data with robust error handling."""
+            logger_to_use = getattr(self, 'logger', get_logger())
+            response_repr = repr(response)
+            logger_to_use.debug("_get_llm_content.received",
+                        input_type=type(response).__name__,
+                        input_repr_preview=response_repr[:200] + "..." if len(response_repr) > 200 else response_repr)
+            try:
+                # 1. Handle standard LLM response objects
+                if hasattr(response, 'choices') and response.choices:
+                    logger_to_use.debug("_get_llm_content.checking_choices")
+                    if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
+                        content = response.choices[0].message.content
+                        logger_to_use.debug("content.extracted_from_model", content_length=len(content) if content else 0)
+                        return content
+                    elif hasattr(response.choices[0], 'delta') and hasattr(response.choices[0].delta, 'content'):
+                        content = response.choices[0].delta.content
+                        logger_to_use.debug("content.extracted_from_delta", content_length=len(content) if content else 0)
+                        return content
+
+                # 2. Handle direct string input
+                if isinstance(response, str):
+                    logger_to_use.debug("content.extracted_direct_string", content_length=len(response))
+                    return response
+
+                # 3. Handle dictionary inputs
+                if isinstance(response, dict):
+                    logger_to_use.debug("_get_llm_content.checking_dict_keys", keys=list(response.keys()))
+
+                    # Check for {'response': ...} structure
+                    if 'response' in response:
+                        response_val = response['response']
+                        logger_to_use.debug("_get_llm_content.found_response_key", response_val_type=type(response_val).__name__) # Log type
+
+                        # Check if response_val is the string directly
+                        if isinstance(response_val, str):
+                            logger_to_use.debug("content.extracted_from_dict_response_key (string)", content_length=len(response_val))
+                            return response_val
+                        
+                        # --- Check nested dict {'response': {'content': '...'}} ---
+                        elif isinstance(response_val, dict) and 'content' in response_val:
+                            # --- ADDED PRINT STATEMENTS ---
+                            print("DEBUG: Entered response[response][content] check") 
+                            content_val = response_val['content']
+                            print(f"DEBUG: Nested content type: {type(content_val).__name__}")
+                            # --- END ADDED ---
+                            if isinstance(content_val, str):
+                                print("DEBUG: Nested content is string, returning it.") # Added Print
+                                logger_to_use.debug("content.extracted_from_nested_dict_response_content_key", content_length=len(content_val))
+                                return content_val
+                            else:
+                                print("DEBUG: Nested content is NOT string.") # Added Print
+                                logger_to_use.warning("_get_llm_content.nested_content_not_string", nested_content_type=type(content_val).__name__)
+                        else:
+                            print("DEBUG: response[response] is dict but no 'content' key found.") # Added Print
+                            logger_to_use.debug("_get_llm_content.nested_content_key_missing")
+
+
+                    # Check for {'content': '...'}
+                    if 'content' in response and isinstance(response['content'], str):
+                        logger_to_use.debug("content.extracted_from_dict_content_key", content_length=len(response['content']))
+                        return response['content']
+                    
+                    # Check for apply_diff structure {'llm_output': {'content': '...'}}
+                    if 'llm_output' in response and isinstance(response['llm_output'], dict):
+                        logger_to_use.debug("_get_llm_content.checking_dict_llm_output_key", llm_output_keys=list(response['llm_output'].keys()))
+                        if 'content' in response['llm_output'] and isinstance(response['llm_output']['content'], str):
+                            logger_to_use.debug("content.extracted_from_dict_llm_output_content_key", content_length=len(response['llm_output']['content']))
+                            return response['llm_output']['content']
+
+                # 4. Last resort fallback - convert to string
+                result = str(response)
+                logger_to_use.warning("content.extraction_fallback",
+                            response_type=type(response).__name__,
+                            content_preview=result[:100] if len(result) > 100 else result)
+                return result
                 
-            # If response is already processed (dict with 'response' key)
-            if isinstance(response, dict) and 'response' in response:
-                return response['response']
-                
-            # Last resort fallback - convert to string
-            result = str(response)
-            logger.warning("content.extraction_fallback",
-                        response_type=type(response).__name__,
-                        content_preview=result[:100] if len(result) > 100 else result)
-            return result
-        except Exception as e:
-            logger.error("content_extraction.failed", error=str(e))
-            return str(response)
+            except Exception as e:
+                # Log the exception *before* falling back
+                logger_to_use.error("content_extraction.failed_with_exception", error=str(e), exc_info=True) # Log traceback
+                # Return string representation on error
+                return str(response)
+
 
     def _should_log(self, level: LogDetail) -> bool:
         """Check if current log level includes the specified detail level"""

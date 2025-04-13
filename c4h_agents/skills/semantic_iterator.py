@@ -231,15 +231,17 @@ class SemanticIterator(BaseAgent):
                 if fast_items_count > 0 and fast_items_count < expected_items and self._allow_fallback:
                     logger.info("extraction.incomplete_fast_results", 
                               found=fast_items_count, 
-                              expected=expected_items)
-                    
+                              expected=expected_items) # Logged the counts
+
                     # Fallback to slow extraction for more reliable results
                     logger.info("extraction.fallback_to_slow", reason="incomplete_results")
                     self._state.mode = ExtractionMode.SLOW
+                    # --- FIX: Explicitly initialize SlowItemIterator ---
                     self._state.iterator = self._slow_extractor.create_iterator(
                         self._state.content,
                         self._state.config
                     )
+                    # --- END FIX ---
             
             # Check if fast extraction completely failed or if fallback is explicitly chosen
             # Removed check for has_items as it doesn't exist on SlowItemIterator
