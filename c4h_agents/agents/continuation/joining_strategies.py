@@ -1,10 +1,15 @@
-# File: c4h_agents/agents/continuation/joining_strategies.py
+# Path: /Users/jim/src/apps/c4h/c4h_agents/agents/continuation/joining_strategies.py
 
 from typing import Tuple
 import re
 import traceback
 import json
+# Import the central logger utility
+from c4h_agents.utils.logging import get_logger
 from .overlap_strategies import find_explicit_overlap
+
+# Use central logger at module level if needed, though functions receive it
+logger = get_logger()
 
 def join_with_explicit_overlap(previous: str, current: str, explicit_overlap: str, requested_size: int, logger) -> Tuple[str, bool]:
     """
@@ -15,7 +20,7 @@ def join_with_explicit_overlap(previous: str, current: str, explicit_overlap: st
         current: New continuation content
         explicit_overlap: The overlap text we asked the LLM to repeat
         requested_size: The size of overlap we requested (hint)
-        logger: Logger instance
+        logger: Logger instance (passed from caller)
         
     Returns:
         (joined_content, success) tuple
@@ -28,57 +33,68 @@ def join_with_explicit_overlap(previous: str, current: str, explicit_overlap: st
             # Join the content at the identified position
             joined_content = previous + current[position:]
             logger.debug("Successfully joined with explicit overlap", 
-                         extra={"overlap_size": position, "joined_length": len(joined_content)})
+                        overlap_size=position, joined_length=len(joined_content)) # Pass directly
             return joined_content, True
             
         # If explicit overlap matching failed, try some simple structural heuristics
         # This can handle case where the LLM didn't repeat properly but continued sensibly
         
-        # 1. Check if we can just append (good for well-structured content)
         if _is_valid_append_point(previous, current):
-            logger.info("Used structural heuristics for joining", 
-                      extra={"method": "valid_append_point"})
+            logger.info("Used structural heuristics for joining", #
+                       method="valid_append_point") # Removed 'extra'
             return previous + current, True
             
-        # 2. If no matches at all, we return failure
+        # If no matches at all, we return failure
         logger.warning("Could not join content with any method")
         return previous, False
         
     except Exception as e:
         logger.error("Join with explicit overlap failed",
-                    extra={"error": str(e), "stack_trace": traceback.format_exc()})
+                    error=str(e), # Pass directly
+                    stack_trace=traceback.format_exc())
         return previous, False
 
 def _is_valid_append_point(previous: str, current: str) -> bool:
-    """
-    Check if it's reasonable to directly append content based on structural cues.
-    Uses simple heuristics to detect if the content appears to be at a valid break point.
-    """
-    # Check for complete sentences at the end of previous
-    if previous.rstrip().endswith(('.', '!', '?', ':', ';')):
-        return True
+    """Check if it's reasonable to directly append content.""" # Simplified Heuristics
+    try:
+        # Basic structural checks... 
+        # Ensure strings are not empty before accessing indices
+        if not previous or not current:
+             return False
+             
+        # Check for complete sentences at the end of previous
+        if previous.rstrip().endswith(('.', '!', '?', ':', ';')):
+            return True
+            
+        # Check for natural break points in code or structured text
+        if (previous.rstrip().endswith(('{', '[', '(', ',', ';')) or 
+            previous.rstrip().endswith(('function', 'class', 'if', 'else', 'for', 'while'))):
+            return True
         
-    # Check for natural break points in code or structured text
-    if (previous.rstrip().endswith(('{', '[', '(', ',', ';')) or 
-        previous.rstrip().endswith(('function', 'class', 'if', 'else', 'for', 'while'))):
-        return True
-    
-    # Check for incomplete words (don't append if we'd be joining mid-word)
-    if previous[-1].isalnum() and current[0].isalnum():
-        return False
+        # Check for incomplete words (don't append if we'd be joining mid-word)
+        if previous[-1].isalnum() and current[0].isalnum():
+            return False
+            
+        # Check for block delimiters in markdown or structured text
+        if (previous.rstrip().endswith(('```', '===', '---')) or
+            current.lstrip().startswith(('```', '===', '---'))):
+            return True
         
-    # Check for block delimiters in markdown or structured text
-    if (previous.rstrip().endswith(('```', '===', '---')) or
-        current.lstrip().startswith(('```', '===', '---'))):
-        return True
-    
-    # For JSON-like content, check structural integrity
-    open_braces = previous.count('{') - previous.count('}')
-    open_brackets = previous.count('[') - previous.count(']')
-    
-    if (open_braces > 0 or open_brackets > 0) and (current.lstrip()[0] in ['"', '{', '[', ']', '}', ',']):
-        return True
-    
+        # For JSON-like content, check structural integrity (simplistic)
+        open_braces = previous.count('{') - previous.count('}')
+        open_brackets = previous.count('[') - previous.count(']')
+        
+        if (open_braces > 0 or open_brackets > 0) and (current.lstrip()[0] in ['"', '{', '[', ']', '}', ',']):
+            return True
+
+    except IndexError:
+         # Handle potential index errors if strings are very short
+         return False
+    except Exception as e:
+         # Use global logger as this is a static-like helper
+         logger.error("_is_valid_append_point.failed", error=str(e))
+         return False
+
     # Default to false - better to be cautious
     return False
         
@@ -86,43 +102,45 @@ def clean_json_content(content: str, logger) -> str:
     """Clean up JSON-like content by fixing structure."""
     try:
         # Fix unbalanced braces
-        if '{' in content and '}' in content:
+        if '{' in content or '}' in content: # Check if braces are present at all
             open_braces = content.count('{')
             close_braces = content.count('}')
             if open_braces > close_braces:
                 missing = open_braces - close_braces
                 content += '\n' + '}' * missing
-                logger.debug("Added missing closing braces", extra={"count": missing})
+                logger.debug("Added missing closing braces", count=missing) # Pass directly
             
             # Fix unbalanced brackets
             open_brackets = content.count('[')
             close_brackets = content.count(']')
             if open_brackets > close_brackets:
                 missing = open_brackets - close_brackets
-                content += '\n' + ']' * missing
-                logger.debug("Added missing closing brackets", extra={"count": missing})
+                content += '\n' + ']' * missing #
+                logger.debug("Added missing closing brackets", count=missing) # Pass directly
                 
-            # Check for special markers
+            # Check for special markers (Ensure they are balanced)
             change_begins = content.count('===CHANGE_BEGIN===')
             change_ends = content.count('===CHANGE_END===')
             
             if change_begins > change_ends:
                 missing = change_begins - change_ends
                 content += '\n===CHANGE_END===' * missing
-                logger.debug("Added missing CHANGE_END markers", extra={"count": missing})
-            
-        # Attempt light validation - try to parse and fix
-        try:
-            # See if the content looks like valid JSON
-            if (content.strip().startswith('{') and content.strip().endswith('}')) or \
-               (content.strip().startswith('[') and content.strip().endswith(']')):
+                logger.debug("Added missing CHANGE_END markers", count=missing) # Pass directly
+        
+        # Attempt light validation - try to parse and fix if it looks like JSON
+        # Only attempt parse if it starts/ends like JSON
+        content_stripped = content.strip()
+        if (content_stripped.startswith('{') and content_stripped.endswith('}')) or \
+           (content_stripped.startswith('[') and content_stripped.endswith(']')):
+            try:
                 json.loads(content)  # Just to validate
-        except json.JSONDecodeError:
-            # Not valid JSON - might be close though, just log it
-            logger.warning("Content appears to be JSON but is not valid")
+            except json.JSONDecodeError:
+                # Not valid JSON - might be close though, just log it
+                logger.warning("Content appears to be JSON but is not valid")
         
         return content
     except Exception as e:
         logger.error("Content cleaning failed",
-                     extra={"error": str(e), "stack_trace": traceback.format_exc()})
+                      error=str(e), # Pass directly
+                      stack_trace=traceback.format_exc())
         return content

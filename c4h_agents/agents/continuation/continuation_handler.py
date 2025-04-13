@@ -1,270 +1,369 @@
-# Path: c4h_agents/skills/_semantic_fast.py
-"""
-Fast extraction mode implementation using standardized LLM response handling.
-Refactored to prioritize deterministic parsing for known formats.
-"""
+# Path: /Users/jim/src/apps/c4h/c4h_agents/agents/continuation/continuation_handler.py
 
-from typing import List, Dict, Any, Optional, Iterator, Union
-import json
-import re
-from c4h_agents.agents.base_agent import BaseAgent, AgentResponse
-from skills.shared.types import ExtractConfig
+from typing import Dict, Any, List, Tuple, Optional
+import time
+import random
+import traceback
+import logging # Keep standard logging for fallback
+
+import litellm
+# Import the central logger utility
 from c4h_agents.utils.logging import get_logger
+from .config import WINDOW_CONFIG, STITCHING_STRATEGIES, requires_json_cleaning
+from .overlap_strategies import find_explicit_overlap
+from .joining_strategies import join_with_explicit_overlap, clean_json_content
 
-logger = get_logger()
+class ContinuationHandler:
+    """Handles LLM response continuations using a simple window approach with explicit overlaps."""
 
-class FastItemIterator:
-    """Iterator for fast extraction results with indexing support"""
-    def __init__(self, items: List[Any]):
-        self._items = items if items else []
-        self._position = 0
-        logger.debug("fast_iterator.initialized", items_count=len(self._items))
+    def __init__(self, parent_agent):
+        self.parent = parent_agent
+        # Ensure these attributes exist on parent_agent before accessing
+        self.model_str = getattr(parent_agent, 'model_str', 'unknown_model')
+        self.provider = getattr(parent_agent, 'provider', None)
+        self.temperature = getattr(parent_agent, 'temperature', 0)
+        self.max_continuation_attempts = getattr(parent_agent, 'max_continuation_attempts', 5)
 
-    def __iter__(self):
-        return self
+        # Use parent agent's logger if available, otherwise get a default one
+        # Parent logger should already be configured via get_logger(config)
+        self.logger = getattr(parent_agent, 'logger', get_logger()) # Use central logger
 
-    def __next__(self):
-        if self._position >= len(self._items):
-            logger.debug("fast_iterator.exhausted")
-            raise StopIteration
-        item = self._items[self._position]
-        self._position += 1
-        logger.debug("fast_iterator.yielded_item", position=self._position - 1, item_preview=str(item)[:100])
-        return item
+        self.metrics = {
+            "attempts": 0,
+            "exact_matches": 0,
+            "fallback_matches": 0,
+            "rate_limit_retries": 0,
+            "stitching_retries": 0
+        }
+        # Log initialization completion
+        self.logger.debug("ContinuationHandler initialized", parent_agent_type=type(parent_agent).__name__)
 
-    def __len__(self):
-        return len(self._items)
 
-    def __getitem__(self, idx):
-        return self._items[idx]
-
-    def has_items(self) -> bool:
-        return bool(self._items)
-
-class FastExtractor(BaseAgent):
-    """
-    Implements fast extraction mode.
-    Prioritizes deterministic parsing for '===CHANGE_BEGIN===' format,
-    falling back to LLM-based extraction if deterministic parsing fails.
-    """
-
-    def __init__(self, config: Dict[str, Any] = None):
-        super().__init__(config=config)
-        fast_cfg = self._get_agent_config()
-        logger.info("fast_extractor.initialized", settings=fast_cfg)
-
-    def _get_agent_name(self) -> str:
-        return "semantic_fast_extractor"
-
-    def _format_request(self, context: Dict[str, Any]) -> str:
-        """Format extraction request for LLM fallback mode"""
-        if not context.get('config'):
-            logger.error("fast_extractor.missing_config")
-            raise ValueError("Extract config required")
-
-        extract_template = self._get_prompt('extract')
-        raw_input_content = context.get('content', '')
-
-        if isinstance(raw_input_content, dict):
-            content_str_for_prompt = json.dumps(raw_input_content, indent=2)
-            logger.debug("fast_extractor_llm.using_json_content", content_length=len(content_str_for_prompt))
-        else:
-            content_str_for_prompt = str(raw_input_content)
-            logger.debug("fast_extractor_llm.using_raw_input", content_length=len(content_str_for_prompt))
-
+    def get_completion_with_continuation(
+            self, messages: List[Dict[str, str]], max_attempts: Optional[int] = None
+    ) -> Tuple[str, Any]:
+        """Get completion with automatic continuation using window-based approach with explicit overlaps."""
+        attempt = 0
+        max_tries = max_attempts or self.max_continuation_attempts
+        accumulated_content = ""
+        final_response = None
+        
+        self.logger.info("Starting continuation process", #
+                        model=self.model_str) # Pass directly
+        
+        rate_limit_retries = 0
+        rate_limit_backoff = WINDOW_CONFIG["rate_limit_retry_base_delay"]
+        
         try:
-            final_prompt = extract_template.format(
-                content=content_str_for_prompt,
-                instruction=context['config'].instruction,
-                format=context['config'].format
-            )
-            escape_handling_instructions = """
-CRITICAL ESCAPE SEQUENCE HANDLING:
-- Ensure all backslashes in diff content are properly double-escaped (\\\\)
-- Ensure all quotes in diff content are properly escaped (\")
-- When processing JSON with nested escape sequences, maintain exact character representation
-"""
-            final_prompt += escape_handling_instructions
-            logger.debug("fast_extractor_llm.formatted_prompt", prompt_length=len(final_prompt))
-            return final_prompt
-        except KeyError as e:
-            logger.error("fast_extractor_llm.format_key_error", error=str(e), missing_key=str(e))
-            raise ValueError(f"Prompt template formatting failed. Missing key: {e}")
-        except Exception as e:
-            logger.error("fast_extractor_llm.format_failed", error=str(e))
-            raise
+            # Initial request - Use internal helper that calls parent methods if needed
+            completion_params = self._build_completion_params(messages) # Build initial params
+            response = self._make_llm_request(completion_params)
+            content = self._get_content_from_response(response)
+            self.logger.debug("Received initial content",
+                            content_preview=content[:100], content_length=len(content)) # Pass directly
+            
+            final_response = response
+            accumulated_content = content
+            
+            while attempt < max_tries:
+                # Ensure response structure is valid before accessing choices
+                if not response or not hasattr(response, 'choices') or not response.choices:
+                     # --- SYNTAX FIX: Correct argument order ---
+                     self.logger.error("Invalid response structure received from LLM", response_obj=response)
+                     # Decide how to handle: raise error, return partial, etc.
+                     # For now, let's break assuming something went wrong upstream.
+                     break 
 
-    def _try_deterministic_parse(self, content: str) -> Optional[List[Dict[str, Any]]]:
-        """Attempt deterministic parsing for '===CHANGE_BEGIN===' format"""
-        if not isinstance(content, str):
-            logger.debug("deterministic_parse.skipping", reason="Input is not a string", content_type=type(content).__name__)
-            return None
-
-        if "===CHANGE_BEGIN===" not in content:
-            logger.debug("deterministic_parse.skipping", reason="No change markers found")
-            return None
-
-        # --- ADDED: Log the exact content being parsed ---
-        logger.debug("deterministic_parse.attempting", content_length=len(content), content_to_parse=content)
-        # --- END ADDED ---
-
-        parsed_items = []
-        # Refined regex again: More explicit boundaries, especially for DIFF content
-        pattern = re.compile(
-            r"===CHANGE_BEGIN===\s*"
-            r"FILE:(?P<file_path>.*?)\n"                # Capture non-greedily until newline
-            r"TYPE:(?P<type>.*?)\n"                  # Capture non-greedily until newline
-            r"DESCRIPTION:(?P<description>.*?)\n"      # Capture non-greedily until newline
-            r"DIFF:\s*\n(?P<diff>.*?)\n?"               # Capture DIFF content after newline, non-greedily
-            r"===CHANGE_END===",
-            # Using DOTALL allows '.' to match newlines within the DIFF section
-            re.DOTALL | re.MULTILINE
-        )
-
-        matches = list(pattern.finditer(content))
-        logger.debug("deterministic_parse.matches_found", count=len(matches))
-
-        for match in matches:
-            data = match.groupdict()
-            logger.debug("deterministic_parse.match_data", file_path=data.get('file_path'), type=data.get('type'))
-
-            if not data.get('file_path'):
-                logger.warning("deterministic_parse.missing_field", field="file_path", match_data=data)
-                continue
-            if not data.get('type'):
-                logger.warning("deterministic_parse.missing_field", field="type", match_data=data)
-                continue
-            if data.get('diff') is None:
-                # Allow empty diffs, but log a warning if it was truly missing vs empty
-                if "DIFF:" not in match.group(0).split("DESCRIPTION:", 1)[1]:
-                     logger.warning("deterministic_parse.missing_field", field="diff", match_data=data)
-                # If DIFF: is present but content is empty, that's okay (e.g., delete file)
-                data['diff'] = '' # Ensure key exists even if empty
-
-            item = {
-                "file_path": data['file_path'].strip(),
-                "type": data['type'].strip(),
-                "description": data['description'].strip(),
-                # Strip only leading/trailing whitespace/newlines from the diff itself
-                "diff": data['diff'].strip()
-            }
-            parsed_items.append(item)
-            logger.debug("deterministic_parse.item_extracted", file_path=item["file_path"])
-
-        if parsed_items:
-            logger.info("deterministic_parse.success", items_found=len(parsed_items))
-        else:
-            logger.warning("deterministic_parse.failed", reason="No valid items extracted")
-        return parsed_items if parsed_items else None
-
-    def create_iterator(self, content: Any, config: ExtractConfig) -> FastItemIterator:
-        """Create iterator, trying deterministic parsing then LLM fallback"""
-        logger.debug("fast_extractor.creating_iterator", content_type=type(content).__name__)
-
-        deterministic_items = None
-        if isinstance(content, str):
-            try:
-                deterministic_items = self._try_deterministic_parse(content)
-            except Exception as e:
-                logger.error("deterministic_parse.unexpected_error", error=str(e))
-
-        if deterministic_items is not None:
-            logger.info("fast_extractor.using_deterministic_results", items_count=len(deterministic_items))
-            return FastItemIterator(deterministic_items)
-
-        logger.info("fast_extractor.falling_back_to_llm")
-        try:
-            result = self.process({
-                'content': content,
-                'config': config
-            })
-            if not result.success:
-                logger.warning("fast_extractor_llm.failed", error=result.error)
-                return FastItemIterator([])
-
-            extracted_content = self._get_llm_content(result.data.get('response'))
-            if extracted_content is None:
-                logger.error("fast_extractor_llm.no_content")
-                return FastItemIterator([])
-
-            logger.debug("fast_extractor_llm.response", response_preview=str(extracted_content)[:200])
-
-            items = []
-            try:
-                if isinstance(extracted_content, str):
+                finish_reason = getattr(response.choices[0], 'finish_reason', None)
+                if finish_reason != 'length':
+                    # --- SYNTAX FIX: Correct argument order ---
+                    self.logger.info("Continuation complete", 
+                                  finish_reason=finish_reason, attempts=attempt) # Pass directly
+                    break
+                
+                attempt += 1
+                self.metrics["attempts"] += 1
+                
+                # Get context window for this continuation
+                window_size = min(
+                    max(len(accumulated_content) // 2, WINDOW_CONFIG["min_context_window"]), 
+                    WINDOW_CONFIG["max_context_window"]
+                )
+                context_window = accumulated_content[-window_size:]
+                
+                # Get explicit overlap to request
+                overlap_size = WINDOW_CONFIG["overlap_size"]
+                explicit_overlap = accumulated_content[-overlap_size:] if len(accumulated_content) >= overlap_size else accumulated_content
+                
+                # Create continuation prompt with explicit overlap request
+                continuation_prompt = self._create_prompt(context_window, explicit_overlap)
+                
+                # Setup continuation messages
+                cont_messages = messages.copy()
+                cont_messages.append({"role": "assistant", "content": accumulated_content})
+                cont_messages.append({"role": "user", "content": continuation_prompt})
+                
+                # --- SYNTAX FIX: Correct argument order ---
+                self.logger.info("Requesting continuation", 
+                               attempt=attempt, window_size=window_size, # Pass directly
+                               overlap_size=len(explicit_overlap))
+                
+                # Handle stitching attempts
+                stitching_success = False
+                stitching_attempts = 0
+                
+                while stitching_attempts <= WINDOW_CONFIG["max_stitching_retries"] and not stitching_success:
                     try:
-                        parsed_content = json.loads(extracted_content)
-                        logger.info("fast_extractor_llm.standard_parse_successful")
-                        if isinstance(parsed_content, list):
-                            items = parsed_content
-                        elif isinstance(parsed_content, dict):
-                            if "changes" in parsed_content and isinstance(parsed_content["changes"], list):
-                                items = parsed_content["changes"]
+                        # Make continuation request
+                        cont_params = completion_params.copy() # Start with original params
+                        cont_params["messages"] = cont_messages # Use updated messages
+                        response = self._make_llm_request(cont_params) # Make the LLM call
+                        cont_content = self._get_content_from_response(response)
+                        
+                        # Try to join with explicit overlap
+                        joined_content, success = join_with_explicit_overlap(
+                            accumulated_content, 
+                            cont_content, 
+                            explicit_overlap,
+                            overlap_size,  # Pass the requested overlap size as a hint
+                            self.logger
+                        )
+                        
+                        if success:
+                            # Successfully joined
+                            self.metrics["exact_matches"] += 1
+                            accumulated_content = joined_content
+                            final_response = response # Update final response to the latest one
+                            stitching_success = True
+                            self.logger.debug("Successfully joined content with explicit overlap",
+                                           content_length=len(accumulated_content)) # Pass directly
+                        else:
+                            # Couldn't find explicit overlap, try fallback strategies
+                            stitching_attempts += 1
+                            self.metrics["stitching_retries"] += 1
+                            
+                            if stitching_attempts <= len(STITCHING_STRATEGIES):
+                                strategy = STITCHING_STRATEGIES[stitching_attempts - 1]
+                                # --- SYNTAX FIX: Correct argument order ---
+                                self.logger.warning(f"Stitching failed, trying {strategy['name']}",
+                                                 attempt=attempt, stitching_attempt=stitching_attempts) # Pass directly
+                                
+                                # Use progressively stronger overlap requests in fallback strategies
+                                adjusted_overlap_size = overlap_size * (1 + stitching_attempts // 2)
+                                # --- Ensure strategy['prompt'] is callable ---
+                                if callable(strategy.get("prompt")):
+                                     cont_messages[-1]["content"] = strategy["prompt"](
+                                         context_window,
+                                         adjusted_overlap_size
+                                     )
+                                else:
+                                     self.logger.error("Invalid prompt strategy", strategy_name=strategy.get('name'))
+                                     # Handle error - maybe break or use a default prompt
+                                     break # Break stitching loop if strategy is bad
+                                # --- End Ensure ---
+                                continue # Retry LLM call with new prompt
                             else:
-                                items = [parsed_content]
-                    except json.JSONDecodeError:
-                        logger.warning("fast_extractor_llm.json_parse_failed", error="Failed to parse JSON, trying simple object extraction")
-                        items = self._extract_simple_objects(extracted_content)
-                else:
-                    items = extracted_content if isinstance(extracted_content, list) else [extracted_content]
+                                 # Exhausted fallback strategies for this attempt
+                                 self.logger.error("Exhausted all stitching fallback strategies", attempt=attempt)
+                                 break # Exit stitching loop for this attempt
 
-                validated_items = []
-                for item in items:
-                    if isinstance(item, dict) and item.get("file_path"):
-                        validated_items.append(item)
-                    else:
-                        logger.warning("fast_extractor_llm.invalid_item_skipped", item_preview=str(item)[:100])
+                    except litellm.RateLimitError as e:
+                        # Handle rate limits with exponential backoff
+                        rate_limit_retries += 1
+                        self.metrics["rate_limit_retries"] += 1
+                        if rate_limit_retries > WINDOW_CONFIG["rate_limit_max_retries"]:
+                            # --- SYNTAX FIX: Correct argument order ---
+                            self.logger.error("Max rate limit retries exceeded",
+                                retry_count=rate_limit_retries, error=str(e)) # Pass directly
+                            raise
+                        
+                        # Calculate backoff with jitter
+                        jitter = 0.1 * rate_limit_backoff * (0.5 - random.random())
+                        current_backoff = min(rate_limit_backoff + jitter, WINDOW_CONFIG["rate_limit_max_backoff"])
+                        # --- SYNTAX FIX: Correct argument order ---
+                        self.logger.warning("Rate limit encountered, backing off",
+                                attempt=attempt, retry_count=rate_limit_retries, # Pass directly
+                                backoff_seconds=current_backoff, error=str(e))
+                        time.sleep(current_backoff)
+                        rate_limit_backoff = min(rate_limit_backoff * 2, WINDOW_CONFIG["rate_limit_max_backoff"])
+                        continue # Retry the same stitching attempt after backoff
+                    
+                    except Exception as e:
+                        # General error handling during a stitching attempt
+                        # --- SYNTAX FIX: Correct argument order ---
+                        self.logger.error("Continuation attempt failed", #
+                                       attempt=attempt, error=str(e), # Pass directly
+                                       stack_trace=traceback.format_exc())
+                        stitching_attempts += 1
+                        self.metrics["stitching_retries"] += 1
+                        # Don't immediately break, allow retries via outer while loop if applicable
+                        # break # Removed break here - let outer loop handle max attempts
 
-                logger.info("fast_extractor_llm.complete", items_found=len(validated_items))
-                return FastItemIterator(validated_items)
-            except Exception as e:
-                logger.error("fast_extractor_llm.parse_error", error=str(e))
-                return FastItemIterator([])
+                # If all stitching attempts failed for this continuation step
+                if not stitching_success:
+                    append_marker = f"\n\n--- CONTINUATION STITCHING FAILED AFTER {stitching_attempts} RETRIES ---\n\n"
+                    # Use the last `cont_content` received, even though it didn't stitch
+                    accumulated_content += append_marker + cont_content 
+                    self.metrics["fallback_matches"] += 1
+                    # --- SYNTAX FIX: Correct argument order ---
+                    self.logger.error("All stitching retries failed, appending with marker", #
+                                  attempt=attempt) # Pass directly
+                    break # Exit the main continuation loop (attempt loop)
+            
+            # Clean up final accumulated content if needed
+            if requires_json_cleaning(accumulated_content):
+                accumulated_content = clean_json_content(accumulated_content, self.logger)
+            
+            # Update final response's content ONLY if final_response is valid
+            if final_response and hasattr(final_response, 'choices') and final_response.choices:
+                 # Ensure message structure exists before modification
+                 if hasattr(final_response.choices[0], 'message'):
+                      # Ensure content attribute exists before assigning
+                      if hasattr(final_response.choices[0].message, 'content'):
+                           final_response.choices[0].message.content = accumulated_content
+                      else:
+                           # Handle case where message object might be incomplete
+                           self.logger.warning("Could not update final response content, message.content missing", response_obj=final_response)
+                 else:
+                      self.logger.warning("Could not update final response content, message structure missing", response_obj=final_response)
+
+            # --- SYNTAX FIX: Correct argument order ---
+            self.logger.info("Continuation process completed",
+                           attempts=attempt, metrics=self.metrics, # Pass directly
+                           content_length=len(accumulated_content))
+                
+            return accumulated_content, final_response
+            
         except Exception as e:
-            logger.error("fast_extractor_llm_fallback.process_failed", error=str(e))
-            return FastItemIterator([])
+             # --- SYNTAX FIX: Correct argument order ---
+            self.logger.error("Continuation process failed", #
+                           error=str(e), stack_trace=traceback.format_exc(), # Pass directly
+                           content_so_far=accumulated_content[:200])
+            raise # Re-raise the exception after logging
 
-    def _extract_simple_objects(self, content: str) -> List[Dict]:
-        """Fallback extraction for LLM response parsing failures"""
-        objects = []
+    def _create_prompt(self, context_window: str, explicit_overlap: str) -> str:
+        """Create a continuation prompt that explicitly requests overlap."""
         try:
-            object_pattern = r'\{\s*"file_path":.*?"diff":.*?\}(?=\s*,|\s*\])'
-            matches = re.finditer(object_pattern, content, re.DOTALL)
-            for match in matches:
-                try:
-                    obj_text = match.group(0)
-                    obj = json.loads(obj_text)
-                    if obj.get("file_path"):
-                        objects.append(obj)
-                except json.JSONDecodeError:
-                    logger.debug("fast_extractor_llm.simple_json_object_parse_failed", text=obj_text[:100])
+            # Create clear prompt with explicit overlap request
+            # Ensure explicit_overlap is not empty before using len()
+            overlap_len = len(explicit_overlap) if explicit_overlap else 0
+            prompt = f"""
+I need you to continue the previous response that was interrupted due to length limits.
+HERE IS THE END OF YOUR PREVIOUS RESPONSE:
+------------BEGIN PREVIOUS CONTENT------------
+{context_window}
+------------END PREVIOUS CONTENT------------
 
-            if objects:
-                logger.info("fast_extractor_llm.simple_json_extraction_successful", count=len(objects))
-                return objects
+CRITICAL CONTINUATION INSTRUCTIONS:
+1. First, repeat these EXACT {overlap_len} characters:
+------------OVERLAP TO REPEAT------------
+{explicit_overlap}
+------------END OVERLAP------------
 
-            logger.warning("fast_extractor_llm.falling_back_to_field_regex")
-            file_paths = re.findall(r'"file_path"\s*:\s*"([^"]+)"', content)
-            types = re.findall(r'"type"\s*:\s*"([^"]+)"', content)
-            descriptions = re.findall(r'"description"\s*:\s*"([^"]*)"', content)
-            diff_pattern = r'"diff"\s*:\s*"(.*?)(?<!\\)"'
-            diff_sections = [match.group(1).encode('utf-8').decode('unicode_escape') for match in re.finditer(diff_pattern, content, re.DOTALL)]
+2. Then continue seamlessly from that point
+3. Maintain identical style, formatting and organization
+4. If in the middle of a code block, function, or component, respect its structure
 
-            count = len(file_paths)
-            for i in range(count):
-                obj = {
-                    "file_path": file_paths[i],
-                    "type": types[i] if i < len(types) else "unknown",
-                    "description": descriptions[i] if i < len(descriptions) else "No description",
-                    "diff": diff_sections[i] if i < len(diff_sections) else ""
-                }
-                objects.append(obj)
-
-            if objects:
-                logger.info("fast_extractor_llm.field_regex_extraction_successful", count=len(objects))
-            else:
-                logger.warning("fast_extractor_llm.field_regex_extraction_failed")
-            return objects
+Begin by repeating the overlap text exactly, then continue:
+"""
+            return prompt
         except Exception as e:
-            logger.error("fast_extractor_llm.simple_extraction_error", error=str(e))
-            return []
+            # --- SYNTAX FIX: Correct argument order ---
+            self.logger.error("Prompt creation failed",
+                              error=str(e), stack_trace=traceback.format_exc()) # Pass directly
+            return f"Continue precisely from: {explicit_overlap}" # Fallback prompt
+
+    def _build_completion_params(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Build parameters for LLM completion request."""
+        try:
+            params = {"model": self.model_str, "messages": messages}
+            # Ensure provider exists before checking value
+            if self.provider and self.provider.value != "openai": # Example, adjust as needed for OpenAI specifics
+                params["temperature"] = self.temperature
+
+            # Ensure parent has necessary methods before calling
+            provider_config = {}
+            if hasattr(self.parent, '_get_provider_config') and self.provider:
+                 provider_config = self.parent._get_provider_config(self.provider)
+            elif hasattr(self.parent, 'config_node') and self.provider: # Fallback via config_node
+                 # Ensure parent.config_node is not None before calling get_value
+                 if self.parent.config_node:
+                      provider_config = self.parent.config_node.get_value(f"llm_config.providers.{self.provider.value}") or {}
+
+
+            params.update(provider_config.get("model_params", {}))
+            if "api_base" in provider_config:
+                params["api_base"] = provider_config["api_base"]
+
+            # Add extended thinking if applicable (copied logic from BaseLLM._setup_litellm)
+            if self.provider and self.model and self.provider.value == "anthropic" and "claude-3-7-sonnet" in self.model:
+                 # Ensure parent has _get_agent_name method
+                 agent_name = getattr(self.parent, '_get_agent_name', lambda: 'unknown_agent')()
+                 agent_path = f"llm_config.agents.{agent_name}"
+                 config_node_to_use = getattr(self.parent, 'config_node', None)
+                 agent_thinking_config = None
+                 if config_node_to_use:
+                      agent_thinking_config = config_node_to_use.get_value(f"{agent_path}.extended_thinking")
+                 if not agent_thinking_config:
+                      agent_thinking_config = provider_config.get("extended_thinking", {})
+                 if agent_thinking_config and agent_thinking_config.get("enabled", False) is True:
+                      # Add 'thinking' parameter if enabled
+                      params['thinking'] = True # Or appropriate value based on API
+                      self.logger.debug("Added 'thinking' parameter for Claude 3.7 Sonnet")
+
+
+            self.logger.debug("Completion parameters built", params=params) # Pass directly
+            return params
+        except Exception as e:
+            # --- SYNTAX FIX: Correct argument order ---
+            self.logger.error("Completion params build failed",
+                            error=str(e), stack_trace=traceback.format_exc()) # Pass directly
+            raise
+            
+    def _make_llm_request(self, params: Dict[str, Any]) -> Any:
+        """Make LLM request using LiteLLM."""
+        # Relies on global LiteLLM config set by BaseLLM._setup_litellm
+        try:
+            # Remove params not directly supported by litellm.completion if necessary
+            # Or ensure they are handled by callbacks or custom logic if applicable
+            # Example: 'thinking' might need custom handling or specific API kwargs
+            api_kwargs = {}
+            if 'thinking' in params and params['thinking'] and self.provider and self.provider.value == 'anthropic':
+                 # Assuming 'thinking' needs to be passed specifically for Anthropic via completion
+                 # This might require checking LiteLLM documentation for the correct way
+                 # api_kwargs['thinking'] = params['thinking'] # Example, adjust as needed
+                 # For now, let's just log it's present, assuming LiteLLM handles it via model_str or automatically
+                 self.logger.debug("Passing 'thinking' parameter potentially via LiteLLM", model=params.get('model'))
+                 # Remove it from standard params if it's not a standard LiteLLM arg
+                 # del params['thinking'] # Uncomment if LiteLLM errors with unknown 'thinking' param
+
+            safe_params = {k: v for k, v in params.items()
+                        if k in ['model', 'messages', 'temperature', 'max_tokens', 'top_p', 'stream', 'api_base']} # Added api_base
+
+            self.logger.debug("Making LLM request") # Log message remains simple
+            return litellm.completion(**safe_params, **api_kwargs) # Pass api_kwargs if needed
+        except Exception as e:
+            # --- SYNTAX FIX: Correct argument order ---
+            self.logger.error("LLM request failed",
+                            error=str(e), stack_trace=traceback.format_exc()) # Pass directly
+            raise
+            
+    def _get_content_from_response(self, response: Any) -> str:
+        """Extract content from LLM response."""
+        # Reusing the robust extraction logic
+        try:
+            if hasattr(response, 'choices') and response.choices:
+                 if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
+                     content = response.choices[0].message.content
+                     if isinstance(content, str): # Ensure it's a string
+                          return content
+                     else:
+                          self.logger.warning("Extracted content is not string in _get_content_from_response", content_type=type(content).__name__)
+                          return str(content) # Convert non-string content
+            self.logger.warning("No valid content structure found in LLM response", response_obj=response)
+            return ""
+        except Exception as e:
+            # --- SYNTAX FIX: Correct argument order ---
+            self.logger.error("Content extraction failed in _get_content_from_response",
+                             error=str(e), stack_trace=traceback.format_exc()) # Pass directly
+            return ""
