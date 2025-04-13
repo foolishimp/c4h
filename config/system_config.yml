@@ -16,7 +16,7 @@ llm_config:
         enabled: false
         budget_tokens: 32000
         min_budget_tokens: 1024
-        max_budget_tokens: 128000        
+        max_budget_tokens: 128000
       litellm_params:
         retry: true
         max_retries: 5
@@ -29,7 +29,6 @@ llm_config:
           initial_delay: 1
           max_delay: 30
           exponential: true
-
     openai:
       api_base: "https://api.openai.com/v1"
       env_var: "OPENAI_API_KEY"
@@ -54,26 +53,34 @@ llm_config:
           initial_delay: 1
           max_delay: 20
           exponential: true
-
     gemini:
+      # IMPORTANT: Verify this api_base is correct for Gemini 2.5 Pro API
       api_base: "https://generativelanguage.googleapis.com/v1beta"
-      context_length: 32000
+      context_length: 32000 # Adjust if 2.5 Pro has different context
       env_var: "GEMINI_API_KEY"
-      default_model: "gemini-2"
+      default_model: "gemini-1.5-pro-latest" # Or keep gemini-2, or set to 2.5-pro
       valid_models:
+        - "gemini-1.0-pro"
+        - "gemini-1.5-flash-latest"
+        - "gemini-1.5-pro-latest"
+        # Add the new model:
+        - "gemini-2.5-pro" # Replace with exact model ID from Google if different
+        # Keep others if still needed:
         - "gemini-1"
         - "gemini-1.5"
-        - "gemini-2"
-  
+        - "gemini-2" # Keeping older versions might be useful for testing/fallback
     xai:
       api_base: "https://api.x.ai/v1"  # Official xAI API base URL
       env_var: "XAI_API_KEY"          # Environment variable for API key
-      default_model: "grok-beta"      # Default to Grok Beta
+      default_model: "grok-1.5-flash" # Defaulting to flash version
       valid_models:
-        - "grok-beta"                # Currently available
-        - "grok-2-latest"            # Anticipated Grok 2 variant
-        - "grok-3"                   # Hypothetical reasoning model
-      context_length: 128000         # Adjust based on actual Grok specs; assuming large context
+        - "grok-1"                   # Original Grok-1
+        - "grok-1.5"                 # Grok 1.5
+        - "grok-1.5-flash"           # Faster variant of Grok 1.5
+        # - "grok-beta"              # Older beta name, likely deprecated
+        # - "grok-2-latest"          # Anticipated Grok 2 variant (placeholder)
+        # - "grok-3"                 # Hypothetical reasoning model (placeholder)
+      context_length: 128000         # Adjust based on actual Grok specs
       litellm_params:
         retry: true
         max_retries: 3
@@ -621,5 +628,5 @@ logging:
     openai:
       level: "debug"
   truncate:
-    prefix_length: 30
-    suffix_length: 30
+    prefix_length: 9000
+    suffix_length: 9000

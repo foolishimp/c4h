@@ -46,14 +46,29 @@ class BaseAgent(BaseConfig, BaseLLM):
             
         # Store agent ID in system namespace
         self.config["system"]["agent_id"] = self.agent_id
+
+        # --- ADDED: Log the full configuration received by the agent ---
+        try:
+            config_dump = json.dumps(self.config, indent=2, default=str)
+            logger.debug(f"{agent_name}.__init__.received_config", config_json=config_dump)
+        except Exception as e:
+            logger.error(f"{agent_name}.__init__.config_dump_failed", error=str(e))
+        # --- END ADDED ---
             
+        # 
         # Resolve provider, model, and temperature using hierarchical lookup
         agent_path = f"llm_config.agents.{agent_name}"
         provider_name = self.config_node.get_value(f"{agent_path}.provider") or self.config_node.get_value("llm_config.default_provider") or "anthropic"
+        # --- ADDED: Log resolved provider ---
+        logger.debug(f"{agent_name}.__init__.resolved_provider", provider_name=provider_name)
+        # --- END ADDED ---
         self.provider = LLMProvider(provider_name)
         
         self.model = self.config_node.get_value(f"{agent_path}.model") or self.config_node.get_value("llm_config.default_model") or "claude-3-opus-20240229"
         self.temperature = self.config_node.get_value(f"{agent_path}.temperature") or 0
+        # --- ADDED: Log resolved model ---
+        logger.debug(f"{agent_name}.__init__.resolved_model", model_name=self.model)
+        # --- END ADDED ---
         
         # Continuation settings
         self.max_continuation_attempts = self.config_node.get_value(f"{agent_path}.max_continuation_attempts") or 5

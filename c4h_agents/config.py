@@ -336,32 +336,32 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
         Merged configuration dictionary
     """
     result = deepcopy(base)
+    # --- MODIFIED LOGGING ---
+    # Log only the top-level keys involved in this specific merge call
+    logger.debug("config.deep_merge.called",
+                 base_keys=list(base.keys()) if isinstance(base, dict) else type(base).__name__,
+                 override_keys=list(override.keys()) if isinstance(override, dict) else type(override).__name__)
+    # --- END MODIFIED LOGGING ---
     try:
-        logger.debug("config.merge.starting", base_keys=list(base.keys()), override_keys=list(override.keys()), project_settings=override.get('project', {}))
-        if 'llm_config' in result or 'llm_config' in override:
-            system_keys = {'providers', 'llm_config', 'project', 'backup', 'logging', 'system'}
-            runtime_keys = {k for k in override.keys() if k not in system_keys}
-            if runtime_keys and 'llm_config' in result:
-                agent_configs = result['llm_config'].get('agents', {})
-                for agent_name, agent_config in agent_configs.items():
-                    for key in runtime_keys:
-                        if key not in agent_config:
-                            logger.debug("config.merge.runtime_value", agent=agent_name, key=key, value=override[key])
-                            agent_config[key] = deepcopy(override[key])
         for key, value in override.items():
             if value is None:
                 result.pop(key, None)
                 continue
-            if key not in result:
-                result[key] = deepcopy(value)
-                continue
-            if isinstance(value, collections.abc.Mapping):
+
+            # Check if key exists in base and both are dictionaries for recursive merge
+            if key in result and isinstance(result[key], collections.abc.Mapping) and isinstance(value, collections.abc.Mapping):
                 result[key] = deep_merge(result[key], value)
             elif isinstance(value, Path):
                 result[key] = str(value)
             else:
+                # Override completely if not both dictionaries or if key is new
                 result[key] = deepcopy(value)
-        logger.debug("config.merge.complete", result_keys=list(result.keys()), project_path=result.get('project', {}).get('path'))
+
+        # --- MODIFIED LOGGING ---
+        # Log only the keys of the final result of this specific call
+        logger.debug("config.deep_merge.complete",
+                     result_keys=list(result.keys()) if isinstance(result, dict) else type(result).__name__)
+        # --- END MODIFIED LOGGING ---
         return result
     except Exception as e:
         logger.error("config.merge.failed", error=str(e), keys_processed=list(override.keys()))

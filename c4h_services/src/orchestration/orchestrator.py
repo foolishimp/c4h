@@ -103,12 +103,16 @@ class Orchestrator:
 
                     # Create task config
                     # Ensure the *current* orchestrator config is used for merging task overrides
-                    task_specific_override = task_config.get("config", {})
-                    final_task_config = deep_merge(self.config, task_specific_override)
+                    task_specific_override = task_config.get("config", {}) # Get overrides for this specific task
+                    # --- MODIFICATION START ---
+                    # Merge overrides onto a COPY of the main config, not self.config directly
+                    task_base_config = self.config.copy() # Start with the current main config
+                    final_task_config_for_agent = deep_merge(task_base_config, task_specific_override)
+                    # --- MODIFICATION END ---
 
                     agent_config = AgentTaskConfig(
                         agent_class=agent_class,
-                        config=final_task_config, # Pass the potentially merged config
+                        config=final_task_config_for_agent, # Pass the isolated config for this task
                         task_name=task_config.get("name"),
                         requires_approval=task_config.get("requires_approval", False),
                         max_retries=task_config.get("max_retries", 3),
@@ -484,4 +488,3 @@ class Orchestrator:
             instance_logger.error("workflow.initialization_failed", error=str(e)) # cite: 1461
             # Re-raise the exception to ensure the calling function knows about the failure
             raise
-

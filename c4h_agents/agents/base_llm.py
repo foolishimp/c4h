@@ -113,16 +113,53 @@ class BaseLLM:
                 "error": error_msg
             }
 
+    # In ./c4h_agents/agents/base_llm.py
+
     def _get_model_str(self) -> str:
-        """Get the appropriate model string for the provider"""
+        """Get the appropriate model string for the provider, formatted for LiteLLM."""
+        # Ensure self.provider and self.model are initialized
+        if not hasattr(self, 'provider') or not self.provider:
+             # Attempt to get provider from config as a fallback if not initialized
+             # This might happen if called before full __init__ completes, though unlikely
+             agent_name = self._get_agent_name() # Assuming this method exists and works
+             provider_name = self.config_node.get_value(f"llm_config.agents.{agent_name}.provider") or \
+                             self.config_node.get_value("llm_config.default_provider")
+             if not provider_name:
+                 raise ValueError("Provider is not set on the agent instance or in config.")
+             self.provider = LLMProvider(provider_name)
+
+        if not hasattr(self, 'model') or not self.model:
+             # Attempt to get model from config as a fallback
+             agent_name = self._get_agent_name()
+             # Note: _resolve_model handles the complex hierarchy, but we might need a simpler lookup here
+             # For safety, just check direct agent config or default
+             self.model = self.config_node.get_value(f"llm_config.agents.{agent_name}.model") or \
+                          self.config_node.get_value("llm_config.default_model")
+             if not self.model:
+                  raise ValueError("Model is not set on the agent instance or in config.")
+
+        # Construct model string based on provider
         if self.provider == LLMProvider.OPENAI:
+            # OpenAI models don't typically need a prefix for LiteLLM if using official API base
+            # However, if using Azure OpenAI, the model name might be the deployment name.
+            # Keeping openai/ prefix might be safer for potential Azure compatibility via LiteLLM proxy.
             return f"openai/{self.model}"
         elif self.provider == LLMProvider.ANTHROPIC:
             return f"anthropic/{self.model}"
         elif self.provider == LLMProvider.GEMINI:
-            return f"google/{self.model}"
+            # --- CHANGE: Use "gemini/" prefix for standard LiteLLM compatibility ---
+            return f"gemini/{self.model}"
+            # --- END CHANGE ---
+        # Example for XAI (adjust if LiteLLM uses a different prefix)
+        elif hasattr(LLMProvider, 'XAI') and self.provider == LLMProvider.XAI:
+             # Assuming LiteLLM uses 'groq/' or 'xai/' prefix - check LiteLLM docs
+             # Using 'groq/' as an example, adjust if needed
+             return f"groq/{self.model}" # Or potentially just self.model if no prefix needed
         else:
+            # Default pattern for other potential providers
             return f"{self.provider.value}/{self.model}"
+
+
 
     def _setup_litellm(self, provider_config: Dict[str, Any]) -> None:
         """

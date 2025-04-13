@@ -12,6 +12,7 @@ import uuid
 import os
 import json
 import uuid
+import logging # Import standard logging
 from datetime import datetime
 
 from c4h_agents.config import deep_merge, load_config
@@ -47,6 +48,15 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
         description="API for executing C4H team-based workflows",
         version="0.2.0"
     )
+
+    # --- Explicitly configure structlog (if not already done globally) ---
+    # This ensures get_logger() provides loggers compatible with standard levels
+    # Note: If structlog is configured elsewhere at service startup, this might be redundant
+    # but ensures it's set up before we manipulate the api.requests logger.
+    # (Consider placing structlog config in a central bootstrap location if possible)
+    # Example minimal setup if needed here:
+    # import structlog
+    # structlog.configure(...) # Add structlog config like in the previous fix for main.py
     
     # Store default config in app state
     app.state.default_config = default_config or {}
@@ -56,6 +66,14 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
     app.state.orchestrator = Orchestrator(app.state.default_config)
     logger.info("api.team_orchestration_initialized", 
                teams=len(app.state.orchestrator.teams))
+
+    # --- Align 'api.requests' logger ---
+    # Get the logger instance that the middleware will presumably use.
+    api_logger = logging.getLogger("api.requests")
+    # Set its level low enough to allow DEBUG messages.
+    api_logger.setLevel(logging.DEBUG)
+    # Ensure messages are passed to handlers configured by structlog/root.
+    api_logger.propagate = True
     
     async def run_workflow(request: WorkflowRequest):
         """
@@ -338,8 +356,7 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
                     intent = workflow_request.intent
                     merged_config = workflow_request.app_config # Use app_config as the 'merged' config here
                     logger.debug("jobs.request_mapped", job_id=job_id, workflow_request_keys=list(workflow_request.dict().keys()))
-                except Exception as e:
-                    logger.error("jobs.request_mapping_failed", job_id=job_id, error=str(e))
+                except Exception as e:logger.error("jobs.request_mapping_failed", job_id=job_id, error=str(e))
                     raise HTTPException(status_code=400, detail=f"Invalid job configuration: {str(e)}")
             else:
                 logger.error("jobs.unknown_request_type", job_id=job_id, request_type=type(request).__name__)
@@ -726,3 +743,4 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
 
 # Default app instance for direct imports
 app = create_app()
+```
