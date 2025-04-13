@@ -301,10 +301,9 @@ def locate_config(config: Dict[str, Any], target_name: str) -> Dict[str, Any]:
         logger.error("config.locate_failed", target=target_name, error=str(e))
         return {}
 
-def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+def deep_merge(base: Dict[str, Any], override: Dict[str, Any], _path: str = "") -> Dict[str, Any]:
     """
     Deep merge dictionaries preserving hierarchical structure.
-    
     Rules:
     1. Preserve llm_config.agents hierarchy.
     2. Override values take precedence.
@@ -312,44 +311,70 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
     4. Lists from override replace lists from base.
     5. None values in override delete keys from base.
     6. Runtime values merged into agent configs.
-    
+
     Args:
         base: Base configuration dictionary
         override: Override configuration dictionary
-        
+        _path: Internal path tracking for logging
+
     Returns:
         Merged configuration dictionary
     """
     result = deepcopy(base)
-    # --- MODIFIED LOGGING ---
-    # Log only the top-level keys involved in this specific merge call
+    current_path_prefix = f"{_path}." if _path else ""
+
+    # Use logger instance assumed to be defined in the module scope
     logger.debug("config.deep_merge.called",
-                 base_keys=list(base.keys()) if isinstance(base, dict) else type(base).__name__,
-                 override_keys=list(override.keys()) if isinstance(override, dict) else type(override).__name__)
-    # --- END MODIFIED LOGGING ---
+                path=current_path_prefix[:-1] if current_path_prefix else "root", # Log current path being merged
+                base_keys=list(base.keys()) if isinstance(base, dict) else type(base).__name__,
+                override_keys=list(override.keys()) if isinstance(override, dict) else type(override).__name__)
+
     try:
         for key, value in override.items():
+            current_key_path = f"{current_path_prefix}{key}"
             if value is None:
-                result.pop(key, None)
+                if key in result:
+                    # Log deletion
+                    logger.debug("config.deep_merge.delete", key_path=current_key_path, old_value=result.get(key))
+                    result.pop(key, None)
                 continue
 
             # Check if key exists in base and both are dictionaries for recursive merge
-            if key in result and isinstance(result[key], collections.abc.Mapping) and isinstance(value, collections.abc.Mapping):
-                result[key] = deep_merge(result[key], value)
+            if key in result and isinstance(result.get(key), collections.abc.Mapping) and isinstance(value, collections.abc.Mapping):
+                # Log recursion
+                logger.debug("config.deep_merge.recursing", key_path=current_key_path)
+                result[key] = deep_merge(result[key], value, _path=current_key_path) # Pass current path down
             elif isinstance(value, Path):
-                result[key] = str(value)
+                # Log override/add for Path objects (convert to string)
+                path_str = str(value)
+                if key in result:
+                    if result.get(key) != path_str: # Log only if value changes
+                        logger.debug("config.deep_merge.override", key_path=current_key_path, old_value_type=type(result.get(key)).__name__, new_value=path_str)
+                else:
+                    logger.debug("config.deep_merge.add", key_path=current_key_path, new_value=path_str)
+                result[key] = path_str
             else:
                 # Override completely if not both dictionaries or if key is new
+                if key in result:
+                    if result.get(key) != value: # Log only if value actually changes
+                        logger.debug("config.deep_merge.override", key_path=current_key_path, old_value=result.get(key), new_value=value)
+                else:
+                    # Log addition of a new key
+                    logger.debug("config.deep_merge.add", key_path=current_key_path, new_value=value)
                 result[key] = deepcopy(value)
 
-        # --- MODIFIED LOGGING ---
-        # Log only the keys of the final result of this specific call
-        logger.debug("config.deep_merge.complete",
-                     result_keys=list(result.keys()) if isinstance(result, dict) else type(result).__name__)
-        # --- END MODIFIED LOGGING ---
+        # Log the final result structure only at the root level for clarity
+        if not _path: # Only log the final full structure at the top level call
+            try:
+                # Attempt to dump to JSON for structured logging, fallback to keys
+                result_structure = json.dumps(result, indent=2, default=str, ensure_ascii=False)
+                logger.debug("config.deep_merge.complete (root)", result_structure=result_structure)
+            except TypeError: # Handle potential circular references or unserializable types
+                logger.warning("config.deep_merge.complete (root, fallback logging)", result_keys=list(result.keys()))
+
         return result
     except Exception as e:
-        logger.error("config.merge.failed", error=str(e), keys_processed=list(override.keys()))
+        logger.error("config.merge.failed", path=current_path_prefix[:-1] if current_path_prefix else "root", error=str(e), keys_processed=list(override.keys()), exc_info=True)
         raise
 
 def load_config(path: Path) -> Dict[str, Any]:

@@ -1,157 +1,189 @@
-# Path: /Users/jim/src/apps/c4h/c4h_agents/agents/base_agent.py
-"""
-Base agent implementation with enhanced lineage tracking.
-Path: c4h_agents/agents/base_agent.py
+# File: /Users/jim/src/apps/c4h/c4h_agents/agents/base_agent.py
 
-Updates:
-- Initialize logger with configuration to ensure proper truncation
-- Initialize _continuation_handler in BaseAgent init
-"""
-
-from typing import Dict, Any, Optional, List, Tuple
-import structlog
+# Necessary Imports (ensure these are present)
 import json
-from pathlib import Path
-from datetime import datetime, timezone # Ensure timezone is imported
 import uuid
-import re # Import re for _get_agent_name fallback
-
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Tuple
+import re
+import structlog
+from c4h_agents.agents.base_config import BaseConfig
+from c4h_agents.agents.base_lineage import BaseLineage # Correct import
+from c4h_agents.agents.lineage_context import LineageContext # Correct import
+from c4h_agents.agents.base_llm import BaseLLM
+from c4h_agents.agents.continuation.continuation_handler import ContinuationHandler
+from c4h_agents.agents.types import AgentResponse, AgentMetrics, LLMProvider, LLMMessages, LogDetail
+from c4h_agents.config import create_config_node # Keep create_config_node
 from c4h_agents.core.project import Project
-from c4h_agents.config import create_config_node # Removed unused locate_config, get_value
-from c4h_agents.utils.logging import get_logger
-from .base_lineage import BaseLineage
-from .lineage_context import LineageContext
-from .types import LogDetail, LLMProvider, LLMMessages, AgentResponse, AgentMetrics
-from .base_config import BaseConfig, log_operation
-from .base_llm import BaseLLM
-# Import ContinuationHandler if needed for type hint, but don't instantiate here
-from .continuation.continuation_handler import ContinuationHandler
+from c4h_agents.utils.logging import get_logger, log_config_node # Import the utility
 
-
-logger = get_logger() # Global logger for module-level logging
+# Logger instance for this module (if needed, otherwise self.logger is used)
+logger = get_logger()
 
 class BaseAgent(BaseConfig, BaseLLM):
     """Base agent implementation"""
 
+    # Corrected __init__ method:
     def __init__(self, config: Dict[str, Any] = None, project: Optional[Project] = None):
         # Pass full config to BaseConfig first
         BaseConfig.__init__(self, config=config, project=project)
         # Then initialize BaseLLM part AFTER BaseConfig setup config_node etc.
         BaseLLM.__init__(self) # Explicitly call BaseLLM init
 
-        # --- FIX: Initialize _continuation_handler in BaseAgent ---
-        # This ensures subclasses inheriting from BaseAgent have it initialized
+        # Initialize _continuation_handler
         self._continuation_handler: Optional[ContinuationHandler] = None
-        # --- END FIX ---
 
-
-        # Create configuration node for hierarchical access (already done in BaseConfig)
-        # self.config_node = create_config_node(self.config) # Redundant
         agent_name = self._get_agent_name()
-
-        # Generate stable agent instance ID
         self.agent_id = str(uuid.uuid4())
 
-        # Ensure system namespace exists
-        if "system" not in self.config:
-            self.config["system"] = {}
-
-        # Store agent ID in system namespace
+        # Ensure system namespace exists and store agent ID
+        if "system" not in self.config: self.config["system"] = {}
         self.config["system"]["agent_id"] = self.agent_id
 
-        # Initialize logger with enhanced context and agent configuration
-        log_context = {
-            "agent": agent_name,
-            "agent_id": self.agent_id,
-            # provider, model, log_level added later after resolution
-        }
+        # Initialize logger with initial context
+        log_context = {"agent": agent_name, "agent_id": self.agent_id}
         if self.project:
             log_context.update({
                 "project_name": self.project.metadata.name,
                 "project_version": self.project.metadata.version,
                 "project_root": str(self.project.paths.root)
             })
-
-        # Bind context directly to the logger obtained using the config
-        # We create the logger instance here but will re-bind later with more context
+        # Get logger using config potentially containing logging settings
         self.logger = get_logger(self.config).bind(**log_context)
 
-        # Log the full configuration received by the agent
-        try:
-            # Use self.logger and pass dict directly, structlog handles serialization/truncation
-            self.logger.debug(f"{agent_name}.__init__.received_config", config_data=self.config)
-        except Exception as e:
-            self.logger.error(f"{agent_name}.__init__.config_dump_failed", error=str(e)) # Use self.logger
+        # --- Log received config using the new utility ---
+        log_config_node(self.logger, self.config, "workorder", log_prefix=f"{agent_name}.init_received")
+        log_config_node(self.logger, self.config, "team.llm_config.agents", log_prefix=f"{agent_name}.init_received")
+        log_config_node(self.logger, self.config, "llm_config.agents", log_prefix=f"{agent_name}.init_received") # Log both potential top keys
 
-        # Resolve provider, model, and temperature using hierarchical lookup
-        agent_path = f"llm_config.agents.{agent_name}"
-        # --- Ensure self.config_node is used for lookup ---
-        provider_name = self.config_node.get_value(f"{agent_path}.provider") or self.config_node.get_value("llm_config.default_provider") or "anthropic"
-        self.logger.debug(f"{agent_name}.__init__.resolved_provider", provider_name=provider_name) # Use self.logger
+        # --- Define Configuration Paths ---
+        # Define the primary path where overrides are expected after the merge
+        primary_agent_path = f"team.llm_config.agents.{agent_name}"
+        # Define the old/fallback path within the top-level llm_config
+        fallback_agent_path = f"llm_config.agents.{agent_name}"
+
+        # --- Resolve Provider ---
+        provider_name = (
+            self.config_node.get_value(f"{primary_agent_path}.provider")  # Check primary override path first
+            or self.config_node.get_value(f"{fallback_agent_path}.provider") # Check original/fallback path
+            or self.config_node.get_value("team.llm_config.default_provider") # Check team default (might not exist)
+            or self.config_node.get_value("llm_config.default_provider") # Check global default
+            or "anthropic" # Hardcoded fallback
+        )
+        self.logger.debug(f"{agent_name}.__init__.resolved_provider", provider_name=provider_name)
         self.provider = LLMProvider(provider_name)
 
-        self.model = self.config_node.get_value(f"{agent_path}.model") or self.config_node.get_value("llm_config.default_model") or "claude-3-opus-20240229"
-        self.temperature = self.config_node.get_value(f"{agent_path}.temperature") or 0
-        self.logger.debug(f"{agent_name}.__init__.resolved_model", model_name=self.model) # Use self.logger
+        # --- Resolve Model ---
+        self.model = (
+            self.config_node.get_value(f"{primary_agent_path}.model") # Check primary override path first
+            or self.config_node.get_value(f"{fallback_agent_path}.model") # Check original/fallback path
+            or self.config_node.get_value(f"llm_config.providers.{self.provider.value}.default_model") # Check provider default
+            or self.config_node.get_value("team.llm_config.default_model") # Check team default (might not exist)
+            or self.config_node.get_value("llm_config.default_model") # Check global default
+            or "claude-3-opus-20240229" # Hardcoded fallback
+        )
+        self.logger.debug(f"{agent_name}.__init__.resolved_model", model_name=self.model)
 
-        # Continuation settings
-        # --- Ensure self.config_node is used for lookup ---
-        self.max_continuation_attempts = self.config_node.get_value(f"{agent_path}.max_continuation_attempts") or 5
-        self.continuation_token_buffer = self.config_node.get_value(f"{agent_path}.continuation_token_buffer") or 1000
+        # --- Resolve Temperature ---
+        # Ensure temperature is retrieved as float/int
+        temp_val = (
+            self.config_node.get_value(f"{primary_agent_path}.temperature") # Check primary override path first
+            or self.config_node.get_value(f"{fallback_agent_path}.temperature") # Check original/fallback path
+        )
+        # Set default if not found or None, convert to float
+        self.temperature = float(temp_val) if temp_val is not None else 0.0
+        self.logger.debug(f"{agent_name}.__init__.resolved_temperature", temperature=self.temperature)
+
+
+        # --- Log the located agent config subsection (checking primary path) ---
+        agent_config_subsection = self.config_node.get_value(primary_agent_path) # Check the path where the override SHOULD be
+        if isinstance(agent_config_subsection, dict): # Check if it's a dict before logging
+            log_config_node(self.logger, self.config, primary_agent_path, log_prefix=f"{agent_name}.init_located")
+        else:
+             # Log if not found or not dict at the primary path, then check the secondary path
+             self.logger.warning(f"{agent_name}.__init__.agent_config_not_found_or_invalid", agent_path=primary_agent_path, found_type=type(agent_config_subsection).__name__)
+             agent_config_subsection_fallback = self.config_node.get_value(fallback_agent_path)
+             if isinstance(agent_config_subsection_fallback, dict):
+                 self.logger.warning(f"{agent_name}.__init__.agent_config_found_at_fallback_path", agent_path=fallback_agent_path)
+                 log_config_node(self.logger, self.config, fallback_agent_path, log_prefix=f"{agent_name}.init_located_fallback")
+             else:
+                 self.logger.warning(f"{agent_name}.__init__.agent_config_not_found_at_any_path", primary_path=primary_agent_path, fallback_path=fallback_agent_path)
+
+        # --- Check for and log fallback usage ---
+        provider_used_primary = bool(self.config_node.get_value(f"{primary_agent_path}.provider"))
+        model_used_primary = bool(self.config_node.get_value(f"{primary_agent_path}.model"))
+        if not provider_used_primary:
+            self.logger.info(f"{agent_name}.__init__.provider_fallback", resolved_provider=self.provider.value, source="default/fallback_path")
+        if not model_used_primary:
+             self.logger.info(f"{agent_name}.__init__.model_fallback", resolved_model=self.model, source="default/fallback_path")
+        # --- End Fallback Logging ---
+
+        # --- Continuation settings (using primary path first) ---
+        self.max_continuation_attempts = self.config_node.get_value(f"{primary_agent_path}.max_continuation_attempts") or \
+                                         self.config_node.get_value(f"{fallback_agent_path}.max_continuation_attempts") or 5
+        self.continuation_token_buffer = self.config_node.get_value(f"{primary_agent_path}.continuation_token_buffer") or \
+                                         self.config_node.get_value(f"{fallback_agent_path}.continuation_token_buffer") or 1000
 
         # Initialize metrics
         self.metrics = AgentMetrics(project=self.project.metadata.name if self.project else None)
 
         # Set logging detail level from config
-        # --- Ensure self.config_node is used for lookup ---
         log_level_str = self.config_node.get_value("logging.agent_level") or self.config_node.get_value("logging.level") or "basic"
         self.log_level = LogDetail.from_str(log_level_str)
 
         # Build model string and setup LiteLLM
-        self.model_str = self._get_model_str() # This now correctly uses self.provider/self.model
+        self.model_str = self._get_model_str() # Uses self.provider/self.model resolved above
         self._setup_litellm(self._get_provider_config(self.provider)) # _get_provider_config uses config_node
 
-        # --- Re-bind logger with full context ---
+        # --- Re-bind logger with potentially updated run_id before lineage init ---
+        run_id = self._get_workflow_run_id() or str(uuid.uuid4()) # Get initial run_id
+        self.run_id = run_id # Store the determined run_id on the instance
+        # Update log context before binding
         log_context.update({
              "provider": self.provider.serialize(),
              "model": self.model,
-             "log_level": str(self.log_level)
+             "log_level": str(self.log_level),
+             "run_id": self.run_id # Ensure run_id is in the context for binding
         })
-        self.logger = self.logger.bind(**log_context)
+        self.logger = self.logger.bind(**log_context) # Bind logger with initial context including run_id
         # --- End Re-bind ---
 
         # Initialize lineage tracking with the full configuration
         self.lineage = None
         try:
-            # Log what run_id we're using
-            run_id = self._get_workflow_run_id() # Uses self.config_node
-            if run_id:
-                self.logger.debug(f"{agent_name}.using_workflow_run_id",
-                            run_id=run_id,
-                            config_keys=list(self.config.keys()),
-                            source="config")
+            # run_id is already determined and bound to logger
+            self.logger.debug(f"{agent_name}.lineage_init", has_runtime="runtime" in self.config, has_system="system" in self.config, has_workflow_run_id=bool(self._get_workflow_run_id()))
+            # Log the run_id that will be used by BaseLineage internally
+            self.logger.debug(f"{agent_name}.using_run_id", run_id=self.run_id)
 
+            # CORRECTED CALL: Do not pass run_id here
             self.lineage = BaseLineage(
                 namespace="c4h_agents",
                 agent_name=agent_name,
-                config=self.config # Pass the current, potentially updated, config
+                config=self.config # Pass the agent's full config
             )
+            # Ensure the run_id *used* by lineage is stored on the agent and logger
+            # (it might differ from the initial one if lineage loads an existing run)
+            if self.lineage and hasattr(self.lineage, 'run_id') and self.lineage.run_id != self.run_id:
+                 self.run_id = self.lineage.run_id # Update instance run_id
+                 self.logger = self.logger.bind(run_id=self.run_id) # Re-bind logger with potentially loaded run_id
+                 self.logger.info(f"{agent_name}.lineage_loaded_existing_run", loaded_run_id=self.run_id)
 
-            # Store lineage run ID for consistency
-            self.run_id = self.lineage.run_id
 
         except Exception as e:
-            self.logger.error(f"{agent_name}.lineage_init_failed", error=str(e)) # Use self.logger
-            # Generate run ID if lineage fails
-            self.run_id = str(uuid.uuid4())
+            self.logger.error(f"{agent_name}.lineage_init_failed", error=str(e), exc_info=True) # Add traceback
+            # self.run_id was already set above as a fallback
 
-        self.logger.info(f"{agent_name}.initialized", # Use self.logger
-                    run_id=self.run_id,
-                    continuation_settings={
-                        "max_attempts": self.max_continuation_attempts,
-                        "token_buffer": self.continuation_token_buffer
-                    },
-                    **log_context) # Pass context directly
+        # --- CORRECTED LOGGING CALL ---
+        # Remove explicit run_id and **log_context as they are already bound to self.logger
+        self.logger.info(f"{agent_name}.initialized",
+                     continuation_settings={
+                         "max_attempts": self.max_continuation_attempts,
+                         "token_buffer": self.continuation_token_buffer
+                     })
+
 
     def _get_workflow_run_id(self) -> Optional[str]:
         """Extract workflow run ID from configuration using hierarchical path queries"""

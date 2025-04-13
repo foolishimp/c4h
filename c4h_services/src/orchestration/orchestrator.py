@@ -5,11 +5,13 @@ Path: c4h_services/src/orchestration/orchestrator.py
 
 from typing import Dict, Any, List, Optional, Set, Union, Tuple
 from c4h_services.src.utils.logging import get_logger
+from c4h_agents.utils.logging import log_config_node
 from pathlib import Path
 from datetime import datetime, timezone
 from copy import deepcopy
 import uuid
 import yaml
+import json
 
 from c4h_agents.config import create_config_node, deep_merge
 from c4h_services.src.intent.impl.prefect.models import AgentTaskConfig
@@ -76,10 +78,10 @@ class Orchestrator:
                           has_orchestration_key="orchestration" in self.config,
                           has_teams_key="teams" in self.config.get("orchestration", {}),
                           teams_config_retrieved=bool(teams_config),
-                          teams_config_keys=list(teams_config.keys()) if teams_config else [])
+                          teams_config_keys=list(teams_config.keys()) if teams_config else []) # cite: 1605
 
         if not teams_config:
-            self.logger.warning("orchestrator.no_teams_found") # KEEP this warning
+            self.logger.warning("orchestrator.no_teams_found") # cite: 1606
             # Load default teams for backward compatibility
             self._load_default_teams()
             return
@@ -91,48 +93,60 @@ class Orchestrator:
             try:
                 # Get basic team info
                 name = team_config.get("name", team_id)
-                self.logger.debug("_load_teams.processing_team", team_id=team_id, name=name)
+                self.logger.debug("_load_teams.processing_team", team_id=team_id, name=name) # cite: 1607
 
                 # Get task configurations
                 tasks = []
-                for task_config in team_config.get("tasks", []):
-                    agent_class = task_config.get("agent_class")
-                    if not agent_class:
-                        self.logger.error("orchestrator.missing_agent_class", team_id=team_id, task=task_config)
+                for task_config_def in team_config.get("tasks", []): # Renamed loop var cite: 1608
+                    agent_class_str = task_config_def.get("agent_class") # Use distinct name cite: 1608
+                    if not agent_class_str:
+                        self.logger.error("orchestrator.missing_agent_class", team_id=team_id, task=task_config_def) # cite: 1609
                         continue
 
-                    # Create task config
-                    # Ensure the *current* orchestrator config is used for merging task overrides
-                    task_specific_override = task_config.get("config", {}) # Get overrides for this specific task
-                    # --- MODIFICATION START ---
-                    # Merge overrides onto a COPY of the main config, not self.config directly
-                    task_base_config = self.config.copy() # Start with the current main config
-                    final_task_config_for_agent = deep_merge(task_base_config, task_specific_override)
-                    # --- MODIFICATION END ---
+                    # --- Merge Task-Specific Overrides ---
+                    task_specific_override = task_config_def.get("config", {}) # cite: 1609
+                    task_base_config = self.config.copy() # Start with the orchestrator's current full config cite: 1610
+                    final_task_config_for_agent = deep_merge(task_base_config, task_specific_override) # cite: 1611
+                    # --- End Merge ---
+
+                    # --- ADDED: Log the specific nodes AFTER task override merge ---
+                    current_task_name = task_config_def.get("name", "unknown_task")
+                    # Derive agent name string for path lookup, handling potential errors
+                    try:
+                        agent_name_for_path = agent_class_str.split('.')[-1].lower().replace('_agent','')
+                    except:
+                        agent_name_for_path = "unknown_agent_name" # Fallback if class string is malformed
+
+                    # Use self.logger (the orchestrator's logger instance)
+                    log_config_node(self.logger, final_task_config_for_agent, "workorder", log_prefix=f"orchestrator.task_config.{team_id}.{current_task_name}")
+                    log_config_node(self.logger, final_task_config_for_agent, "team.llm_config.agents.solution_designer", log_prefix=f"orchestrator.task_config.{team_id}.{current_task_name}")
+                    # Log the node the agent *expects* to find its config at
+                    log_config_node(self.logger, final_task_config_for_agent, f"llm_config.agents.{agent_name_for_path}", log_prefix=f"orchestrator.task_config.{team_id}.{current_task_name}")
+                    # --- END ADDED ---
 
                     agent_config = AgentTaskConfig(
-                        agent_class=agent_class,
-                        config=final_task_config_for_agent, # Pass the isolated config for this task
-                        task_name=task_config.get("name"),
-                        requires_approval=task_config.get("requires_approval", False),
-                        max_retries=task_config.get("max_retries", 3),
-                        retry_delay_seconds=task_config.get("retry_delay_seconds", 30)
+                        agent_class=agent_class_str, # Pass the string path for dynamic loading later
+                        config=final_task_config_for_agent, # Pass the merged config for *this specific task* cite: 1612
+                        task_name=current_task_name, # Use variable defined above
+                        requires_approval=task_config_def.get("requires_approval", False), # cite: 1613
+                        max_retries=task_config_def.get("max_retries", 3),
+                        retry_delay_seconds=task_config_def.get("retry_delay_seconds", 30) # cite: 1613
                     )
                     tasks.append(agent_config)
 
-                # Create team
                 self.teams[team_id] = Team(
                     team_id=team_id,
-                    name=name,
+                    name=name, # cite: 1614
                     tasks=tasks,
-                    config=team_config # Store the team-specific config part
+                    config=team_config # Store the original team-specific config part cite: 1614
                 )
                 loaded_count += 1
-                self.logger.info("orchestrator.team_loaded", team_id=team_id, name=name, tasks=len(tasks))
+                self.logger.info("orchestrator.team_loaded", team_id=team_id, name=name, tasks=len(tasks)) # cite: 1615
 
             except Exception as e:
-                self.logger.error("orchestrator.team_load_failed", team_id=team_id, error=str(e))
+                self.logger.error("orchestrator.team_load_failed", team_id=team_id, error=str(e), exc_info=True) # cite: 1615; Add traceback
         self.logger.debug("_load_teams.finished", loaded_count=loaded_count, final_team_keys=list(self.teams.keys()))
+
 
     def _load_default_teams(self) -> None:
         """
