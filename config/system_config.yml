@@ -56,21 +56,29 @@ llm_config:
           max_delay: 20
           exponential: true
     gemini:
-      # Keep the Google AI Studio endpoint as it should support the preview model per docs
-      api_base: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-preview-03-25"
-      context_length: 32000 # Adjust if needed for 2.5 pro
+      # IMPORTANT: Use the base API endpoint WITHOUT /models
+      # LiteLLM will construct this incorrectly, which is why we need this specific format
+      api_base: "https://generativelanguage.googleapis.com/v1beta"
+      context_length: 32000
       env_var: "GEMINI_API_KEY"
-      default_model: "gemini-1.5-pro-latest"  # A generally available default
+      default_model: "gemini-1.5-pro-latest"
       valid_models:
-        - "gemini-1.0-pro"
-        - "gemini-1.5-flash-latest"
-        - "gemini-1.5-pro-latest"
-        - "gemini-2.0-flash" # Add the one from your curl test
-        - "gemini-2.5-pro-preview-03-25" # <<<< ADD THE CORRECT PREVIEW MODEL NAME HERE
-        # Add any other specific Gemini models you have access to
-        - "gemini-1"
-        - "gemini-1.5"
-        - "gemini-2"
+        - "gemini-2.5-pro-preview-03-25"  # Exact model name that works with curl
+      # Set model parameters specific to Gemini
+      model_params:
+        # Use camelCase format for params as required by Google API
+        maxOutputTokens: 8192
+        temperature: 0.7
+      litellm_params:
+        # Skip LiteLLM's Gemini handling with a custom call
+        custom_gemini_call: true  # We'll add this flag in our code
+        retry: true
+        max_retries: 3
+        timeout: 60
+        backoff:
+          initial_delay: 2
+          max_delay: 30
+          exponential: true
     xai:
       api_base: "https://api.x.ai/v1"  # Official xAI API base URL
       env_var: "XAI_API_KEY"          # Environment variable for API key
@@ -86,7 +94,7 @@ llm_config:
       litellm_params:
         retry: true
         max_retries: 3
-        timeout: 30
+        timeout: 45
         rate_limit_policy:
           tokens: 10000             # Adjust based on xAI rate limits
           requests: 50

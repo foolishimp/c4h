@@ -29,7 +29,8 @@ class LLMProvider(str, Enum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
     GEMINI = "gemini"
-
+    XAI = "xai"
+    
     def __str__(self) -> str:
         """Safe string conversion ensuring no interpolation issues"""
         return str(self.value)
