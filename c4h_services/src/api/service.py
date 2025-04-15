@@ -1,4 +1,3 @@
-# File: /Users/jim/src/apps/c4h/c4h_services/src/api/service.py
 """
 API service implementation with enhanced configuration handling and multi-config support.
 Path: c4h_services/src/api/service.py
@@ -118,6 +117,75 @@ def map_job_to_workflow_request(job_request: JobRequest) -> WorkflowRequest:
                  error_type=type(e).__name__) # cite: 1773
         raise ValueError(f"Failed to map job request to workflow request: {str(e)}")
 
+def extract_from_merged_config(merged_config: Dict[str, Any]) -> WorkflowRequest:
+    """
+    Extract necessary fields from a merged configuration and create a WorkflowRequest.
+    This function handles the extraction step after all configs have been merged.
+    
+    Args:
+        merged_config: The fully merged configuration dictionary
+        
+    Returns:
+        WorkflowRequest object with properly mapped fields
+    """
+    try:
+        # Create a config node for easier path-based access
+        config_node = create_config_node(merged_config)
+        
+        # Extract project path - first check common paths
+        project_path = config_node.get_value("project.path")
+        if not project_path:
+            # Fallback to workorder path
+            project_path = config_node.get_value("workorder.project.path")
+            
+        if not project_path:
+            logger.warning("config_extraction.missing_project_path", config_keys=list(merged_config.keys()))
+            raise ValueError("Required field 'project_path' not found in configuration")
+
+        # Extract intent
+        intent_dict = config_node.get_value("intent")
+        if not intent_dict:
+            # Fallback to workorder intent
+            intent_dict = config_node.get_value("workorder.intent")
+        
+        if not intent_dict:
+            logger.warning("config_extraction.missing_intent", config_keys=list(merged_config.keys()))
+            raise ValueError("Required field 'intent' not found in configuration")
+
+        # Extract lineage information from runtime if available
+        lineage_file = None
+        stage = None
+        keep_runid = True
+
+        # Check common paths for lineage/stage info
+        runtime_config = config_node.get_value("runtime.runtime")
+        if isinstance(runtime_config, dict):
+            lineage_file = runtime_config.get("lineage_file")
+            stage = runtime_config.get("stage")
+            keep_runid = runtime_config.get("keep_runid", True)
+        
+        # Create the workflow request
+        workflow_request = WorkflowRequest(
+            project_path=project_path,
+            intent=intent_dict,
+            app_config=merged_config,
+            lineage_file=lineage_file,
+            stage=stage,
+            keep_runid=keep_runid
+        )
+        
+        logger.debug("config.extraction_complete",
+                    project_path=project_path,
+                    has_intent=bool(intent_dict),
+                    app_config_keys=list(merged_config.keys()),
+                    lineage_file=lineage_file,
+                    stage=stage)
+
+        return workflow_request
+    
+    except Exception as e:
+        logger.error("config.extraction_failed", error=str(e), error_type=type(e).__name__)
+        raise ValueError(f"Failed to extract workflow request from merged configuration: {str(e)}")
 
 def map_workflow_to_job_changes(workflow_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
@@ -461,29 +529,20 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
                         job_id=job_id,
                         merged_config_keys=list(merged_config.keys()))
 
-                # ... (rest of the code for creating WorkflowRequest from MultiConfigJobRequest) ...
+                # --- NEW: Extract fields from the merged config ---
                 try:
-                    config_node = create_config_node(merged_config)
-                    project_path = config_node.get_value("workorder.project.path")
-                    intent = config_node.get_value("workorder.intent")
-                    # ... (extract lineage/stage/keep_runid) ...
-                    lineage_file = config_node.get_value("runtime.runtime.lineage_file")
-                    stage = config_node.get_value("runtime.runtime.stage")
-                    keep_runid_value = config_node.get_value("runtime.runtime.keep_runid")
-                    keep_runid = keep_runid_value if isinstance(keep_runid_value, bool) else True
-
-                    workflow_request = WorkflowRequest(
-                        project_path=project_path,
-                        intent=intent,
-                        app_config=merged_config, # Pass the fully merged config
-                        system_config=None,
-                        lineage_file=lineage_file,
-                        stage=stage,
-                        keep_runid=keep_runid
-                    )
+                    workflow_request = extract_from_merged_config(merged_config)
+                    logger.info("jobs.workflow_request_created_from_merged_config", 
+                               job_id=job_id, 
+                               project_path=workflow_request.project_path,
+                               has_intent=bool(workflow_request.intent))
                 except Exception as e:
-                    logger.error("jobs.workflow_request_creation_failed", job_id=job_id, error=str(e), error_type=type(e).__name__, exc_info=True)
-                    raise HTTPException(status_code=400, detail=f"Invalid merged configuration ({type(e).__name__}): {str(e)}")
+                    logger.error("jobs.extract_from_merged_config_failed", 
+                               job_id=job_id, 
+                               error=str(e), 
+                               error_type=type(e).__name__, 
+                               exc_info=True)
+                    raise HTTPException(status_code=400, detail=f"Invalid merged configuration: {str(e)}")
 
 
             elif isinstance(request, JobRequest):
@@ -538,6 +597,9 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
             )
 
             final_project_path = project_path
+            if final_project_path is None and hasattr(workflow_request, 'project_path'):
+                final_project_path = workflow_request.project_path
+                
             if final_project_path is None:
                 logger.warning("Could not determine project_path for final job storage", job_id=job_id)
 
