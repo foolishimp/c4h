@@ -1,13 +1,15 @@
-# Path: /Users/jim/src/apps/c4h/c4h_agents/agents/coder.py
+# File: /Users/jim/src/apps/c4h_ai_dev/c4h_agents/agents/coder.py
 """
 Primary coder agent implementation using semantic extraction.
+Handles iterating through change blocks provided by SolutionDesigner
+and applying them using AssetManager.
 """
-from typing import Dict, Any
-from dataclasses import dataclass, field # Import field, asdict
-import dataclasses # Import dataclasses for asdict
-
+from typing import Dict, Any, Optional, List # Added Optional, List
+from dataclasses import dataclass, field, asdict # Use asdict directly
 from datetime import datetime, timezone
 from pathlib import Path
+import json # For parsing string if needed
+import re # For parsing raw string block
 
 from c4h_agents.agents.base_agent import BaseAgent, AgentResponse
 from c4h_agents.skills.semantic_merge import SemanticMerge
@@ -21,7 +23,7 @@ logger = get_logger()
 @dataclass
 class CoderMetrics:
     """Detailed metrics for code processing operations"""
-    total_changes: int = 0
+    total_changes_processed: int = 0 # Renamed for clarity
     successful_changes: int = 0
     failed_changes: int = 0
     start_time: str = ""
@@ -29,11 +31,9 @@ class CoderMetrics:
     processing_time: float = 0.0
     error_count: int = 0
 
-    # --- FIX: Add to_dict method using dataclasses.asdict ---
     def to_dict(self) -> Dict[str, Any]:
          """Convert metrics to plain dictionary for serialization"""
-         return dataclasses.asdict(self)
-    # --- END FIX ---
+         return asdict(self)
 
 class Coder(BaseAgent):
     """Handles code modifications using semantic processing"""
@@ -43,118 +43,191 @@ class Coder(BaseAgent):
         super().__init__(config=config)
 
         # Use self.logger inherited from BaseAgent after super().__init__()
-        logger_to_use = self.logger
+        # Bind logger immediately for consistent context
+        self.logger = self.logger.bind(agent_name=self._get_agent_name(), agent_type="Coder")
 
-        coder_config = self._get_agent_config()
+        # Get agent specific config (though Coder might not have much unique config now)
+        coder_config = self._get_agent_config() # Uses persona if generic, or llm_config.agents.coder if specific
 
-        runtime_config = self.config_node.get_value("runtime") or {}
-        backup_config = runtime_config.get("backup", {})
-        backup_enabled_val = backup_config.get("enabled", False)
+        # Determine backup settings from the full config
+        backup_config = self.config_node.get_value("backup") or {} # Check top-level first
+        if not backup_config:
+             runtime_config = self.config_node.get_value("runtime") or {} # Fallback to runtime
+             backup_config = runtime_config.get("backup", {})
+
+        backup_enabled_val = backup_config.get("enabled", True) # Default to True if not specified
+        # Robust boolean conversion
         backup_enabled = str(backup_enabled_val).lower() == 'true' if isinstance(backup_enabled_val, str) else bool(backup_enabled_val)
-        backup_path = Path(backup_config.get("path", "workspaces/backups"))
+        backup_path_str = backup_config.get("path", "workspaces/backups")
 
-        # Create semantic tools, passing the agent's config
+        # Resolve backup path relative to project if project path exists
+        backup_path = Path(backup_path_str)
+        if not backup_path.is_absolute() and self.project:
+             backup_path = self.project.paths.root / backup_path
+
+        # Create semantic tools, passing the agent's full config
+        # These skills will inherit config resolution from BaseAgent
         self.iterator = SemanticIterator(config=self.config)
         self.merger = SemanticMerge(config=self.config)
-        # Pass logger to AssetManager if it accepts it
         self.asset_manager = AssetManager(
             backup_enabled=backup_enabled,
-            backup_dir=backup_path,
+            backup_dir=backup_path.resolve(), # Ensure resolved path
             merger=self.merger,
             config=self.config,
-            # logger=logger_to_use # Uncomment if AssetManager accepts logger
+            # logger=self.logger # Pass logger if AssetManager accepts it
         )
 
         # Initialize metrics
         self.operation_metrics = CoderMetrics(start_time=datetime.now(timezone.utc).isoformat())
-        logger_to_use.info("coder.initialized", backup_path=str(backup_path), backup_enabled=backup_enabled)
+        self.logger.info("initialized", backup_path=str(backup_path.resolve()), backup_enabled=backup_enabled)
 
 
     def _get_agent_name(self) -> str:
          """Provide agent name for config/logging."""
+         # If this becomes generic, it should return self.unique_name
+         # For now, keep as specific Coder
          return "coder"
 
+    def _parse_raw_change_block(self, raw_block: str) -> Optional[Dict[str, Any]]:
+        """
+        Parses a raw text block (including markers) into a structured dictionary.
+        Needed when SemanticIterator falls back and yields raw text.
+        """
+        logger_to_use = self.logger # Use instance logger
+        logger_to_use.debug("parsing_raw_change_block", block_length=len(raw_block))
+        if not isinstance(raw_block, str) or not raw_block.strip().startswith("===CHANGE_BEGIN==="):
+            logger_to_use.warning("invalid_raw_block_format", block_preview=raw_block[:100])
+            return None
+
+        # Basic parsing using regex (similar to FastExtractor's logic)
+        pattern = re.compile(
+            r"FILE:(?P<file_path>.*?)\n"
+            r"TYPE:(?P<type>.*?)\n"
+            r"DESCRIPTION:(?P<description>.*?)\n"
+            r"DIFF:\s*\n(?P<diff>.*?)\n?$", # Match DIFF content until the end (before ===CHANGE_END===)
+            re.DOTALL | re.MULTILINE
+        )
+
+        # Remove markers before matching
+        content_inside_markers = raw_block.strip()[len("===CHANGE_BEGIN==="):-len("===CHANGE_END===")].strip()
+
+        match = pattern.search(content_inside_markers)
+        if not match:
+            logger_to_use.error("failed_to_parse_raw_block", block_content=content_inside_markers[:200])
+            return None
+
+        data = match.groupdict()
+        parsed_item = {
+            "file_path": data.get('file_path', '').strip(),
+            "type": data.get('type', '').strip(),
+            "description": data.get('description', '').strip(),
+            "diff": data.get('diff', '').strip() # Strip whitespace from diff edges
+        }
+
+        # Validate essential fields
+        if not parsed_item["file_path"] or not parsed_item["type"]:
+            logger_to_use.error("missing_essential_fields_in_parsed_block", parsed_data=parsed_item)
+            return None
+
+        logger_to_use.debug("raw_block_parsed_successfully", file_path=parsed_item["file_path"])
+        return parsed_item
+
+
     def process(self, context: Dict[str, Any]) -> AgentResponse:
-        """Process code changes using semantic extraction"""
+        """Process code changes using semantic extraction and asset management."""
         logger_to_use = self.logger # Use initialized instance logger
-        logger_to_use.info("coder.process_start", context_keys=list(context.keys()))
-        logger_to_use.debug("coder.input_data", data=context)
+        logger_to_use.info("process_start", context_keys=list(context.keys()))
+        logger_to_use.debug("input_context_received", data=context)
 
         # Reset metrics at the start of processing
         self.operation_metrics = CoderMetrics(start_time=datetime.now(timezone.utc).isoformat())
         final_error = None
+        change_results = [] # Store AssetResult objects
 
         try:
-            # Get input data using the inherited method
+            # Get input data (typically the SolutionDesigner's output)
             data = self._get_data(context)
 
-            # Extract the actual content string using the corrected _get_llm_content from BaseAgent
-            content = self._get_llm_content(data)
+            # Extract the actual content string (potentially nested)
+            content_to_iterate = self._get_llm_content(data)
 
             # Ensure content is a string before passing to iterator
-            if not isinstance(content, str):
-                logger_to_use.warning("coder.extracted_content_not_string", content_type=type(content).__name__)
-                content = str(content)
+            if not isinstance(content_to_iterate, str):
+                logger_to_use.warning("extracted_content_not_string", content_type=type(content_to_iterate).__name__)
+                content_to_iterate = str(content_to_iterate)
 
-            # Get changes from iterator
-            # Pass only the extracted content string under 'input_data'
-            iterator_result = self.iterator.process({'input_data': content})
+            # --- Call SemanticIterator.process to get results ---
+            # This handles the fast/slow fallback internally
+            iterator_response: AgentResponse = self.iterator.process({'input_data': content_to_iterate})
 
-            if not iterator_result.success:
-                logger_to_use.error("coder.iterator_failed", error=iterator_result.error)
-                final_error = f"Iterator failed: {iterator_result.error}"
+            if not iterator_response.success:
+                logger_to_use.error("iterator_failed", error=iterator_response.error)
+                final_error = f"Iterator failed: {iterator_response.error}"
                 # Fall through to return error state at the end
+            else:
+                # --- CORRECTED ITERATION LOGIC ---
+                extracted_items = iterator_response.data.get("results", [])
+                item_count = iterator_response.data.get("count", 0)
+                logger_to_use.info("iterator_completed", items_yielded=item_count)
 
-            # Process each change yielded by the iterator (if any)
-            results = []
-            processed_count = 0
-            # Check success and if results exist before iterating
-            # Also check if iterator_result itself is not None
-            if iterator_result and iterator_result.success and iterator_result.data and iterator_result.data.get("results"):
-                 try:
-                      # Use the iterator instance directly from self.iterator
-                      for change in self.iterator: # Iterate through items found
-                           processed_count += 1
-                           logger_to_use.debug("coder.processing_change",
-                                        type=type(change).__name__,
-                                        change_preview=repr(change)[:150] + "..." if len(repr(change)) > 150 else repr(change) )
+                if item_count > 0 and extracted_items:
+                    for index, item in enumerate(extracted_items):
+                        self.operation_metrics.total_changes_processed += 1
+                        logger_to_use.debug("processing_yielded_item",
+                                            index=index,
+                                            item_type=type(item).__name__,
+                                            item_preview=repr(item)[:150] + "...")
 
-                           if not isinstance(change, dict):
-                                logger_to_use.error("coder.iterator_yielded_non_dict", item_type=type(change).__name__)
-                                self.operation_metrics.failed_changes += 1
-                                self.operation_metrics.error_count += 1
-                                results.append(AssetResult(success=False, path=Path("unknown"), error="Iterator yielded non-dictionary item"))
-                                continue
+                        change_action_dict = None
+                        # Check if the item needs parsing (i.e., it's a raw string block)
+                        if isinstance(item, str) and item.strip().startswith("===CHANGE_BEGIN==="):
+                             logger_to_use.info("parsing_raw_block_from_iterator", index=index)
+                             change_action_dict = self._parse_raw_change_block(item)
+                             if not change_action_dict:
+                                 logger_to_use.error("failed_to_parse_raw_block_item", index=index)
+                                 self.operation_metrics.failed_changes += 1
+                                 self.operation_metrics.error_count += 1
+                                 change_results.append(AssetResult(success=False, path=Path("unknown"), error="Failed to parse raw block from iterator"))
+                                 continue # Skip to next item
+                        elif isinstance(item, dict):
+                             # Assume it's already the correct dictionary format
+                             change_action_dict = item
+                        else:
+                             logger_to_use.error("iterator_yielded_invalid_type", item_type=type(item).__name__, index=index)
+                             self.operation_metrics.failed_changes += 1
+                             self.operation_metrics.error_count += 1
+                             change_results.append(AssetResult(success=False, path=Path("unknown"), error=f"Iterator yielded unexpected type: {type(item).__name__}"))
+                             continue # Skip to next item
 
-                           result = self.asset_manager.process_action(change)
+                        # Ensure we have a valid dictionary before calling AssetManager
+                        if change_action_dict and isinstance(change_action_dict, dict):
+                             # Call AssetManager with the structured dictionary
+                             asset_result: AssetResult = self.asset_manager.process_action(change_action_dict)
+                             change_results.append(asset_result) # Store the AssetResult
 
-                           if result.success:
-                                self.operation_metrics.successful_changes += 1
-                           else:
-                                self.operation_metrics.failed_changes += 1
-                                self.operation_metrics.error_count += 1
+                             if asset_result.success:
+                                 self.operation_metrics.successful_changes += 1
+                                 logger_to_use.info("change_applied_successfully", file=str(asset_result.path))
+                             else:
+                                 self.operation_metrics.failed_changes += 1
+                                 self.operation_metrics.error_count += 1
+                                 logger_to_use.error("change_application_failed", file=str(asset_result.path), error=asset_result.error)
+                        # else: error handled above
 
-                           self.operation_metrics.total_changes += 1
-                           results.append(result)
-
-                 except Exception as iter_err:
-                      logger_to_use.error("coder.iteration_error", error=str(iter_err), exc_info=True)
-                      self.operation_metrics.error_count += 1
-                      final_error = f"Error during change processing: {str(iter_err)}"
-            elif iterator_result and iterator_result.success: # Handle case where iterator succeeded but found 0 items
-                 logger_to_use.info("coder.process_complete_nop", reason="Iterator returned zero change items.")
-
+                elif item_count == 0:
+                     logger_to_use.info("process_complete_nop", reason="Iterator returned zero change items.")
+                # --- END CORRECTED ITERATION LOGIC ---
 
             # Determine overall success
-            # Success if iterator succeeded AND no errors occurred during change processing. Zero changes is success.
-            success = iterator_result and iterator_result.success and self.operation_metrics.error_count == 0
+            # Success only if iterator didn't fail AND no errors occurred during change processing.
+            success = (iterator_response and iterator_response.success and self.operation_metrics.error_count == 0)
 
-            # Update final_error if process failed but no specific error was caught
+            # Update final_error if process failed but no specific error was caught earlier
             if not success and not final_error:
-                 # If iterator_result exists and has an error, use that, otherwise use a generic message
-                 iter_error = iterator_result.error if iterator_result else "Iterator processing failed"
-                 final_error = iter_error or "Coder task failed due to processing errors."
-            elif success and not results: # Successful NOP case
+                 iter_error = iterator_response.error if iterator_response else "Iterator processing failed"
+                 processing_errors = f"{self.operation_metrics.error_count} change processing errors occurred." if self.operation_metrics.error_count > 0 else ""
+                 final_error = iter_error or processing_errors or "Coder task failed due to processing errors."
+            elif success and not change_results: # Successful NOP case
                  final_error = None # Ensure error is None
 
             # Finalize metrics
@@ -168,16 +241,18 @@ class Coder(BaseAgent):
                       self.operation_metrics.processing_time = 0.0
             except ValueError:
                  self.operation_metrics.processing_time = 0.0
-                 logger_to_use.warning("Failed to calculate processing_time due to invalid timestamp format",
+                 logger_to_use.warning("failed_to_calculate_processing_time",
                                         start=self.operation_metrics.start_time,
                                         end=self.operation_metrics.end_time)
 
-            # Use the new to_dict() method for metrics
             metrics_dict = self.operation_metrics.to_dict()
+            logger_to_use.info("process_finished", success=success, metrics=metrics_dict, final_error=final_error)
 
+            # Return structured results
             return AgentResponse(
                 success=success,
                 data={
+                    # Use the structured AssetResult list
                     "changes": [
                         {
                             "file": str(r.path) if r.path else "unknown",
@@ -185,7 +260,7 @@ class Coder(BaseAgent):
                             "error": r.error,
                             "backup": str(r.backup_path) if r.backup_path else None
                         }
-                        for r in results
+                        for r in change_results # Iterate over AssetResult objects
                     ],
                     "metrics": metrics_dict
                 },
@@ -193,7 +268,7 @@ class Coder(BaseAgent):
             )
 
         except Exception as e:
-            logger_to_use.error("coder.process_failed", error=str(e), exc_info=True)
+            logger_to_use.error("process_uncaught_exception", error=str(e), exc_info=True)
             # Update metrics on failure
             if hasattr(self, 'operation_metrics'):
                  self.operation_metrics.error_count += 1
@@ -207,10 +282,9 @@ class Coder(BaseAgent):
                            self.operation_metrics.processing_time = 0.0
 
                  metrics_dict = {}
-                 # Use the to_dict method safely
-                 if hasattr(self.operation_metrics, 'to_dict') and callable(self.operation_metrics.to_dict):
-                      metrics_dict = self.operation_metrics.to_dict()
-                 else: # Fallback if method somehow missing
+                 try:
+                     metrics_dict = self.operation_metrics.to_dict()
+                 except Exception: # Fallback if to_dict fails
                      metrics_dict = vars(self.operation_metrics)
 
                  return AgentResponse(success=False, data={"metrics": metrics_dict}, error=str(e))
