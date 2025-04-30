@@ -336,58 +336,60 @@ llm_config:
           1. Return ONLY the raw JSON array of valid file changes
 
     semantic_slow_extractor:
-      provider: "openai"
-      model: "o3-mini"
-      temperature: 0
+      provider: "anthropic"
+      model: "claude-3-7-sonnet-20250219"
+      temperature: 0.0 # Strict instruction following
+      extended_thinking:
+        enabled: true
+        budget_tokens: 16000
       prompts:
         system: |
-          You are a precise sequential extraction agent for extracting object of information.
-          Your role is to extract exactly one object from a sequence of text sections at position N.
-          Rules:
-          1. Extract ONLY the Nth ===CHANGE_BEGIN=== section that hasn't been returned before
-          2. Return NO_MORE_ITEMS if no more sections exist or position exceeds available items
-          3. Each extracted object MUST be unique and complete
-          4. Follow exact format for response with no additional text
-          5. Handle structured sections properly
-        extract: |
-          Extract the {ordinal} change object from the input. The input uses a text-based format with
-          ===CHANGE_BEGIN=== and ===CHANGE_END=== markers.
-          
-          Content to analyze:
-          {content}
-          
-          NAVIGATION RULES:
-          1. Look for sections between ===CHANGE_BEGIN=== and ===CHANGE_END=== markers
-          2. Extract EXACTLY the {ordinal} section in sequence
-          3. Return the complete object with ALL required fields
-          4. Return NO_MORE_ITEMS if:
-            - {ordinal} exceeds number of sections
-            - All sections have already been extracted
-          
-          The object MUST contain:
-          1. file_path: Path of the file to modify (from the FILE: line)
-          2. type: One of "modify", "create", or "delete" (from the TYPE: line)
-          3. diff: Git-style diff content (from the DIFF: section)
-          4. description: Clear change description (from the DESCRIPTION: line)
-          
-          Input instruction:
-          {instruction}
-          
-          Required format:
-          {format}
-          
-          CRITICAL: Return ONLY the single extracted object without array brackets or ANY additional text.
-          1. Extract EXACTLY the {ordinal} section in sequence order
-          2. Return NO_MORE_ITEMS if:
-            - {ordinal} exceeds number of objects
-            - Object at {ordinal} was already returned in previous position
-          3. Return single change object, not an array
-          4. No explanations or headers allowed or conversational text
+          You are a precise sequential parsing and extraction agent.
+          Your ONLY task is to identify the Nth complete *top-level* text block delimited by '===CHANGE_BEGIN===' and '===CHANGE_END===' markers from the provided input content, parse its internal fields, and return a structured JSON object containing those fields.
+          A top-level block is one whose '===CHANGE_BEGIN===' marker is not inside another block.
+          Ignore any '===CHANGE_BEGIN===' or '===CHANGE_END===' markers that appear *inside* the content of a block when determining its boundaries or counting blocks.
+          You MUST parse the following fields from within the identified block: FILE:, TYPE:, DESCRIPTION:, DIFF:.
+          Do NOT include the '===CHANGE_BEGIN===' or '===CHANGE_END===' markers in the final JSON output.
+          Do NOT add ANY extra text, explanations, formatting (outside the JSON), or conversational filler.
+          If the Nth distinct, complete block cannot be found, your ONLY response MUST be the literal string "NO_MORE_ITEMS".
 
+        extract: |
+          Analyze the 'Content to analyze' below using a two-step process:
+
+          **Step 1: Count Top-Level Blocks**
+          - Carefully count how many distinct, complete *top-level* text blocks exist in the content. A top-level block starts with '===CHANGE_BEGIN===' that is not nested within another block and ends with its corresponding *outermost* '===CHANGE_END==='. Ignore nested markers when counting. Let this count be `TOTAL_BLOCKS`.
+
+          **Step 2: Parse or Terminate**
+          - You are asked to extract and parse the {ordinal} block. Let N = {ordinal}.
+          - Compare N to `TOTAL_BLOCKS`.
+          - **If N is greater than `TOTAL_BLOCKS`**: Your ONLY response MUST be the literal string "NO_MORE_ITEMS".
+          - **If N is less than or equal to `TOTAL_BLOCKS`**:
+              1. Identify the {ordinal} top-level block based on the counting in Step 1.
+              2. Parse the content *inside* that block to extract the values for FILE:, TYPE:, DESCRIPTION:, and DIFF:.
+              3. Construct a single JSON object with the following keys and the extracted values: "file_path", "type", "description", "diff".
+              4. Ensure the value for "diff" contains the multi-line diff content accurately, preserving original formatting within the JSON string (use correct newline escapes like \\n).
+              5. Return ONLY this single, complete JSON object.
+
+          Content to analyze:
+          ```text
+          {content}
+          ```
+
+          CRITICAL OUTPUT INSTRUCTIONS:
+          - Perform the count first.
+          - Based on the comparison between {ordinal} and the count, return *either* a single JSON object containing the parsed fields ("file_path", "type", "description", "diff") from the {ordinal} block *or* the literal string "NO_MORE_ITEMS".
+          - Do not include the '===CHANGE_BEGIN===' or '===CHANGE_END===' markers in the JSON output.
+          - Ensure the output is valid JSON.
+          - Absolutely no other text, explanation, or formatting is allowed in your response.
+
+          Return the result based on the two-step process now:
     semantic_merge:
       provider: "anthropic"
       model: "claude-3-7-sonnet-20250219"
-      temperature: 0
+      temperature: 1
+      extended_thinking:
+        enabled: true
+        budget_tokens: 32000
       merge_config:
         preserve_formatting: true
         allow_partial: false
