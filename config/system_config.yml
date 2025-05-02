@@ -1,3 +1,7 @@
+config_locations:
+  personas_dir: "personas"
+  schemas_dir: "schemas"
+
 llm_config:
   providers:
     anthropic:
@@ -106,16 +110,40 @@ llm_config:
 
   default_provider: "anthropic"
   default_model: "claude-3-opus-20240229"
-  agents:
-    base:  # Base settings all agents inherit
-      storage:
-        root_dir: "workspaces"
-        retention:
-          max_age_days: 30
-          max_runs: 10
-        error_handling:
-          ignore_failures: true
-          log_level: "ERROR"
+  
+  # Base structure for personas - will be template/schema
+  personas:
+    # Common fields all personas inherit
+    provider: null # Provider to use (e.g., "anthropic")
+    model: null    # Model to use (e.g., "claude-3-7-sonnet-20250219")
+    temperature: 0.7
+    extended_thinking:
+      enabled: true
+      budget_tokens: 32000
+    
+    # Template for prompt structures        
+    prompts:
+      system: null  # System instruction prompt
+      user: null    # Default user template
+    
+    # Execution plan for orchestrating agents - used by GenericOrchestratingAgent
+    execution_plan:
+      enabled: false
+      steps: []
+    
+    # Model-specific parameters
+    model_params:
+      max_tokens: 4096
+    
+    # Storage settings
+    storage:
+      root_dir: "workspaces"
+      retention:
+        max_age_days: 30
+        max_runs: 10
+      error_handling:
+        ignore_failures: true
+        log_level: "ERROR"
 
     lineage:  # Lineage-specific configuration
       enabled: true
@@ -366,7 +394,10 @@ llm_config:
           - **If N is less than or equal to `TOTAL_BLOCKS`**:
               1. Identify the {ordinal} top-level block based on the counting in Step 1.
               2. Parse the content *inside* that block to extract the values for FILE:, TYPE:, DESCRIPTION:, and DIFF:.
-              3. Construct a single JSON object with the following keys and the extracted values: "file_path", "type", "description", "diff".
+              3. Construct a single JSON object with the following keys and the extracted values: "file_path", "type", "
+------------END OVERLAP------------
+
+description", "diff".
               4. Ensure the value for "diff" contains the multi-line diff content accurately, preserving original formatting within the JSON string (use correct newline escapes like \\n).
               5. Return ONLY this single, complete JSON object.
 
@@ -537,8 +568,10 @@ orchestration:
     discovery:
       name: "Discovery Team"
       tasks:
-        - name: "discovery"
-          agent_class: "c4h_agents.agents.discovery.DiscoveryAgent"
+        - name: "discovery_phase"
+          agent_type: "generic_single_shot"
+          persona_key: "discovery"
+          description: "Analyze project structure and files"
           requires_approval: false
           max_retries: 2
       routing:
@@ -548,8 +581,10 @@ orchestration:
     solution:
       name: "Solution Design Team"
       tasks:
-        - name: "solution_designer"
-          agent_class: "c4h_agents.agents.solution_designer.SolutionDesigner"
+        - name: "solution_design_phase"
+          agent_type: "generic_single_shot"
+          persona_key: "solution_designer"
+          description: "Create solution design and code changes"
           requires_approval: true
           max_retries: 1
       routing:
@@ -564,8 +599,10 @@ orchestration:
     coder:
       name: "Coder Team"
       tasks:
-        - name: "coder"
-          agent_class: "c4h_agents.agents.coder.Coder"
+        - name: "coding_phase"
+          agent_type: "generic_single_shot"
+          persona_key: "coder"
+          description: "Implement code changes based on solution design"
           requires_approval: true
           max_retries: 1
       routing:
@@ -578,8 +615,10 @@ orchestration:
     fallback:
       name: "Fallback Team"
       tasks:
-        - name: "fallback_coder"
-          agent_class: "c4h_agents.agents.coder.Coder"
+        - name: "fallback_coding_phase"
+          agent_type: "generic_single_shot"
+          persona_key: "coder"
+          description: "Implement code changes with conservative approach"
           config:
             temperature: 0  # Lower temperature for more conservative changes
       routing:
@@ -642,3 +681,4 @@ logging:
   truncate:
     prefix_length: 2000
     suffix_length: 1000
+===CHANGE_END===

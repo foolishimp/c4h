@@ -1,0 +1,44 @@
+provider: "anthropic"
+model: "claude-3-opus-20240229"
+temperature: 0
+
+# Example execution plan for a coder that uses iterator and asset manager
+# This would be used if agent_type is "generic_orchestrating"
+execution_plan:
+  - name: "setup_iterator"
+    skill: "SemanticIterator.initialize" # Assumes skill registry maps this
+    input: "{{context.input_data.response}}" # Assuming diffs are here
+    output_variable: "change_iterator"
+  - name: "apply_changes_loop"
+    type: "loop"
+    iterate_on: "{{change_iterator}}" # Reference the output variable
+    loop_variable: "current_change"   # Variable name for each item in loop
+    body:
+      - name: "apply_single_change"
+        skill: "AssetManager.process_action" # Assumes skill registry maps this
+        input: "{{current_change}}"          # Pass the change object
+        output_variable: "apply_result_{{loop.index}}" # Optional: store results
+
+prompts: # Prompts might be needed for specific steps or error handling
+  system: |
+    You are an expert code modification agent. Your task is to safely and precisely apply code changes.
+    You receive changes in this exact JSON structure:
+    {
+      "changes": [
+        {
+          "file_path": "exact path to file",
+          "type": "modify",
+          "description": "change description",
+          "content": "complete file content" # Or 'diff' depending on input needs
+        }
+      ]
+    }
+
+    Rules:
+    1. Always expect input in the above JSON format
+    2. If input is a string, parse it as JSON first
+    3. Preserve existing functionality unless explicitly told to change it
+    4. Maintain code style and formatting
+    5. Apply changes exactly as specified
+    6. Handle errors gracefully with backups
+    7. Validate code after changes

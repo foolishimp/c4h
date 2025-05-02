@@ -1,4 +1,3 @@
-# Path: /Users/jim/src/apps/c4h/c4h_agents/agents/base_llm.py
 """
 LLM interaction layer providing completion and response handling.
 """
@@ -324,16 +323,28 @@ class BaseLLM:
     def _build_completion_params(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
         """Build parameters for LLM completion request."""
         try:
+            # Get config_node safely from parent BaseAgent
+            config_node_to_use = getattr(self.parent, 'config_node', None)
+            if not config_node_to_use:
+                raise ValueError("config_node not available in parent BaseAgent")
+                
+            # Get agent config path from parent BaseAgent
+            agent_config_path = getattr(self.parent, 'config_path', None)
+            if not agent_config_path:
+                raise ValueError("agent_config_path not available in parent BaseAgent")
+                
+            # Get provider from parent (was resolved during init)
+            provider = getattr(self.parent, 'provider', None)
+            if not provider:
+                provider_name = config_node_to_use.get_value(f"{agent_config_path}.provider") or "anthropic"
+                provider = LLMProvider(provider_name)
+            
             params = {"model": self.model_str, "messages": messages}
-            if self.provider and self.provider.value != "openai": 
+            if provider and provider.value != "openai": 
                 params["temperature"] = self.temperature
 
-            provider_config = {}
-            if hasattr(self.parent, '_get_provider_config') and self.provider:
-                provider_config = self.parent._get_provider_config(self.provider)
-            elif hasattr(self.parent, 'config_node') and self.provider: 
-                if self.parent.config_node:
-                    provider_config = self.parent.config_node.get_value(f"llm_config.providers.{self.provider.value}") or {}
+            # Get provider config directly from effective config snapshot
+            provider_config = config_node_to_use.get_value(f"llm_config.providers.{provider.value}") or {}
 
             # Get model parameters from provider config
             model_params = provider_config.get("model_params", {})
@@ -349,13 +360,13 @@ class BaseLLM:
                 
                 # CRITICAL FIX: For Gemini models, ensure the API base is correctly formatted
                 # The debug output shows that the API base should end with /models
-                if self.provider and self.provider.value == "gemini":
+                if provider and provider.value == "gemini":
                     logger_to_use = getattr(self, 'logger', logger)
                     
                     # Log the API base we're using
                     logger_to_use.debug("Using Gemini API base", 
-                                    api_base=params["api_base"],
-                                    model=self.model)
+                                     api_base=params["api_base"],
+                                     model=self.model)
                     
                     # Ensure the API base ends with /models
                     if not params["api_base"].endswith("/models"):
@@ -366,13 +377,9 @@ class BaseLLM:
                             params["api_base"] = params["api_base"] + "/models"
 
             # Handle Claude 3.7 Sonnet extended thinking if present
-            if self.provider and self.model and self.provider.value == "anthropic" and "claude-3-7-sonnet" in self.model:
-                agent_name = getattr(self.parent, '_get_agent_name', lambda: 'unknown_agent')()
-                agent_path = f"llm_config.agents.{agent_name}"
-                config_node_to_use = getattr(self.parent, 'config_node', None)
-                agent_thinking_config = None
-                if config_node_to_use:
-                    agent_thinking_config = config_node_to_use.get_value(f"{agent_path}.extended_thinking")
+            if provider and self.model and provider.value == "anthropic" and "claude-3-7-sonnet" in self.model:
+                # Get extended thinking config directly from effective config snapshot
+                agent_thinking_config = config_node_to_use.get_value(f"{agent_config_path}.extended_thinking")
                 if not agent_thinking_config:
                     agent_thinking_config = provider_config.get("extended_thinking", {})
                 if agent_thinking_config and agent_thinking_config.get("enabled", False) is True:
@@ -407,14 +414,13 @@ class BaseLLM:
                 litellm.retry_exponential = backoff.get("exponential", True)
 
             # Configure extended thinking support
-            if self.provider and self.model and self.provider.value == "anthropic" and "claude-3-7-sonnet" in self.model:
-                agent_name = self._get_agent_name()
-                agent_path = f"llm_config.agents.{agent_name}"
+            # Get provider and model from parent BaseAgent if available
+            provider = getattr(self.parent, 'provider', None)
+            agent_config_path = getattr(self.parent, 'config_path', '')
 
-                config_node_to_use = getattr(self, 'config_node', None)
-                agent_thinking_config = None
-                if config_node_to_use:
-                     agent_thinking_config = config_node_to_use.get_value(f"{agent_path}.extended_thinking")
+            if provider and self.model and provider.value == "anthropic" and "claude-3-7-sonnet" in self.model:
+                config_node_to_use = getattr(self.parent, 'config_node', None)
+                agent_thinking_config = config_node_to_use.get_value(f"{agent_config_path}.extended_thinking") if config_node_to_use else None
 
                 if not agent_thinking_config:
                     agent_thinking_config = provider_config.get("extended_thinking", {})
@@ -435,7 +441,7 @@ class BaseLLM:
                  max_delay_val = getattr(litellm, 'max_retry_wait', 'Not Set')
 
                  logger_to_use.debug("litellm.configured (Note: Global settings)",
-                             provider=self.provider.serialize() if self.provider else 'Not Set',
+                             provider=provider.serialize() if provider else 'Not Set',
                              retry_settings={
                                  "enabled": retry_enabled,
                                  "max_retries": max_retries_val,

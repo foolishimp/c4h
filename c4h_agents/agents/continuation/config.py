@@ -5,7 +5,7 @@ from typing import Dict, Callable, List, Union
 # Simple configuration for window-based continuation strategy
 WINDOW_CONFIG = {
     # Size of explicit overlap to request in characters
-    "overlap_size": 150,
+    "overlap_size": 300,
     
     # Window context size
     "min_context_window": 1000,

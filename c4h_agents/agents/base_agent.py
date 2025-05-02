@@ -1,4 +1,5 @@
-# File: /Users/jim/src/apps/c4h/c4h_agents/agents/base_agent.py
+# File: /Users/jim/src/apps/c4h_ai_dev/c4h_agents/agents/base_agent.py
+# Corrections for errors related to 'config' and 'agent_name' scope
 
 # Necessary Imports (ensure these are present)
 import json
@@ -8,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 import re
-import structlog
+import structlog # Ensure structlog is imported if used directly
 from c4h_agents.agents.base_config import BaseConfig
 from c4h_agents.agents.base_lineage import BaseLineage # Correct import
 from c4h_agents.agents.lineage_context import LineageContext # Correct import
@@ -17,167 +18,143 @@ from c4h_agents.agents.continuation.continuation_handler import ContinuationHand
 from c4h_agents.agents.types import AgentResponse, AgentMetrics, LLMProvider, LLMMessages, LogDetail
 from c4h_agents.config import create_config_node # Keep create_config_node
 from c4h_agents.core.project import Project
-from c4h_agents.utils.logging import get_logger, log_config_node # Import the utility
+# Import get_logger and log_config_node from the correct utility path
+from c4h_agents.utils.logging import get_logger, log_config_node
 
 # Logger instance for this module (if needed, otherwise self.logger is used)
-logger = get_logger()
+# logger = get_logger() # Removed global logger instance if self.logger is always used
 
 class BaseAgent(BaseConfig, BaseLLM):
     """Base agent implementation"""
 
     # Corrected __init__ method:
-    def __init__(self, config: Dict[str, Any] = None, project: Optional[Project] = None):
-        # Pass full config to BaseConfig first
-        BaseConfig.__init__(self, config=config, project=project)
-        # Then initialize BaseLLM part AFTER BaseConfig setup config_node etc.
+    def __init__(self, full_effective_config: Dict[str, Any], unique_name: str):
+        # --- Step 1: Initialize BaseConfig FIRST to set up self.config and self.config_node ---
+        # BaseConfig now accepts the full config directly
+        BaseConfig.__init__(self, config=full_effective_config)
+
+        # --- Step 2: Initialize BaseLLM ---
         BaseLLM.__init__(self) # Explicitly call BaseLLM init
 
-        # Initialize _continuation_handler
-        self._continuation_handler: Optional[ContinuationHandler] = None
-
-        agent_name = self._get_agent_name()
+        # --- Step 3: Store unique_name and agent_id ---
+        self.unique_name = unique_name # Store the unique name passed in
         self.agent_id = str(uuid.uuid4())
 
-        # Ensure system namespace exists and store agent ID
-        if "system" not in self.config: self.config["system"] = {}
-        self.config["system"]["agent_id"] = self.agent_id
+        # --- Step 4: Define agent_name using the required method ---
+        # This ensures _get_agent_name() works correctly later if needed,
+        # and provides a variable for logging if preferred over calling the method repeatedly.
+        agent_name = self._get_agent_name() # Now returns self.unique_name
 
-        # Initialize logger with initial context
+        # --- Step 5: Initialize Logger AFTER self.config is set by BaseConfig ---
+        # Bind initial context including the unique agent name
         log_context = {"agent": agent_name, "agent_id": self.agent_id}
+        # Add project info if project was passed and initialized in BaseConfig
         if self.project:
             log_context.update({
                 "project_name": self.project.metadata.name,
                 "project_version": self.project.metadata.version,
                 "project_root": str(self.project.paths.root)
             })
-        # Get logger using config potentially containing logging settings
+        # Get logger using self.config which was set in BaseConfig.__init__
+        # Ensure get_logger can handle the config format correctly
         self.logger = get_logger(self.config).bind(**log_context)
 
-        # --- Log received config using the new utility ---
+        # --- Step 6: Log received config using self.config and self.logger ---
+        # Use self.config, not a global 'config'
+        # Use agent_name variable defined above
         log_config_node(self.logger, self.config, "workorder", log_prefix=f"{agent_name}.init_received")
         log_config_node(self.logger, self.config, "team.llm_config.agents", log_prefix=f"{agent_name}.init_received")
-        log_config_node(self.logger, self.config, "llm_config.agents", log_prefix=f"{agent_name}.init_received") # Log both potential top keys
+        log_config_node(self.logger, self.config, "llm_config.agents", log_prefix=f"{agent_name}.init_received")
 
-        # --- Define Configuration Paths ---
-        # Define the primary path where overrides are expected after the merge
+        # --- Step 7: Determine Agent's Config Path ---
+        # Use unique_name (agent_name) to find the config path within the snapshot
         primary_agent_path = f"team.llm_config.agents.{agent_name}"
-        # Define the old/fallback path within the top-level llm_config
         fallback_agent_path = f"llm_config.agents.{agent_name}"
+        self.config_path = primary_agent_path # Assume primary first
+        agent_config_subsection = self.config_node.get_value(primary_agent_path)
 
-        # --- Resolve Provider ---
-        provider_name = (
-            self.config_node.get_value(f"{primary_agent_path}.provider")  # Check primary override path first
-            or self.config_node.get_value(f"{fallback_agent_path}.provider") # Check original/fallback path
-            or self.config_node.get_value("team.llm_config.default_provider") # Check team default (might not exist)
-            or self.config_node.get_value("llm_config.default_provider") # Check global default
-            or "anthropic" # Hardcoded fallback
-        )
-        self.logger.debug(f"{agent_name}.__init__.resolved_provider", provider_name=provider_name)
-        self.provider = LLMProvider(provider_name)
+        if not isinstance(agent_config_subsection, dict):
+            self.logger.debug(f"{agent_name}.init.primary_path_not_found", path=primary_agent_path)
+            agent_config_subsection = self.config_node.get_value(fallback_agent_path)
+            if isinstance(agent_config_subsection, dict):
+                 self.config_path = fallback_agent_path # Use fallback path
+                 self.logger.info(f"{agent_name}.init.using_fallback_config_path", path=self.config_path)
+            else:
+                 # If neither path yields a dict, log a warning. The agent might still function
+                 # if it relies only on global defaults or context, but specific settings are missing.
+                 self.logger.warning(f"{agent_name}.init.agent_specific_config_not_found",
+                                     primary_path=primary_agent_path,
+                                     fallback_path=fallback_agent_path)
+                 self.config_path = fallback_agent_path # Default to fallback path even if empty
 
-        # --- Resolve Model ---
-        self.model = (
-            self.config_node.get_value(f"{primary_agent_path}.model") # Check primary override path first
-            or self.config_node.get_value(f"{fallback_agent_path}.model") # Check original/fallback path
-            or self.config_node.get_value(f"llm_config.providers.{self.provider.value}.default_model") # Check provider default
-            or self.config_node.get_value("team.llm_config.default_model") # Check team default (might not exist)
-            or self.config_node.get_value("llm_config.default_model") # Check global default
-            or "claude-3-opus-20240229" # Hardcoded fallback
-        )
-        self.logger.debug(f"{agent_name}.__init__.resolved_model", model_name=self.model)
-
-        # --- Resolve Temperature ---
-        # Ensure temperature is retrieved as float/int
-        temp_val = (
-            self.config_node.get_value(f"{primary_agent_path}.temperature") # Check primary override path first
-            or self.config_node.get_value(f"{fallback_agent_path}.temperature") # Check original/fallback path
-        )
-        # Set default if not found or None, convert to float
+        # --- Step 8: Resolve Provider, Model, Temperature using self.config_node and self.config_path ---
+        # These values should exist in the snapshot due to merging/persona injection
+        self.provider = LLMProvider(self.config_node.get_value(f"{self.config_path}.provider") or \
+                                    self.config_node.get_value("llm_config.default_provider") or \
+                                    "anthropic") # Default if missing
+        self.model = self.config_node.get_value(f"{self.config_path}.model") or \
+                     self.config_node.get_value(f"llm_config.providers.{self.provider.value}.default_model") or \
+                     self.config_node.get_value("llm_config.default_model") or \
+                     "claude-3-opus-20240229" # Default if missing
+        temp_val = self.config_node.get_value(f"{self.config_path}.temperature")
         self.temperature = float(temp_val) if temp_val is not None else 0.0
-        self.logger.debug(f"{agent_name}.__init__.resolved_temperature", temperature=self.temperature)
 
+        self.logger.debug(f"{agent_name}.init.resolved_settings",
+                          provider=self.provider.value, model=self.model, temp=self.temperature)
 
-        # --- Log the located agent config subsection (checking primary path) ---
-        agent_config_subsection = self.config_node.get_value(primary_agent_path) # Check the path where the override SHOULD be
-        if isinstance(agent_config_subsection, dict): # Check if it's a dict before logging
-            log_config_node(self.logger, self.config, primary_agent_path, log_prefix=f"{agent_name}.init_located")
-        else:
-             # Log if not found or not dict at the primary path, then check the secondary path
-             self.logger.warning(f"{agent_name}.__init__.agent_config_not_found_or_invalid", agent_path=primary_agent_path, found_type=type(agent_config_subsection).__name__)
-             agent_config_subsection_fallback = self.config_node.get_value(fallback_agent_path)
-             if isinstance(agent_config_subsection_fallback, dict):
-                 self.logger.warning(f"{agent_name}.__init__.agent_config_found_at_fallback_path", agent_path=fallback_agent_path)
-                 log_config_node(self.logger, self.config, fallback_agent_path, log_prefix=f"{agent_name}.init_located_fallback")
-             else:
-                 self.logger.warning(f"{agent_name}.__init__.agent_config_not_found_at_any_path", primary_path=primary_agent_path, fallback_path=fallback_agent_path)
+        # --- Step 9: Continuation settings ---
+        # Use self.config_node and self.config_path
+        self.max_continuation_attempts = self.config_node.get_value(f"{self.config_path}.max_continuation_attempts", default=5)
+        self.continuation_token_buffer = self.config_node.get_value(f"{self.config_path}.continuation_token_buffer", default=1000)
 
-        # --- Check for and log fallback usage ---
-        provider_used_primary = bool(self.config_node.get_value(f"{primary_agent_path}.provider"))
-        model_used_primary = bool(self.config_node.get_value(f"{primary_agent_path}.model"))
-        if not provider_used_primary:
-            self.logger.info(f"{agent_name}.__init__.provider_fallback", resolved_provider=self.provider.value, source="default/fallback_path")
-        if not model_used_primary:
-             self.logger.info(f"{agent_name}.__init__.model_fallback", resolved_model=self.model, source="default/fallback_path")
-        # --- End Fallback Logging ---
-
-        # --- Continuation settings (using primary path first) ---
-        self.max_continuation_attempts = self.config_node.get_value(f"{primary_agent_path}.max_continuation_attempts") or \
-                                         self.config_node.get_value(f"{fallback_agent_path}.max_continuation_attempts") or 5
-        self.continuation_token_buffer = self.config_node.get_value(f"{primary_agent_path}.continuation_token_buffer") or \
-                                         self.config_node.get_value(f"{fallback_agent_path}.continuation_token_buffer") or 1000
-
-        # Initialize metrics
+        # --- Step 10: Initialize metrics ---
         self.metrics = AgentMetrics(project=self.project.metadata.name if self.project else None)
 
-        # Set logging detail level from config
+        # --- Step 11: Set logging detail level ---
         log_level_str = self.config_node.get_value("logging.agent_level") or self.config_node.get_value("logging.level") or "basic"
         self.log_level = LogDetail.from_str(log_level_str)
 
-        # Build model string and setup LiteLLM
-        self.model_str = self._get_model_str() # Uses self.provider/self.model resolved above
-        self._setup_litellm(self._get_provider_config(self.provider)) # _get_provider_config uses config_node
+        # --- Step 12: Setup LiteLLM ---
+        # _get_model_str uses self.provider/self.model resolved above
+        self.model_str = self._get_model_str()
+        # _get_provider_config uses self.config_node
+        self._setup_litellm(self._get_provider_config(self.provider))
 
-        # --- Re-bind logger with potentially updated run_id before lineage init ---
-        run_id = self._get_workflow_run_id() or str(uuid.uuid4()) # Get initial run_id
-        self.run_id = run_id # Store the determined run_id on the instance
-        # Update log context before binding
+        # --- Step 13: Finalize logger binding with run_id ---
+        # Get run_id from the effective config snapshot
+        self.run_id = self._get_workflow_run_id() or str(uuid.uuid4())
         log_context.update({
              "provider": self.provider.serialize(),
              "model": self.model,
              "log_level": str(self.log_level),
-             "run_id": self.run_id # Ensure run_id is in the context for binding
+             "run_id": self.run_id
         })
-        self.logger = self.logger.bind(**log_context) # Bind logger with initial context including run_id
-        # --- End Re-bind ---
+        self.logger = self.logger.bind(**log_context)
 
-        # Initialize lineage tracking with the full configuration
+        # --- Step 14: Initialize Lineage ---
         self.lineage = None
         try:
-            # run_id is already determined and bound to logger
-            self.logger.debug(f"{agent_name}.lineage_init", has_runtime="runtime" in self.config, has_system="system" in self.config, has_workflow_run_id=bool(self._get_workflow_run_id()))
-            # Log the run_id that will be used by BaseLineage internally
+            self.logger.debug(f"{agent_name}.lineage_init", has_runtime="runtime" in self.config, has_system="system" in self.config, has_workflow_run_id=bool(self.run_id))
             self.logger.debug(f"{agent_name}.using_run_id", run_id=self.run_id)
-
-            # CORRECTED CALL: Do not pass run_id here
+            # Pass self.config (the full effective snapshot)
             self.lineage = BaseLineage(
                 namespace="c4h_agents",
-                agent_name=agent_name,
-                config=self.config # Pass the agent's full config
+                agent_name=agent_name, # Use variable defined above
+                config=self.config
             )
-            # Ensure the run_id *used* by lineage is stored on the agent and logger
-            # (it might differ from the initial one if lineage loads an existing run)
+            # Update run_id if lineage loaded an existing one
             if self.lineage and hasattr(self.lineage, 'run_id') and self.lineage.run_id != self.run_id:
-                 self.run_id = self.lineage.run_id # Update instance run_id
-                 self.logger = self.logger.bind(run_id=self.run_id) # Re-bind logger with potentially loaded run_id
+                 self.run_id = self.lineage.run_id
+                 self.logger = self.logger.bind(run_id=self.run_id)
                  self.logger.info(f"{agent_name}.lineage_loaded_existing_run", loaded_run_id=self.run_id)
-
-
         except Exception as e:
-            self.logger.error(f"{agent_name}.lineage_init_failed", error=str(e), exc_info=True) # Add traceback
-            # self.run_id was already set above as a fallback
+            self.logger.error(f"{agent_name}.lineage_init_failed", error=str(e), exc_info=True)
 
-        # --- CORRECTED LOGGING CALL ---
-        # Remove explicit run_id and **log_context as they are already bound to self.logger
+        # --- Step 15: Initialize Continuation Handler ---
+        # Ensure it's initialized AFTER all necessary parent attributes (like logger, model_str) are set
+        self._continuation_handler: Optional[ContinuationHandler] = ContinuationHandler(self)
+
+        # --- Step 16: Final Log ---
         self.logger.info(f"{agent_name}.initialized",
                      continuation_settings={
                          "max_attempts": self.max_continuation_attempts,
@@ -395,7 +372,8 @@ class BaseAgent(BaseConfig, BaseLLM):
 
     def _get_data(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Extracts primary data payload, ensuring it's a dictionary."""
-        logger_to_use = getattr(self, 'logger', logger)
+        # Use self.logger which should be initialized
+        logger_to_use = self.logger
         try:
             # Prioritize 'input_data' as the primary container
             if 'input_data' in context and isinstance(context['input_data'], dict):
@@ -412,15 +390,17 @@ class BaseAgent(BaseConfig, BaseLLM):
             logger_to_use.error("_get_data.failed", error=str(e))
             return {}
 
-
     def _format_request(self, context: Dict[str, Any]) -> str:
          # Default implementation, subclasses should override if specific formatting is needed
          # Safely convert context to string for basic use
          try:
+              # Use self.logger which should be initialized
+              self.logger.debug("_format_request: using default JSON dump")
               return json.dumps(context, indent=2, default=str) # Safer conversion
-         except Exception:
+         except Exception as e:
+              # Use self.logger which should be initialized
+              self.logger.error("_format_request: failed to dump context to JSON", error=str(e))
               return str(context) # Fallback
-
 
     # --- THIS IS THE OVERRIDDEN METHOD IN BaseAgent ---
     # --- Includes fix for nested 'response' and 'llm_output' ---
@@ -493,13 +473,15 @@ class BaseAgent(BaseConfig, BaseLLM):
             return str(response)
 
 
+    # Example: Assuming the error is in _process_response
     def _process_response(self, content: str, raw_response: Any) -> Dict[str, Any]:
         """Process LLM response into standard format without duplicating raw output"""
-        # Use self.logger which should be initialized in BaseAgent
-        logger_to_use = self.logger
+        # Use self.logger which should be initialized in BaseAgent __init__
+        logger_to_use = self.logger # Use the instance logger
         try:
             # Extract content using THIS class's _get_llm_content method
             processed_content = self._get_llm_content(content) # Calls the overridden method
+            # Check if logger exists before logging
             if logger_to_use and self._should_log(LogDetail.DEBUG):
                 logger_to_use.debug("agent.processing_response",
                             content_length=len(str(processed_content)) if processed_content else 0,
@@ -519,12 +501,14 @@ class BaseAgent(BaseConfig, BaseLLM):
                     "prompt_tokens": getattr(usage, 'prompt_tokens', 0),
                     "total_tokens": getattr(usage, 'total_tokens', 0)
                 }
+                # Check if logger exists before logging
                 if logger_to_use: logger_to_use.info("llm.token_usage", **usage_data)
                 response["usage"] = usage_data
 
             return response
         except Exception as e:
-            if logger_to_use: logger_to_use.error("response_processing.failed", error=str(e))
+            # Check if logger exists before logging
+            if logger_to_use: logger_to_use.error("response_processing.failed", error=str(e), exc_info=True) # Added traceback
             return {
                 "response": str(content),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -536,26 +520,34 @@ class BaseAgent(BaseConfig, BaseLLM):
         return []
 
     def _get_agent_name(self) -> str:
-        # Default implementation, should be overridden by specific agent subclasses
-        class_name = self.__class__.__name__
-        # Convert CamelCase to snake_case more robustly
-        name = re.sub(r'(?<!^)(?=[A-Z])', '_', class_name).lower()
-        if name.endswith("_agent"): # Remove suffix only if present
-            name = name[:-6]
-        return name or "base_agent" # Fallback
-
+        # This method now returns the unique name assigned during instantiation
+        # Ensure self.unique_name is set in __init__
+        if hasattr(self, 'unique_name') and self.unique_name:
+             return self.unique_name
+        else:
+             # Fallback, though unique_name should always be set by the factory
+             # Use self.logger if available, otherwise print a warning
+             logger_instance = getattr(self, 'logger', None)
+             if logger_instance:
+                  logger_instance.warning("_get_agent_name called before unique_name was set or unique_name is empty.")
+             else:
+                  print("Warning: _get_agent_name called before unique_name was set or unique_name is empty.")
+             # Attempt to derive from class name as a last resort, but this deviates from the new design
+             class_name = self.__class__.__name__
+             name = re.sub(r'(?<!^)(?=[A-Z])', '_', class_name).lower()
+             if name.endswith("_agent"): name = name[:-6]
+             return name or "base_agent"
 
     def _get_system_message(self) -> str:
         # Use self.config_node which is initialized in BaseConfig
-        agent_config_node = self.config_node.get_node(f"llm_config.agents.{self._get_agent_name()}")
-        return agent_config_node.get_value("prompts.system") or ""
+        return self.config_node.get_value(f"{self.config_path}.prompts.system") or ""
 
 
     def _get_prompt(self, prompt_type: str) -> str:
          # Use self.config_node which is initialized in BaseConfig
-        agent_config_node = self.config_node.get_node(f"llm_config.agents.{self._get_agent_name()}")
-        prompt = agent_config_node.get_value(f"prompts.{prompt_type}")
-        if prompt is None: # Check explicitly for None
+        prompt_path = f"{self.config_path}.prompts.{prompt_type}"
+        prompt = self.config_node.get_value(prompt_path)
+        if prompt is None:  # Check explicitly for None
              # Use self.logger which is initialized
              self.logger.error("prompt.template_not_found", prompt_type=prompt_type, agent=self._get_agent_name())
              raise ValueError(f"No prompt template found for type: {prompt_type} in agent {self._get_agent_name()}")

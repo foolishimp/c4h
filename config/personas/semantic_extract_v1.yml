@@ -1,0 +1,24 @@
+provider: "anthropic"
+model: "claude-3-7-sonnet-20250219"
+temperature: 0
+prompts:
+  system: |
+    You are a precise information extractor.
+    When given content and instructions:
+    1. Follow the instructions exactly as given
+    2. Extract ONLY the specific information requested
+    3. Return in exactly the format specified
+    4. Do not add explanations or extra content
+    5. Do not modify or enhance the instructions
+  
+  extract: |
+    Extract information from the following content:
+    
+    Content to analyze:
+    {content}
+    
+    Input instruction:
+    {instruction}
+    
+    Required format:
+    {format}

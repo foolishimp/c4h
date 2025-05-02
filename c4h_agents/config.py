@@ -3,12 +3,14 @@ Configuration handling with robust dictionary access and path resolution.
 Path: c4h_agents/config.py
 """
 import yaml
-from typing import Dict, Any, Optional, List, Tuple, Union, Iterator, Pattern
+from typing import Dict, Any, Optional, List, Tuple, Union, Iterator, Pattern, Callable
 from pathlib import Path
 import structlog
 from copy import deepcopy
 import collections.abc
 import json
+import os
+import hashlib
 import fnmatch
 import re
 
@@ -395,6 +397,32 @@ def load_config(path: Path) -> Dict[str, Any]:
         logger.error("config.load.failed", path=str(path), error=str(e), error_type=type(e).__name__)
         return {}
 
+def load_persona_config(persona_key: str, personas_base_path: Path) -> Dict[str, Any]:
+    """
+    Load persona configuration from the personas directory
+    
+    Args:
+        persona_key: Name of the persona configuration to load
+        personas_base_path: Base path to the personas directory
+        
+    Returns:
+        Persona configuration dictionary or empty dict if not found
+    """
+    try:
+        # Try both .yml and .yaml extensions
+        for ext in ['.yml', '.yaml']:
+            persona_path = personas_base_path / f"{persona_key}{ext}"
+            if persona_path.exists():
+                logger.info("config.persona.loading", persona_key=persona_key, path=str(persona_path))
+                return load_config(persona_path)
+        
+        logger.warning("config.persona.not_found", persona_key=persona_key, searched_base_path=str(personas_base_path))
+        return {}
+    except Exception as e:
+        logger.error("config.persona.load_failed", persona_key=persona_key, base_path=str(personas_base_path),
+                   error=str(e), error_type=type(e).__name__)
+        return {}
+
 def load_with_app_config(system_path: Path, app_path: Path) -> Dict[str, Any]:
     """Load and merge system config with app config with full logging"""
     try:
@@ -419,3 +447,81 @@ def create_config_node(config: Dict[str, Any]) -> ConfigNode:
         ConfigNode for easy hierarchical access
     """
     return ConfigNode(config)
+
+def expand_env_vars(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively expand environment variables in configuration values
+    
+    Supports ${VAR} or $VAR syntax in string values
+    """
+    if not isinstance(config, dict):
+        return config
+        
+    result = {}
+    for key, value in config.items():
+        if isinstance(value, dict):
+            result[key] = expand_env_vars(value)
+        elif isinstance(value, list):
+            result[key] = [expand_env_vars(item) if isinstance(item, dict) else item for item in value]
+        elif isinstance(value, str):
+            # Expand ${VAR} syntax
+            if "${" in value and "}" in value:
+                # Extract all environment variables
+                for env_var in re.findall(r'\${([^}]+)}', value):
+                    env_value = os.environ.get(env_var, "")
+                    value = value.replace(f"${{{env_var}}}", env_value)
+            # Expand $VAR syntax (only for values that are just an env var)
+            elif value.startswith("$") and len(value) > 1 and " " not in value:
+                env_var = value[1:]
+                env_value = os.environ.get(env_var, "")
+                if env_value:
+                    value = env_value
+            result[key] = value
+        else:
+            result[key] = value
+    return result
+
+def render_config(
+    fragments: List[Dict[str, Any]], 
+    run_id: str, 
+    workdir: Path,
+    transform_funcs: Optional[List[Callable[[Dict[str, Any]], Dict[str, Any]]]] = None
+) -> Path:
+    """
+    Generate and persist an effective configuration snapshot after merging all fragments.
+    
+    Args:
+        fragments: List of configuration fragments to merge
+        run_id: Unique run identifier
+        workdir: Directory to store the snapshot
+        transform_funcs: Optional list of transformation functions to apply after merging
+        
+    Returns:
+        Path to the generated effective configuration snapshot
+    """
+    logger.info("config.render.starting", run_id=run_id, fragments_count=len(fragments))
+    
+    # Merge all fragments
+    effective_config = {}
+    for fragment in fragments:
+        effective_config = deep_merge(effective_config, fragment)
+    
+    # Apply transformation functions if provided
+    transform_funcs = transform_funcs or [expand_env_vars]
+    for transform in transform_funcs:
+        effective_config = transform(effective_config)
+    
+    # Create output directory
+    output_dir = workdir / run_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Serialize to YAML and calculate hash
+    yaml_content = yaml.safe_dump(effective_config, sort_keys=True, default_flow_style=False)
+    config_hash = hashlib.sha256(yaml_content.encode()).hexdigest()[:8]
+    output_path = output_dir / f"effective_config_{config_hash}.yml"
+    
+    # Write to file
+    with open(output_path, "w") as f:
+        f.write(yaml_content)
+    
+    logger.info("config.render.complete", path=str(output_path), hash=config_hash)
+    return output_path

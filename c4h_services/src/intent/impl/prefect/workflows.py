@@ -1,331 +1,414 @@
-"""
-Path: c4h_services/src/intent/impl/prefect/workflows.py
-Core workflow implementation with enhanced lineage tracking.
-"""
+# File: /Users/jim/src/apps/c4h_ai_dev/c4h_services/src/intent/impl/prefect/workflows.py
+# Correction: Add missing import for evaluate_routing_task
 
 from prefect import flow, get_run_logger
 from prefect.context import get_run_context
 from typing import Dict, Any, Optional, List
-from c4h_services.src.utils.logging import get_logger
+# Import get_logger from the shared utility path
+from c4h_services.src.utils.logging import get_logger, truncate_log_string
 from pathlib import Path
 from datetime import datetime, timezone
 from copy import deepcopy
 import uuid
+import os
+import io
+import yaml
 
 from c4h_agents.config import create_config_node
 from c4h_agents.agents.lineage_context import LineageContext
-from .tasks import run_agent_task
-from .factories import (
-    create_discovery_task,
-    create_solution_task,
-    create_coder_task
-)
+# Import evaluate_routing_task from the tasks module
+from .tasks import run_agent_task, materialise_config, evaluate_routing_task
+# Remove unused factory imports if run_basic_workflow was deleted
+# from .factories import (...)
+
 # Import the LineageContext utility
 from c4h_agents.agents.lineage_context import LineageContext
 
+# Use the imported get_logger
 logger = get_logger()
 
+# --- prepare_workflow_config function ---
 def prepare_workflow_config(base_config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Prepare workflow configuration with proper run ID and context.
     Uses hierarchical configuration access.
     """
+    # Use get_run_logger() inside the flow/task for Prefect context awareness
+    run_logger = get_run_logger() if get_run_context() else logger # Fallback to global logger if no context
     try:
         # Get workflow run ID from Prefect context
+        workflow_id = None
         ctx = get_run_context()
-        if ctx is not None and hasattr(ctx, "flow_run") and ctx.flow_run and hasattr(ctx.flow_run, "id"):
+        if ctx and hasattr(ctx, "flow_run") and ctx.flow_run and hasattr(ctx.flow_run, "id"):
             workflow_id = str(ctx.flow_run.id)
-        else:
-            workflow_id = str(uuid.uuid4())
-            logger.warning("workflow.missing_prefect_context", generated_workflow_id=workflow_id)
-        
+
+        # If no Prefect context, check base_config or generate new ID
+        if not workflow_id:
+             config_node_temp = create_config_node(base_config)
+             workflow_id = config_node_temp.get_value("workflow_run_id") or \
+                           config_node_temp.get_value("system.runid")
+
+        if not workflow_id:
+            workflow_id = f"wf_standalone_{str(uuid.uuid4())[:8]}" # Generate ID if still missing
+            run_logger.warning("workflow.missing_prefect_context_and_config_id", generated_workflow_id=workflow_id)
+
         # Deep copy to avoid mutations
         config = deepcopy(base_config)
-        
-        # First, set the run ID at the root system namespace 
-        if 'system' not in config:
-            config['system'] = {}
+
+        # Ensure system namespace exists and set runid
+        if 'system' not in config: config['system'] = {}
         config['system']['runid'] = workflow_id
-        
-        # For backward compatibility, also set in runtime config
-        if 'runtime' not in config:
-            config['runtime'] = {}
-            
+
+        # Ensure runtime namespace exists and set workflow IDs
+        if 'runtime' not in config: config['runtime'] = {}
         config['runtime'].update({
-            'workflow_run_id': workflow_id,  # Primary workflow ID
-            'run_id': workflow_id,           # Legacy support
-            'workflow': {
-                'id': workflow_id,
-                'start_time': datetime.now(timezone.utc).isoformat()
-            }
+            'workflow_run_id': workflow_id,
+            'run_id': workflow_id,
         })
-        
-        # Also set at top level for direct access
+        if 'workflow' not in config['runtime']: config['runtime']['workflow'] = {}
+        config['runtime']['workflow']['id'] = workflow_id
+        if 'start_time' not in config['runtime']['workflow']:
+             config['runtime']['workflow']['start_time'] = datetime.now(timezone.utc).isoformat()
+
+
+        # Also set workflow_run_id at top level for direct access
         config['workflow_run_id'] = workflow_id
-        
-        # Set lineage tracking configuration
-        if 'llm_config' not in config:
-            config['llm_config'] = {}
-        
-        if 'agents' not in config['llm_config']:
-            config['llm_config']['agents'] = {}
-            
+
+        # Ensure lineage tracking configuration exists and is enabled
+        if 'llm_config' not in config: config['llm_config'] = {}
+        if 'agents' not in config['llm_config']: config['llm_config']['agents'] = {}
         if 'lineage' not in config['llm_config']['agents']:
             config['llm_config']['agents']['lineage'] = {}
-            
-        # Ensure lineage is enabled
-        config['llm_config']['agents']['lineage'].update({
+
+        # Set defaults if not present, but don't override existing values unless necessary
+        lineage_defaults = {
             'enabled': True,
             'namespace': 'c4h_agents',
-            'event_detail_level': 'full',  # full, standard, or minimal
-            'separate_input_output': False, # Set to True for large payloads
-            'backend': {
-                'type': 'file',
-                'path': 'workspaces/lineage'
-            }
-        })
-        
-        logger.debug("workflow.config_prepared",
+            'event_detail_level': 'full',
+            'separate_input_output': False,
+            'backend': { 'type': 'file', 'path': 'workspaces/lineage' }
+        }
+        # Merge defaults without overwriting existing keys
+        current_lineage_config = config['llm_config']['agents']['lineage']
+        for key, value in lineage_defaults.items():
+            if key not in current_lineage_config:
+                current_lineage_config[key] = value
+            elif key == 'backend' and isinstance(value, dict):
+                 # Merge backend defaults carefully
+                 current_backend = current_lineage_config.get('backend', {})
+                 if not isinstance(current_backend, dict): current_backend = {}
+                 for bk, bv in value.items():
+                      if bk not in current_backend:
+                           current_backend[bk] = bv
+                 current_lineage_config['backend'] = current_backend
+
+
+        run_logger.debug("workflow.config_prepared",
             workflow_id=workflow_id,
             config_keys=list(config.keys()))
-            
+
         return config
-        
+
     except Exception as e:
-        logger.error("workflow.config_prep_failed", error=str(e))
+        run_logger.error("workflow.config_prep_failed", error=str(e), exc_info=True) # Log traceback
         raise
 
-@flow(name="basic_refactoring")
-def run_basic_workflow(
-    project_path: Path,
-    intent_desc: Dict[str, Any],
-    config: Dict[str, Any]
+# --- run_declarative_workflow function ---
+@flow(name="declarative_workflow")
+def run_declarative_workflow(
+    initial_context: Dict[str, Any],
+    system_config_path: Path = Path("config/system_config.yml"),
+    max_total_teams: Optional[int] = None, # Allow None to use config default
+    max_recursion_depth: Optional[int] = None # Allow None to use config default
 ) -> Dict[str, Any]:
     """
-    Basic workflow implementing the core refactoring steps.
-    Uses hierarchical configuration access for consistent run ID propagation.
+    Execute a workflow defined declaratively in configuration.
+    Uses the effective configuration snapshot for all execution.
+
+    Args:
+        initial_context: Initial context including config fragments
+        system_config_path: Path to base system configuration
+        max_total_teams: Safety limit for total team executions (overrides config if set)
+        max_recursion_depth: Safety limit for recursive team executions (overrides config if set)
+
+    Returns:
+        Dict with workflow execution results
     """
     run_logger = get_run_logger()
-    
+    config_info = None # Initialize for potential error handling
+
     try:
-        # Prepare workflow configuration with proper run ID propagation
-        workflow_config = prepare_workflow_config(config)
-        
-        # Create configuration node for path-based access
-        config_node = create_config_node(workflow_config)
-        
-        # Log the workflow ID for debugging
-        workflow_id = config_node.get_value("system.runid")
-        logger.info("workflow.initialized", 
-                  flow_id=workflow_id,
-                  project_path=str(project_path))
-        
-        # Ensure project config exists - path resolution happens in asset manager
-        if 'project' not in workflow_config:
-            workflow_config['project'] = {}
-            
-        # Set original project path in config - let components resolve as needed
-        if 'path' not in workflow_config['project']:
-            workflow_config['project']['path'] = str(project_path)
-        
-        # Configure agent tasks - each agent will create its own domain objects if needed
-        discovery_config = create_discovery_task(workflow_config)
-        solution_config = create_solution_task(workflow_config)
-        coder_config = create_coder_task(workflow_config)
-        
-        # Create a workflow context with proper lineage tracking
-        workflow_context = LineageContext.create_workflow_context(workflow_id)
-        
-        # Set step sequence for visualization and tracking
-        step_sequence = 0
-        
-        # Run discovery with proper lineage tracking context
-        step_sequence += 1
-        discovery_context = LineageContext.create_agent_context(
-            workflow_run_id=workflow_id,
-            agent_type="discovery",
-            step=step_sequence,
-            base_context={
-                "project_path": str(project_path),
-                "project": workflow_config['project']
-            }
-        )
-        
-        logger.debug("workflow.discovery_context", 
-                   workflow_id=workflow_id, 
-                   agent_execution_id=discovery_context.get("agent_execution_id"),
-                   step=step_sequence,
-                   context_keys=list(discovery_context.keys()))
-        
-        discovery_result = run_agent_task(
-            agent_config=discovery_config,
-            context=discovery_context
+        # Step 1: Generate the effective configuration snapshot
+        config_info = materialise_config(
+            context=initial_context,
+            system_config_path=system_config_path,
+            workspace_dir=None  # Use default workspace dir based on run ID
         )
 
-        if not discovery_result.get("success"):
-            return {
-                "status": "error",
-                "error": discovery_result.get("error"),
-                "workflow_run_id": workflow_id,
-                "stage": "workflow",
-                "project_path": str(project_path),
-                "execution_metadata": {
-                    "agent_execution_id": discovery_context.get("agent_execution_id"),
-                    "step": step_sequence,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }
-            }
+        # Load the effective configuration FROM THE SNAPSHOT
+        run_logger.info(f"Loading effective configuration from: {config_info.snapshot_path}")
+        with open(config_info.snapshot_path, 'r') as f:
+            effective_config = yaml.safe_load(f) or {} # Ensure it's a dict
 
-        # Extract discovery execution metadata
-        discovery_metadata = discovery_result.get("result_data", {}).get("execution_metadata", {})
-        discovery_agent_id = discovery_metadata.get("agent_execution_id")
+        # Create config node for path-based access
+        config_node = create_config_node(effective_config)
 
-        # Run solution design with proper lineage tracking
-        step_sequence += 1
-        solution_context = LineageContext.create_agent_context(
-            workflow_run_id=workflow_id,
-            agent_type="solution_designer",
-            step=step_sequence,
-            base_context={
-                "input_data": {
-                    "discovery_data": discovery_result["result_data"],
-                    "intent": intent_desc,
-                    "project": workflow_config['project']
-                }
-            }
-        )
-        
-        logger.debug("workflow.solution_context", 
-                   workflow_id=workflow_id,
-                   agent_execution_id=solution_context.get("agent_execution_id"),
-                   step=step_sequence,
-                   context_keys=list(solution_context.keys()))
-                    
-        solution_result = run_agent_task(
-            agent_config=solution_config,
-            context=solution_context
-        )
+        # Get workflow run ID for tracking (should be embedded in snapshot)
+        workflow_id = config_node.get_value("system.runid") or str(config_info.run_id)
+        run_logger.info(f"Workflow Run ID: {workflow_id}") # Log the ID being used
 
-        if not solution_result.get("success"):
-            return {
-                "status": "error",
-                "error": solution_result.get("error"),
-                "stage": "solution_design",
-                "workflow_run_id": workflow_id,
-                "project_path": str(project_path),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "discovery_data": discovery_result.get("result_data"),
-                "execution_metadata": {
-                    "agent_execution_id": solution_context.get("agent_execution_id"),
-                    "step": step_sequence,
-                    "previous_step": discovery_agent_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }
-            }
+        # Get global safety limits from effective config, overridden by args if provided
+        config_max_total = config_node.get_value("orchestration.max_total_teams", default=30)
+        final_max_total_teams = max_total_teams if max_total_teams is not None else config_max_total
 
-        # Extract solution execution metadata
-        solution_metadata = solution_result.get("result_data", {}).get("execution_metadata", {})
-        solution_agent_id = solution_metadata.get("agent_execution_id")
+        config_max_recursion = config_node.get_value("orchestration.max_recursion_depth", default=5)
+        final_max_recursion_depth = max_recursion_depth if max_recursion_depth is not None else config_max_recursion
 
-        # Run coder with proper lineage tracking
-        step_sequence += 1
-        coder_context = LineageContext.create_agent_context(
-            workflow_run_id=workflow_id,
-            agent_type="coder",
-            step=step_sequence,
-            base_context={
-                "input_data": solution_result["result_data"],
-                "project": workflow_config['project']
-            }
-        )
-        
-        logger.debug("workflow.coder_context", 
-                   workflow_id=workflow_id,
-                   agent_execution_id=coder_context.get("agent_execution_id"),
-                   step=step_sequence,
-                   context_keys=list(coder_context.keys()))
-                    
-        coder_result = run_agent_task(
-            agent_config=coder_config,
-            context=coder_context
-        )
+        run_logger.info("Workflow limits", max_total_teams=final_max_total_teams, max_recursion_depth=final_max_recursion_depth)
 
-        if not coder_result.get("success"):
-            return {
-                "status": "error",
-                "error": coder_result.get("error"),
-                "stage": "coder",
-                "workflow_run_id": workflow_id,
-                "project_path": str(project_path),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "discovery_data": discovery_result.get("result_data"),
-                "solution_data": solution_result.get("result_data"),
-                "execution_metadata": {
-                    "agent_execution_id": coder_context.get("agent_execution_id"),
-                    "step": step_sequence,
-                    "previous_step": solution_agent_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }
-            }
+        # Initialize safety counters
+        total_teams_executed = 0
+        team_execution_counts = {}  # Track execution count per team
 
-        # Extract coder execution metadata
-        coder_metadata = coder_result.get("result_data", {}).get("execution_metadata", {})
-        coder_agent_id = coder_metadata.get("agent_execution_id")
+        # Get entry team from config or use default
+        entry_team_id = config_node.get_value("orchestration.entry_team") or "discovery"
+        run_logger.info(f"Starting workflow with entry team: {entry_team_id}")
 
-        # Return workflow result with comprehensive lineage context
-        return {
-            "status": "success",
-            "stages": {
-                "discovery": discovery_result["result_data"],
-                "solution_design": solution_result["result_data"],
-                "coder": coder_result["result_data"]
-            },
-            "changes": coder_result["result_data"].get("changes", []),
-            "project_path": str(project_path),
+        # Initialize current state
+        current_team_id = entry_team_id
+        # Start context with initial context, but ensure config points to the loaded effective_config
+        current_context = initial_context.copy()
+        current_context["config"] = effective_config # Ensure context uses the loaded snapshot
+        current_context["config_snapshot_path"] = str(config_info.snapshot_path)
+        # Ensure workflow_run_id is consistently set in context
+        current_context["workflow_run_id"] = workflow_id
+        if "system" not in current_context: current_context["system"] = {}
+        current_context["system"]["runid"] = workflow_id
+
+
+        # Track execution results
+        team_results = {}
+        execution_path = []
+        final_workflow_status = "success" # Assume success initially
+        final_workflow_error = None
+
+        # Main workflow loop
+        while current_team_id:
+            # Check global execution limits
+            if total_teams_executed >= final_max_total_teams:
+                run_logger.warning(f"Maximum total team executions ({final_max_total_teams}) reached")
+                final_workflow_status = "error"
+                final_workflow_error = f"Exceeded maximum total team executions ({final_max_total_teams})"
+                break
+
+            # Get per-team recursion depth limit (if specified in config)
+            team_max_depth = config_node.get_value(f"orchestration.teams.{current_team_id}.max_recursion_depth", default=final_max_recursion_depth)
+
+            # Check team-specific recursion depth
+            current_team_count = team_execution_counts.get(current_team_id, 0)
+            if current_team_count >= team_max_depth:
+                run_logger.warning(f"Maximum recursion depth ({team_max_depth}) reached for team {current_team_id}")
+                final_workflow_status = "error"
+                final_workflow_error = f"Exceeded maximum recursion depth ({team_max_depth}) for team {current_team_id}"
+                break
+
+            # Update team execution counter
+            team_execution_counts[current_team_id] = current_team_count + 1
+            total_teams_executed += 1
+
+            # Add to execution path for tracking
+            execution_path.append(current_team_id)
+
+            run_logger.info(f"Executing team: {current_team_id} "
+                            f"(execution {total_teams_executed}, depth {current_team_count + 1})")
+
+            # Execute the team as a subflow
+            # Ensure the effective_config dictionary is passed correctly
+            team_result = execute_team_subflow(
+                team_id=current_team_id,
+                effective_config=effective_config,
+                current_context=current_context
+            )
+
+            # Store the team result with a unique key per execution
+            team_results[f"{current_team_id}_{current_team_count}"] = team_result
+
+            # Check for team execution failure
+            if not team_result.get("success", False):
+                error_detail = team_result.get('error', 'Unknown team error')
+                run_logger.error(f"Team {current_team_id} execution failed: {error_detail}")
+                # Check if workflow should stop on failure for this team
+                stop_on_fail = config_node.get_value(f"orchestration.teams.{current_team_id}.stop_on_failure", default=True)
+                if stop_on_fail:
+                     final_workflow_status = "error"
+                     final_workflow_error = f"Team {current_team_id} failed: {error_detail}"
+                     break # Stop the workflow
+                else:
+                     run_logger.warning(f"Team {current_team_id} failed but stop_on_failure is false, continuing workflow.")
+
+
+            # Evaluate routing to determine next team
+            routing_result = evaluate_routing_task(
+                team_results=team_result, # Pass the result of the *current* team execution
+                current_context=current_context,
+                effective_config=effective_config,
+                team_id=current_team_id
+            )
+
+            # Update context with any context updates returned by routing
+            if "context_updates" in routing_result and routing_result["context_updates"]:
+                context_updates = routing_result["context_updates"]
+                if isinstance(context_updates, dict): # Ensure it's a dict
+                     run_logger.info(f"Applying context updates from routing: {list(context_updates.keys())}")
+                     # Perform immutable merge of context updates
+                     current_context = {**current_context, **context_updates}
+                else:
+                     run_logger.warning("Routing returned non-dict context_updates, ignoring.", updates=context_updates)
+
+
+            # Get next team ID
+            current_team_id = routing_result.get("next_team_id")
+
+            # Check if we've reached the end
+            if not current_team_id:
+                run_logger.info("Workflow completed - no next team specified by routing.")
+                break
+
+        # Final workflow metrics
+        metrics = {
+            "total_teams_executed": total_teams_executed,
+            "unique_teams_executed": len(team_execution_counts),
+            "max_team_recursion": max(team_execution_counts.values()) if team_execution_counts else 0
+        }
+
+        # Return comprehensive workflow results
+        final_result_data = {
+            "status": final_workflow_status,
             "workflow_run_id": workflow_id,
-            "metrics": {
-                "discovery": discovery_result.get("metrics", {}),
-                "solution_design": solution_result.get("metrics", {}),
-                "coder": coder_result.get("metrics", {})
-            },
-            "timestamps": {
-                "start": workflow_config["runtime"]["workflow"]["start_time"],
-                "end": datetime.now(timezone.utc).isoformat()
-            },
-            "execution_metadata": {
-                "workflow_run_id": workflow_id,
-                "step_sequence": step_sequence,
-                "agent_sequence": [
-                    {"agent": "discovery", "id": discovery_agent_id, "step": 1},
-                    {"agent": "solution_designer", "id": solution_agent_id, "step": 2},
-                    {"agent": "coder", "id": coder_agent_id, "step": 3}
-                ],
-                "execution_path": LineageContext.extract_lineage_info(coder_context).get("execution_path", [])
+            "execution_metrics": metrics,
+            "execution_path": execution_path,
+            "team_results": team_results,
+            "config_metadata": {
+                "snapshot_path": str(config_info.snapshot_path),
+                "schema_validated": config_info.schema_validated
             }
         }
+        if final_workflow_error:
+             final_result_data["error"] = final_workflow_error
+
+        run_logger.info("Declarative workflow finished.", status=final_workflow_status, teams_executed=total_teams_executed)
+        return final_result_data
 
     except Exception as e:
         error_msg = str(e)
-        ctx = get_run_context()
-        if ctx is not None and hasattr(ctx, "flow_run") and ctx.flow_run and hasattr(ctx.flow_run, "id"):
-            workflow_id = str(ctx.flow_run.id)
-        else:
-            workflow_id = "unknown"
-        logger.error("workflow.failed", 
-                   error=error_msg,
-                   workflow_id=workflow_id,
-                   project_path=str(project_path))
+        run_logger.error(f"Declarative workflow execution failed unexpectedly: {error_msg}", exc_info=True) # Log traceback
+        # Attempt to get run_id for error reporting
+        run_id_for_error = "unknown"
+        if config_info and hasattr(config_info, 'run_id'): run_id_for_error = config_info.run_id
+        elif 'initial_context' in locals() and isinstance(initial_context, dict):
+             run_id_for_error = initial_context.get('workflow_run_id', run_id_for_error)
+
         return {
             "status": "error",
             "error": error_msg,
-            "workflow_run_id": workflow_id,
-            "project_path": str(project_path),
-            "stage": "workflow",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "execution_metadata": {
-                "error": error_msg,
-                "error_type": type(e).__name__,
-                "workflow_run_id": workflow_id,
-                "timestamp": datetime.now(timezone.utc).isoformat()
+            "workflow_run_id": run_id_for_error,
+            "config_metadata": {
+                "snapshot_path": str(getattr(config_info, "snapshot_path", "unknown")) if config_info else "unknown"
             }
+        }
+
+# --- execute_team_subflow function ---
+@flow(name="execute_team")
+def execute_team_subflow(
+    team_id: str,
+    effective_config: Dict[str, Any],
+    current_context: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Execute a team's tasks as defined in the effective configuration.
+
+    Args:
+        team_id: ID of the team to execute
+        effective_config: The complete effective configuration snapshot
+        current_context: Current execution context
+
+    Returns:
+        Dict with team execution results
+    """
+    run_logger = get_run_logger()
+    task_results = [] # Initialize outside try block
+
+    try:
+        # Create config node for path-based access
+        config_node = create_config_node(effective_config)
+
+        # Look up team configuration in the effective config
+        team_config = config_node.get_value(f"orchestration.teams.{team_id}")
+        if not team_config or not isinstance(team_config, dict): # Check if dict
+            run_logger.error(f"Team configuration not found or invalid for team: {team_id}")
+            return {
+                "success": False,
+                "error": f"Team configuration not found or invalid: {team_id}",
+                "team_id": team_id,
+                "results": []
+            }
+
+        # Get the team's tasks list
+        tasks = team_config.get("tasks", [])
+        if not tasks:
+            run_logger.warning(f"No tasks defined for team: {team_id}")
+            # Return success if no tasks, as the team technically completed
+            return { "success": True, "team_id": team_id, "results": [], "task_count": 0 }
+
+
+        # Execute each task in sequence
+        for i, task_config_def in enumerate(tasks):
+            # Ensure task_config_def is a dictionary
+            if not isinstance(task_config_def, dict):
+                 run_logger.error(f"Invalid task definition format in team {team_id}, task index {i}", task_def=task_config_def)
+                 # Decide how to handle: skip task or fail team? Failing team seems safer.
+                 return { "success": False, "error": f"Invalid task definition at index {i} for team {team_id}", "team_id": team_id, "results": task_results }
+
+            task_name = task_config_def.get('name', f'unnamed_task_{i}')
+            run_logger.info(f"Executing task {i+1}/{len(tasks)}: {task_name}")
+
+            # Add task_config to context for factory creation
+            # Pass the specific task definition from the effective config
+            task_context = {**current_context, "task_config": task_config_def}
+
+            # Execute the task using run_agent_task
+            # Pass the full effective_config snapshot
+            result = run_agent_task(
+                task_config=task_config_def, # Pass the specific task definition
+                context=task_context,
+                effective_config=effective_config
+            )
+
+            task_results.append(result)
+
+            # Stop on failure if configured to do so
+            stop_on_fail = team_config.get("stop_on_failure", True)
+            if not result.get("success", False) and stop_on_fail:
+                run_logger.warning(f"Task {task_name} failed, stopping team sequence based on stop_on_failure=True.")
+                break # Stop processing further tasks in this team
+
+        # Determine overall team success (all tasks succeeded OR failures were allowed)
+        all_succeeded = all(r.get("success", False) for r in task_results)
+        team_success = all_succeeded or not team_config.get("stop_on_failure", True)
+
+        # Return comprehensive team results
+        return {
+            "success": team_success,
+            "team_id": team_id,
+            "results": task_results, # Contains results for each task executed
+            "task_count": len(tasks)
+        }
+
+    except Exception as e:
+        run_logger.error(f"Team execution failed unexpectedly for team {team_id}", error=str(e), exc_info=True) # Log traceback
+        return {
+            "success": False,
+            "error": f"Unexpected error in team {team_id}: {str(e)}",
+            "team_id": team_id,
+            "results": task_results # Include results up to the point of failure
         }
