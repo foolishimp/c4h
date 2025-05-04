@@ -79,7 +79,7 @@ def run_agent_task(
         prefect_logger.info(f"Using effective config snapshot for agent creation")
             
         # Create agent using factory - ONLY supported pattern
-        factory = AgentFactory(full_effective_config=effective_config)
+        factory = AgentFactory(effective_config)
         
         prefect_logger.info(f"Creating agent using factory: {task_config['agent_type']}, "
                            f"name={task_config['name']}")

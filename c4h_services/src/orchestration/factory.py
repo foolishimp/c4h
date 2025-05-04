@@ -36,22 +36,42 @@ class AgentFactory:
             The agent class that inherits from BaseAgent
         """
         try:
-            # Convert snake_case agent_type to CamelCase class name and module path
-            parts = agent_type.split('_')
-            agent_category = parts[0]  # e.g. 'generic'
+            # Hardcoded mapping instead of dynamic resolution to ensure we get the right classes
+            agent_type_map = {
+                "generic_single_shot": "c4h_agents.agents.generic.GenericSingleShotAgent",
+                "generic_orchestrating": "c4h_agents.agents.generic.GenericOrchestratingAgent"
+            }
             
-            # Build class name (e.g. 'GenericSingleShotAgent')
-            class_name = ''.join(part.capitalize() for part in parts) + 'Agent'
+            # Check if we have a known mapping for this agent type
+            if agent_type not in agent_type_map:
+                # Fall back to the original dynamic resolution
+                parts = agent_type.split('_')
+                agent_category = parts[0]  # e.g. 'generic'
+                
+                # Build class name (e.g. 'GenericSingleShotAgent')
+                class_name = ''.join(part.capitalize() for part in parts) + 'Agent'
+                
+                # Build import path (e.g. 'c4h_agents.agents.generic')
+                module_path = f"c4h_agents.agents.{agent_category}"
+                
+                logger.info("factory.resolving_agent_class_dynamic", 
+                            agent_type=agent_type,
+                            module_path=module_path, 
+                            class_name=class_name)
+                
+                # Import the class dynamically
+                return getattr(importlib.import_module(module_path), class_name)
             
-            # Build import path (e.g. 'c4h_agents.agents.generic')
-            module_path = f"c4h_agents.agents.{agent_category}"
+            # Use the hardcoded mapping
+            class_path = agent_type_map[agent_type]
+            module_path, class_name = class_path.rsplit(".", 1)
             
-            logger.info("factory.resolving_agent_class", 
+            logger.info("factory.resolving_agent_class_mapped", 
                         agent_type=agent_type,
                         module_path=module_path, 
                         class_name=class_name)
             
-            # Import the class dynamically
+            # Import the class using the mapping
             return getattr(importlib.import_module(module_path), class_name)
         
         except (ValueError, ImportError, AttributeError) as e:
@@ -82,8 +102,16 @@ class AgentFactory:
             agent_class = self._get_agent_class(agent_type)
             
             # Instantiate the agent with full effective config and unique name
+            # Pass the effective_config_snapshot as the first positional parameter (full_effective_config)
+            # and unique_name as the second positional parameter
             logger.info("factory.creating_agent", agent_type=agent_type, unique_name=unique_name)
-            return agent_class(full_effective_config=self.effective_config_snapshot, unique_name=unique_name)
+            
+            # Add debug print to see what's being called
+            print(f"DEBUG - Creating agent: {agent_class.__name__}({type(self.effective_config_snapshot).__name__}, {unique_name})")
+            
+            # Explicitly use positional arguments
+            agent = agent_class(self.effective_config_snapshot, unique_name)
+            return agent
             
         except Exception as e:
             logger.error("factory.agent_creation_failed", error=str(e))

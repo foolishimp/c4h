@@ -66,52 +66,79 @@ class BaseAgent(BaseConfig, BaseLLM):
         log_config_node(self.logger, self.config, "team.llm_config.agents", log_prefix=f"{agent_name}.init_received")
         log_config_node(self.logger, self.config, "llm_config.agents", log_prefix=f"{agent_name}.init_received")
 
-        # --- Step 7: Determine Agent's Config Path ---
-        # Use unique_name (agent_name) to find the config path within the snapshot
-        primary_agent_path = f"team.llm_config.agents.{agent_name}"
-        fallback_agent_path = f"llm_config.agents.{agent_name}"
-        self.config_path = primary_agent_path # Assume primary first
-        agent_config_subsection = self.config_node.get_value(primary_agent_path)
+        # --- Step 7: Use persona configuration directly ---
+        self.config_path = f"llm_config.agents.{agent_name}"
+        agent_config = self.config_node.get_value(self.config_path) or {}
+        
+        # Get persona_key from task config - required for this approach
+        self.persona_key = agent_config.get('persona_key')
+        
+        if not self.persona_key:
+            self.logger.error(f"{agent_name}.init.missing_persona_key", 
+                             agent_name=agent_name,
+                             config_path=self.config_path)
+            raise ValueError(f"Agent {agent_name} is missing required persona_key in configuration")
+        
+        # Set persona path - this is our primary configuration source
+        self.persona_path = f"llm_config.personas.{self.persona_key}"
+        
+        # Verify persona exists
+        persona_config = self.config_node.get_value(self.persona_path)
+        if not persona_config:
+            self.logger.error(f"{agent_name}.init.persona_not_found", 
+                             persona_key=self.persona_key, 
+                             persona_path=self.persona_path)
+            raise ValueError(f"Persona '{self.persona_key}' not found at {self.persona_path}")
+            
+        self.logger.info(f"{agent_name}.init.using_persona", 
+                       persona_key=self.persona_key, 
+                       persona_path=self.persona_path)
 
-        if not isinstance(agent_config_subsection, dict):
-            self.logger.debug(f"{agent_name}.init.primary_path_not_found", path=primary_agent_path)
-            agent_config_subsection = self.config_node.get_value(fallback_agent_path)
-            if isinstance(agent_config_subsection, dict):
-                 self.config_path = fallback_agent_path # Use fallback path
-                 self.logger.info(f"{agent_name}.init.using_fallback_config_path", path=self.config_path)
-            else:
-                 # If neither path yields a dict, log a warning. The agent might still function
-                 # if it relies only on global defaults or context, but specific settings are missing.
-                 self.logger.warning(f"{agent_name}.init.agent_specific_config_not_found",
-                                     primary_path=primary_agent_path,
-                                     fallback_path=fallback_agent_path)
-                 self.config_path = fallback_agent_path # Default to fallback path even if empty
-
-        # --- Step 8: Resolve Provider, Model, Temperature using self.config_node and self.config_path ---
-        # These values should exist in the snapshot due to merging/persona injection
-        self.provider = LLMProvider(self.config_node.get_value(f"{self.config_path}.provider") or \
-                                    self.config_node.get_value("llm_config.default_provider") or \
-                                    "anthropic") # Default if missing
-        self.model = self.config_node.get_value(f"{self.config_path}.model") or \
-                     self.config_node.get_value(f"llm_config.providers.{self.provider.value}.default_model") or \
-                     self.config_node.get_value("llm_config.default_model") or \
-                     "claude-3-opus-20240229" # Default if missing
-        temp_val = self.config_node.get_value(f"{self.config_path}.temperature")
+        # --- Step 8: Resolve Provider, Model, Temperature primarily from persona ---
+        # Use persona configuration as primary source with minimal fallbacks
+        self.provider = LLMProvider(
+            self.config_node.get_value(f"{self.persona_path}.provider") or \
+            self.config_node.get_value("llm_config.default_provider") or \
+            "anthropic"  # Ultimate fallback
+        )
+        
+        self.model = (
+            self.config_node.get_value(f"{self.persona_path}.model") or \
+            self.config_node.get_value(f"llm_config.providers.{self.provider.value}.default_model") or \
+            self.config_node.get_value("llm_config.default_model") or \
+            "claude-3-opus-20240229"  # Ultimate fallback
+        )
+        
+        # Temperature from persona
+        temp_val = self.config_node.get_value(f"{self.persona_path}.temperature")
         self.temperature = float(temp_val) if temp_val is not None else 0.0
 
         self.logger.debug(f"{agent_name}.init.resolved_settings",
-                          provider=self.provider.value, model=self.model, temp=self.temperature)
+                          provider=self.provider.value, 
+                          model=self.model, 
+                          temp=self.temperature,
+                          persona_key=self.persona_key)
 
-        # --- Step 9: Continuation settings ---
-        # Use self.config_node and self.config_path
-        self.max_continuation_attempts = self.config_node.get_value(f"{self.config_path}.max_continuation_attempts", default=5)
-        self.continuation_token_buffer = self.config_node.get_value(f"{self.config_path}.continuation_token_buffer", default=1000)
+        # --- Step 9: Continuation settings from persona ---
+        # Use persona config with defaults only as fallback
+        self.max_continuation_attempts = (
+            self.config_node.get_value(f"{self.persona_path}.max_continuation_attempts") or 5  # Default value
+        )
+        
+        self.continuation_token_buffer = (
+            self.config_node.get_value(f"{self.persona_path}.continuation_token_buffer") or 1000  # Default value
+        )
 
         # --- Step 10: Initialize metrics ---
         self.metrics = AgentMetrics(project=self.project.metadata.name if self.project else None)
 
-        # --- Step 11: Set logging detail level ---
-        log_level_str = self.config_node.get_value("logging.agent_level") or self.config_node.get_value("logging.level") or "basic"
+        # --- Step 11: Set logging detail level from persona ---
+        log_level_str = (
+            self.config_node.get_value(f"{self.persona_path}.log_level") or
+            self.config_node.get_value("logging.agent_level") or 
+            self.config_node.get_value("logging.level") or 
+            "basic"
+        )
         self.log_level = LogDetail.from_str(log_level_str)
 
         # --- Step 12: Setup LiteLLM ---
@@ -156,6 +183,8 @@ class BaseAgent(BaseConfig, BaseLLM):
 
         # --- Step 16: Final Log ---
         self.logger.info(f"{agent_name}.initialized",
+                     persona_key=self.persona_key,
+                     has_persona_config=bool(self.persona_path),
                      continuation_settings={
                          "max_attempts": self.max_continuation_attempts,
                          "token_buffer": self.continuation_token_buffer
@@ -539,18 +568,33 @@ class BaseAgent(BaseConfig, BaseLLM):
              return name or "base_agent"
 
     def _get_system_message(self) -> str:
-        # Use self.config_node which is initialized in BaseConfig
-        return self.config_node.get_value(f"{self.config_path}.prompts.system") or ""
+        """Get system message from persona config"""
+        # Get system prompt directly from persona
+        system_prompt = self.config_node.get_value(f"{self.persona_path}.prompts.system")
+                
+        if not system_prompt:
+            self.logger.warning("system_prompt.not_found", 
+                              persona_key=self.persona_key,
+                              persona_path=f"{self.persona_path}.prompts.system")
+                
+        return system_prompt or ""
 
 
     def _get_prompt(self, prompt_type: str) -> str:
-         # Use self.config_node which is initialized in BaseConfig
-        prompt_path = f"{self.config_path}.prompts.{prompt_type}"
-        prompt = self.config_node.get_value(prompt_path)
-        if prompt is None:  # Check explicitly for None
-             # Use self.logger which is initialized
-             self.logger.error("prompt.template_not_found", prompt_type=prompt_type, agent=self._get_agent_name())
-             raise ValueError(f"No prompt template found for type: {prompt_type} in agent {self._get_agent_name()}")
+        """Get a prompt template from persona"""
+        # Get prompt directly from persona configuration
+        persona_prompt_path = f"{self.persona_path}.prompts.{prompt_type}"
+        prompt = self.config_node.get_value(persona_prompt_path)
+            
+        if prompt is None:
+            # Use self.logger which is initialized
+            agent_name = self._get_agent_name()
+            self.logger.error("prompt.template_not_found", 
+                           prompt_type=prompt_type, 
+                           agent=agent_name,
+                           persona_path=persona_prompt_path)
+            raise ValueError(f"No prompt template '{prompt_type}' found in persona '{self.persona_key}' for agent {agent_name}")
+            
         # Ensure prompt is a string before returning
         return str(prompt) if prompt is not None else ""
 

@@ -32,15 +32,16 @@ class ConfigNode:
         self.data = data
         self.base_path = base_path
 
-    def get_value(self, path: str) -> Any:
+    def get_value(self, path: str, default: Any = None) -> Any:
         """
         Get value at specified path relative to this node.
         
         Args:
             path: Dot-delimited path string, may include wildcards (*)
+            default: Optional default value to return if path not found
             
         Returns:
-            Value at the path, or None if not found
+            Value at the path, or default value if not found
         """
         # Handle direct access
         if not path:
@@ -57,7 +58,7 @@ class ConfigNode:
                               matches=len(matches),
                               returning="first_match")
                 return matches[0][1]  # Return first match
-            return None
+            return default
             
         # Standard path access
         path_parts = path.split('.')
@@ -168,32 +169,33 @@ class ConfigNode:
 
 # Original functions enhanced to work with the new approach
 
-def get_by_path(data: Dict[str, Any], path: List[str]) -> Any:
+def get_by_path(data: Dict[str, Any], path: List[str], default: Any = None) -> Any:
     """
     Access dictionary data using a path list.
     
     Args:
         data: Dictionary to traverse
         path: List of keys forming the path
+        default: Optional default value to return if path not found
         
     Returns:
-        Value at path or None if not found
+        Value at path or default if not found
     """
     try:
         current = data
         for key in path:
             if isinstance(current, dict): # Check if current level is a dict
                 if key not in current:    # Check if key exists in dict
-                    return None
+                    return default
                 current = current[key]    # Move down one level
             else: # If not a dict, cannot traverse further
-                return None
+                return default
         return current
     except Exception as e:
         logger.error("config.path_access_failed", path=path, error=str(e))
-        return None
+        return default
 
-def get_value(data: Dict[str, Any], path_str: str) -> Any:
+def get_value(data: Dict[str, Any], path_str: str, default: Any = None) -> Any:
     """
     Access dictionary data using a hierarchical path string (e.g. "system.runid").
     Supports both dots (.) and slashes (/) as path separators.
@@ -201,9 +203,10 @@ def get_value(data: Dict[str, Any], path_str: str) -> Any:
     Args:
         data: Dictionary to traverse
         path_str: Delimited key path (using dots or slashes)
+        default: Optional default value to return if path not found
         
     Returns:
-        Value at the specified path or None if not found.
+        Value at the specified path or default if not found.
     """
     # Handle both dot and slash notation for backward compatibility
     if '/' in path_str:
@@ -211,7 +214,7 @@ def get_value(data: Dict[str, Any], path_str: str) -> Any:
     else:
         path_list = path_str.split('.')
         
-    return get_by_path(data, path_list)
+    return get_by_path(data, path_list, default)
 
 def locate_keys(data: Dict[str, Any], target_keys: List[str], current_path: List[str] = None) -> Dict[str, Tuple[Any, List[str]]]:
     """

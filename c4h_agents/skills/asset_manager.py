@@ -29,7 +29,10 @@ class AssetManager(BaseAgent):
     
     def __init__(self, config: Dict[str, Any] = None, **kwargs):
         """Initialize with basic config and backup settings"""
-        super().__init__(config=config)
+        # Pass positional parameters to BaseAgent
+        super().__init__(config, "asset_manager")
+        
+        # The unique_name is now stored by BaseAgent
         
         # Get project path from config if available
         self.project_path = None

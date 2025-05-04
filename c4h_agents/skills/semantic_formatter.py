@@ -23,7 +23,10 @@ class SemanticFormatter(BaseAgent):
     
     def __init__(self, config: Dict[str, Any] = None):
         """Initialize formatter with config."""
-        super().__init__(config=config)
+        # Pass positional parameters to BaseAgent
+        super().__init__(config, "semantic_formatter")
+        
+        # The unique_name is now stored by BaseAgent
 
     def _get_agent_name(self) -> str:
         return "semantic_formatter"

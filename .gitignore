@@ -59,3 +59,5 @@ tests/test_projects/project1/sample.py
 tests/test_projects/project2/main.py
 tests/test_projects/project2/utils.py
 tests/test_projects/project3/test_java.java
+
+**/.claude/settings.local.json

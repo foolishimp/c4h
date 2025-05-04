@@ -49,7 +49,10 @@ class FastExtractor(BaseAgent):
     """
 
     def __init__(self, config: Dict[str, Any] = None):
-        super().__init__(config=config)
+        # Pass positional parameters to BaseAgent
+        super().__init__(config, "semantic_fast_extractor")
+        
+        # The unique_name is now stored by BaseAgent
         fast_cfg = self._get_agent_config()
         logger.info("fast_extractor.initialized", settings=fast_cfg)
 

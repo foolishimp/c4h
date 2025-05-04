@@ -6,6 +6,8 @@ Path: c4h_agents/agents/generic.py
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
 import json
+import os
+import subprocess
 
 from c4h_agents.agents.base_agent import BaseAgent, AgentResponse
 from c4h_agents.agents.types import LLMMessages, LogDetail
@@ -28,22 +30,12 @@ class GenericSingleShotAgent(BaseAgent):
             unique_name: Unique instance name used for configuration path
         """
         # Initialize base agent with full config
-        super().__init__(config=full_effective_config)
+        super().__init__(full_effective_config, unique_name)
         
-        # Store unique name for path-based config access
-        self.unique_name = unique_name
+        # unique_name is already stored by BaseAgent constructor
         
-        # Determine configuration path
-        # First check primary path (team.llm_config) then fallback path
-        self.config_path = f"team.llm_config.agents.{unique_name}"
-        if not self.config_node.get_value(self.config_path):
-            self.config_path = f"llm_config.agents.{unique_name}"
-            # If still not found, log the issue but continue (we'll check later when needed)
-            if not self.config_node.get_value(self.config_path):
-                self.logger.warning("agent.config_not_found", 
-                                   unique_name=unique_name, 
-                                   primary_path=f"team.llm_config.agents.{unique_name}",
-                                   fallback_path=f"llm_config.agents.{unique_name}")
+        # Configuration path is already set by BaseAgent constructor
+        # BaseAgent handles checking both team.llm_config.agents.{unique_name} and llm_config.agents.{unique_name} paths
         
         self.logger = self.logger.bind(agent_name=self.unique_name, config_path=self.config_path)
         self.logger.info("generic_agent.initialized", agent_type="GenericSingleShotAgent")
@@ -53,31 +45,112 @@ class GenericSingleShotAgent(BaseAgent):
         return self.unique_name
 
     def _get_system_message(self) -> str:
-        """Get system message from path-addressable config."""
-        system_prompt = self.config_node.get_value(f"{self.config_path}.prompts.system")
-        if not system_prompt:
-            self.logger.warning("system_prompt.not_found", path=f"{self.config_path}.prompts.system")
-            return ""
-        return system_prompt
+        """Get system message from path-addressable config with persona fallback."""
+        # Use BaseAgent's implementation which now includes persona fallback
+        return super()._get_system_message()
 
     def _format_request(self, context: Dict[str, Any]) -> str:
         """
-        Format user request based on path-addressable config.
+        Format user request based on path-addressable config with persona fallback.
         
         This method:
-        1. Gets the prompt template specified in config
+        1. Gets the prompt template specified in config or persona
         2. Formats it using context variables
         3. Returns the formatted prompt
-        """
-        # Get the prompt template name from config or use "user" as default
-        template_name = self.config_node.get_value(f"{self.config_path}.prompts.template_name") or "user"
         
-        # Get the prompt template
-        template = self.config_node.get_value(f"{self.config_path}.prompts.{template_name}")
+        Special handling for discovery agent:
+        - If this is a discovery agent and tartxt_config is present,
+          run the tartxt.py script to gather project information
+        """
+        # Check if this is a discovery agent with tartxt config
+        if (self.unique_name == "discovery_phase" or 
+            self.config_path.endswith(".discovery") or 
+            "discovery" in self.unique_name):
+            
+            # Get tartxt_config directly from persona
+            tartxt_config = self.config_node.get_value(f"{self.persona_path}.tartxt_config")
+            
+            if tartxt_config and isinstance(tartxt_config, dict):
+                self.logger.info("discovery.tartxt_config_found", 
+                               config_keys=list(tartxt_config.keys()),
+                               persona_key=self.persona_key)
+                
+                # Get script path
+                script_path = tartxt_config.get("script_path")
+                if script_path and os.path.exists(script_path):
+                    # Get project path from context
+                    project_path = context.get("project_path")
+                    if not project_path:
+                        self.logger.warning("discovery.no_project_path_in_context")
+                        project_path = os.getcwd()
+                    
+                    # Get exclusions
+                    exclusions = tartxt_config.get("exclusions", [])
+                    exclusion_arg = ",".join(exclusions) if exclusions else ""
+                    
+                    # Create output file path
+                    output_file = os.path.join(os.getcwd(), "workspaces", f"project_scan_{self.run_id}.txt")
+                    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+                    
+                    # Build command
+                    cmd = [
+                        script_path,
+                        project_path,
+                        "-f", output_file,
+                        "-H", "0"  # No history initially for speed
+                    ]
+                    
+                    if exclusion_arg:
+                        cmd.extend(["-x", exclusion_arg])
+                    
+                    # Run tartxt.py
+                    self.logger.info("discovery.running_tartxt", cmd=cmd)
+                    try:
+                        import subprocess
+                        result = subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            text=True,
+                            check=False
+                        )
+                        
+                        if result.returncode != 0:
+                            self.logger.error("discovery.tartxt_failed", 
+                                            returncode=result.returncode,
+                                            stderr=result.stderr)
+                        else:
+                            self.logger.info("discovery.tartxt_success", output_file=output_file)
+                            
+                            # Read output file and add to context
+                            try:
+                                if os.path.exists(output_file):
+                                    with open(output_file, 'r', encoding='utf-8') as f:
+                                        project_content = f.read()
+                                    
+                                    # Update context with project content
+                                    context['project_content'] = project_content
+                                    context['project_scan_file'] = output_file
+                                    self.logger.info("discovery.added_project_content", 
+                                                  content_length=len(project_content))
+                                else:
+                                    self.logger.error("discovery.output_file_not_found", file=output_file)
+                            except Exception as e:
+                                self.logger.error("discovery.read_output_failed", error=str(e))
+                    except Exception as e:
+                        self.logger.error("discovery.tartxt_execution_failed", error=str(e))
+        
+        # Continue with standard prompt template handling directly from persona
+        # Get the prompt template name from persona configuration or use "user" as default
+        template_name = self.config_node.get_value(f"{self.persona_path}.prompts.template_name") or "user"
+        
+        # Get the prompt template from persona
+        template = self.config_node.get_value(f"{self.persona_path}.prompts.{template_name}")
+                
         if not template:
             self.logger.warning("prompt_template.not_found", 
                               template_name=template_name,
-                              path=f"{self.config_path}.prompts.{template_name}")
+                              persona_key=self.persona_key,
+                              persona_path=f"{self.persona_path}.prompts.{template_name}")
             # Fallback to simple JSON string if template not found
             return json.dumps(context, indent=2)
         
@@ -132,20 +205,12 @@ class GenericOrchestratingAgent(BaseAgent):
             unique_name: Unique instance name used for configuration path
         """
         # Initialize base agent with full config
-        super().__init__(config=full_effective_config)
+        super().__init__(full_effective_config, unique_name)
         
-        # Store unique name for path-based config access
-        self.unique_name = unique_name
+        # unique_name is already stored by BaseAgent constructor
         
-        # Determine configuration path
-        self.config_path = f"team.llm_config.agents.{unique_name}"
-        if not self.config_node.get_value(self.config_path):
-            self.config_path = f"llm_config.agents.{unique_name}"
-            if not self.config_node.get_value(self.config_path):
-                self.logger.warning("agent.config_not_found", 
-                                   unique_name=unique_name, 
-                                   primary_path=f"team.llm_config.agents.{unique_name}",
-                                   fallback_path=f"llm_config.agents.{unique_name}")
+        # Configuration path is already set by BaseAgent constructor
+        # BaseAgent handles checking both team.llm_config.agents.{unique_name} and llm_config.agents.{unique_name} paths
         
         self.logger = self.logger.bind(agent_name=self.unique_name, config_path=self.config_path)
         self.logger.info("generic_agent.initialized", agent_type="GenericOrchestratingAgent")
@@ -163,14 +228,17 @@ class GenericOrchestratingAgent(BaseAgent):
         """
         self.logger.info("orchestration.start", context_keys=list(context.keys()))
         
-        # Get execution plan from config
-        execution_plan = self.config_node.get_value(f"{self.config_path}.execution_plan")
+        # Get execution plan directly from persona config
+        execution_plan = self.config_node.get_value(f"{self.persona_path}.execution_plan")
+        
         if not execution_plan:
-            self.logger.error("execution_plan.not_found", path=f"{self.config_path}.execution_plan")
+            self.logger.error("execution_plan.not_found", 
+                            persona_key=self.persona_key,
+                            persona_path=f"{self.persona_path}.execution_plan")
             return AgentResponse(
                 success=False,
                 data={},
-                error=f"No execution plan found at {self.config_path}.execution_plan"
+                error=f"No execution plan found in persona '{self.persona_key}'"
             )
         
         # Execute the plan

@@ -23,7 +23,10 @@ class ExtractResult:
 class SemanticExtract(BaseAgent):
     def __init__(self, config: Dict[str, Any] = None):
         """Initialize extractor with config."""
-        super().__init__(config=config)
+        # Pass positional parameters to BaseAgent
+        super().__init__(config, "semantic_extract")
+        
+        # The unique_name is now stored by BaseAgent
 
     def _get_agent_name(self) -> str:
         return "semantic_extract"

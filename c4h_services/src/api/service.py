@@ -1,7 +1,5 @@
-"""
-API service implementation with enhanced configuration handling and multi-config support.
-Path: c4h_services/src/api/service.py
-"""
+# File: /Users/jim/src/apps/c4h_ai_dev/c4h_services/src/api/service.py
+# Correction: Removed module-level config loading and app instantiation
 
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
@@ -26,16 +24,17 @@ from c4h_services.src.orchestration.orchestrator import Orchestrator
 from c4h_services.src.utils.lineage_utils import load_lineage_file, prepare_context_from_lineage
 
 # --- Logger Setup ---
-logger = get_logger()
+logger = get_logger() # Initialize logger at module level is fine
 
-# --- Global State / Storage ---
+# --- Global State / Storage (Okay at module level) ---
 workflow_storage: Dict[str, Dict[str, Any]] = {}
 job_storage: Dict[str, Dict[str, Any]] = {}
 job_to_workflow_map: Dict[str, str] = {}
-system_config_path = Path("config/system_config.yml")
+# Define the default path, but don't load it here
+system_config_path_default = Path("config/system_config.yml")
 
-# --- Helper Functions (Moved Before Endpoints) ---
-
+# --- Helper Functions ---
+# ... (map_job_to_workflow_request, extract_from_merged_config, map_workflow_to_job_changes remain the same) ...
 def map_job_to_workflow_request(job_request: JobRequest) -> WorkflowRequest:
     """
     Map JobRequest to WorkflowRequest format.
@@ -121,23 +120,23 @@ def extract_from_merged_config(merged_config: Dict[str, Any]) -> WorkflowRequest
     """
     Extract necessary fields from a merged configuration and create a WorkflowRequest.
     This function handles the extraction step after all configs have been merged.
-    
+
     Args:
         merged_config: The fully merged configuration dictionary
-        
+
     Returns:
         WorkflowRequest object with properly mapped fields
     """
     try:
         # Create a config node for easier path-based access
         config_node = create_config_node(merged_config)
-        
+
         # Extract project path - first check common paths
         project_path = config_node.get_value("project.path")
         if not project_path:
             # Fallback to workorder path
             project_path = config_node.get_value("workorder.project.path")
-            
+
         if not project_path:
             logger.warning("config_extraction.missing_project_path", config_keys=list(merged_config.keys()))
             raise ValueError("Required field 'project_path' not found in configuration")
@@ -147,7 +146,7 @@ def extract_from_merged_config(merged_config: Dict[str, Any]) -> WorkflowRequest
         if not intent_dict:
             # Fallback to workorder intent
             intent_dict = config_node.get_value("workorder.intent")
-        
+
         if not intent_dict:
             logger.warning("config_extraction.missing_intent", config_keys=list(merged_config.keys()))
             raise ValueError("Required field 'intent' not found in configuration")
@@ -163,17 +162,17 @@ def extract_from_merged_config(merged_config: Dict[str, Any]) -> WorkflowRequest
             lineage_file = runtime_config.get("lineage_file")
             stage = runtime_config.get("stage")
             keep_runid = runtime_config.get("keep_runid", True)
-        
+
         # Create the workflow request
         workflow_request = WorkflowRequest(
             project_path=project_path,
             intent=intent_dict,
-            app_config=merged_config,
+            app_config=merged_config, # Pass the full merged config as app_config
             lineage_file=lineage_file,
             stage=stage,
             keep_runid=keep_runid
         )
-        
+
         logger.debug("config.extraction_complete",
                     project_path=project_path,
                     has_intent=bool(intent_dict),
@@ -182,7 +181,7 @@ def extract_from_merged_config(merged_config: Dict[str, Any]) -> WorkflowRequest
                     stage=stage)
 
         return workflow_request
-    
+
     except Exception as e:
         logger.error("config.extraction_failed", error=str(e), error_type=type(e).__name__)
         raise ValueError(f"Failed to extract workflow request from merged configuration: {str(e)}")
@@ -268,13 +267,14 @@ def map_workflow_to_job_changes(workflow_data: Dict[str, Any]) -> List[Dict[str,
                   error_type=type(e).__name__) # cite: 1788
         return []
 
-# --- FastAPI App Creation ---
 
-def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
+# --- FastAPI App Creation Function ---
+
+def create_app(config: Dict[str, Any]) -> FastAPI: # Changed signature: now requires config
     """
     Create FastAPI application with team-based orchestration.
     Args:
-        default_config: Optional base configuration for the service
+        config: The fully loaded and merged configuration for this app instance.
 
     Returns:
         Configured FastAPI application
@@ -282,209 +282,204 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
     app = FastAPI(
         title="C4H Workflow Service",
         description="API for executing C4H team-based workflows",
-        version="0.2.0"
+        version="0.2.1" # Incremented version
     )
 
-    # Store default config in app state
-    app.state.default_config = default_config or {}
-    app.state.system_config_path = system_config_path # cite: 1671
+    # Store the provided config in app state
+    app.state.config = config
+    # Store the default system config path for reference if needed (e.g., by merge endpoint)
+    app.state.system_config_path_default = system_config_path_default
 
-    # Create orchestrator
-    app.state.orchestrator = Orchestrator(app.state.default_config) # cite: 1674
-    logger.info("api.team_orchestration_initialized",
-               teams=len(app.state.orchestrator.teams)) # cite: 1674
+    # Create orchestrator using the provided config
+    app.state.orchestrator = Orchestrator(app.state.config)
+    logger.info("api.orchestrator_initialized_with_config",
+               teams=len(app.state.orchestrator.teams))
 
-    # Align 'api.requests' logger (if necessary, see previous explanation)
+    # Configure API logger
     api_logger = logging.getLogger("api.requests")
-    api_logger.setLevel(logging.DEBUG) # cite: 1676
-    api_logger.propagate = True # cite: 1677
+    # Set level based on main config if available
+    log_level_str = app.state.config.get("logging", {}).get("level", "INFO").upper()
+    log_level = getattr(logging, log_level_str, logging.INFO)
+    api_logger.setLevel(log_level)
+    api_logger.propagate = True # Propagate to main logger setup by get_logger
 
+    # --- run_workflow and get_workflow functions remain the same ---
+    # They will use the orchestrator stored in app.state which was initialized
+    # with the config passed to create_app.
     async def run_workflow(request: WorkflowRequest):
         """
         Execute a team-based workflow with the provided configuration.
-        Configuration from the request is merged with the default configuration.
+        Configuration from the request is merged with the app's base configuration.
         """
         try:
-            # --- Start with a clean copy of the app's default config ---
-            # This prevents mutation of the shared app.state.default_config
-            config = deepcopy(app.state.default_config)
+            # --- Start with a clean copy of the app's config ---
+            # This prevents mutation of the shared app.state.config
+            # The orchestrator was already initialized with this config.
+            current_run_config = deepcopy(app.state.config)
 
             # --- Merge system_config and app_config from the request ---
-            # Note: WorkflowRequest model expects system_config and app_config separately,
-            # but in the multi-config flow, they are already part of the single app_config.
-            # For direct WorkflowRequest calls, we maintain this merge logic.
+            # This allows overriding parts of the config for a specific run
             if request.system_config:
-                 config = deep_merge(config, request.system_config)
+                 current_run_config = deep_merge(current_run_config, request.system_config)
             if request.app_config:
-                 config = deep_merge(config, request.app_config) # cite: 1679
+                 current_run_config = deep_merge(current_run_config, request.app_config)
 
             # Check if lineage file is provided for workflow continuation
             if request.lineage_file and request.stage:
                 logger.info("workflow.continuing_from_lineage",
-                            lineage_file=request.lineage_file, # cite: 1680
+                            lineage_file=request.lineage_file,
                             stage=request.stage,
                             keep_runid=request.keep_runid)
 
                 try:
-                    # Load lineage data
-                    lineage_data = load_lineage_file(request.lineage_file) # cite: 1681
+                    lineage_data = load_lineage_file(request.lineage_file)
 
-                    # Add intent to config for context preparation
-                    if request.intent:
-                        config['intent'] = request.intent
-
-                    # Add project path to config if provided
+                    # Add intent and project path to the config used for context prep
+                    temp_config_for_context = current_run_config.copy()
+                    if request.intent: temp_config_for_context['intent'] = request.intent
                     if request.project_path:
-                        if 'project' not in config:
-                            config['project'] = {} # cite: 1683
-                        config['project']['path'] = request.project_path
+                        if 'project' not in temp_config_for_context: temp_config_for_context['project'] = {}
+                        temp_config_for_context['project']['path'] = request.project_path
 
-                    # Prepare context from lineage with keep_runid flag from request
                     context = prepare_context_from_lineage(
-                         lineage_data, # cite: 1684
+                         lineage_data,
                          request.stage,
-                         config,
-                         keep_runid=request.keep_runid # cite: 1684
+                         temp_config_for_context, # Use temp config here
+                         keep_runid=request.keep_runid
                     )
+                    workflow_id = context["workflow_run_id"]
 
-                    # Get workflow ID
-                    workflow_id = context["workflow_run_id"] # cite: 1685
+                    # --- Re-initialize orchestrator for this specific run with potentially modified config ---
+                    # This ensures the lineage continuation uses the correct merged config
+                    current_orchestrator = Orchestrator(current_run_config)
 
-                    # --- Reload orchestrator with potentially modified config ---
-                    # If config was updated (e.g., by prepare_context_from_lineage),
-                    # ensure orchestrator uses the latest version for this execution.
-                    current_orchestrator = Orchestrator(config)
+                    # Pass the fully prepared config (including lineage overrides) in the context
+                    context["config"] = current_run_config
 
-                    # Execute workflow from the specified stage
                     result = current_orchestrator.execute_workflow(
-                         entry_team=request.stage, # cite: 1686
+                         entry_team=request.stage,
                          context=context
                     )
 
-                    # Store result
+                    # Store result using the final workflow_id
                     workflow_storage[workflow_id] = {
-                         "status": result.get("status", "error"), # cite: 1687
+                         "status": result.get("status", "error"),
                          "team_results": result.get("team_results", {}),
-                         "changes": result.get("data", {}).get("changes", []), # cite: 1687
-                         "storage_path": os.path.join("workspaces", "lineage", workflow_id) if config.get("runtime", {}).get("lineage", {}).get("enabled", False) else None, # cite: 1688 (logic adjusted for runtime)
-                         "source_lineage": request.lineage_file, # cite: 1688
+                         "changes": result.get("data", {}).get("changes", []),
+                         "storage_path": os.path.join("workspaces", "lineage", workflow_id) if current_run_config.get("runtime", {}).get("lineage", {}).get("enabled", False) else None,
+                         "source_lineage": request.lineage_file,
                          "stage": request.stage
                     }
 
                     return WorkflowResponse(
-                        workflow_id=workflow_id, # cite: 1689
+                        workflow_id=workflow_id,
                         status=result.get("status", "error"),
-                        storage_path=workflow_storage[workflow_id].get("storage_path"), # cite: 1689
-                        error=result.get("error") if result.get("status") == "error" else None # cite: 1690
+                        storage_path=workflow_storage[workflow_id].get("storage_path"),
+                        error=result.get("error") if result.get("status") == "error" else None
                     )
 
                 except Exception as e:
                      logger.error("workflow.lineage_processing_failed",
                                lineage_file=request.lineage_file,
-                               stage=request.stage, # cite: 1691
-                               error=str(e))
+                               stage=request.stage,
+                               error=str(e), exc_info=True)
                      raise HTTPException(status_code=500, detail=f"Lineage processing failed: {str(e)}")
 
             # --- Standard workflow initialization ---
-            # Use the already merged config from the start of this function
-            # Initialize workflow with consistent defaults using the merged config
-            prepared_config, context = app.state.orchestrator.initialize_workflow( # Use the main orchestrator instance
+            # Use the main orchestrator instance initialized with app's config
+            # initialize_workflow uses the config passed to it (current_run_config)
+            prepared_config, context = app.state.orchestrator.initialize_workflow(
                 project_path=request.project_path,
                 intent_desc=request.intent,
-                config=config # Pass the config merged at the start
+                config=current_run_config # Pass the potentially overridden config
             )
+            workflow_id = context["workflow_run_id"]
 
-            workflow_id = context["workflow_run_id"] # cite: 1693
-
-            # Store intent in config (if not already there from merge)
+            # Ensure intent is in the prepared_config
             if 'intent' not in prepared_config:
                 prepared_config['intent'] = request.intent
 
-            # Log workflow start
             logger.info("workflow.starting",
                         workflow_id=workflow_id,
-                        project_path=request.project_path, # cite: 1694
-                        config_keys=list(prepared_config.keys())) # cite: 1694
+                        project_path=request.project_path,
+                        config_keys=list(prepared_config.keys()))
 
-            # --- Ensure Orchestrator uses the latest config for THIS execution ---
             # Pass the fully prepared config in the context
-            # The orchestrator's execute_workflow method should ideally use the config from the context
             context["config"] = prepared_config
 
             try:
-                # Get entry team from config or use default
-                entry_team = prepared_config.get("orchestration", {}).get("entry_team", "discovery") # cite: 1695
+                entry_team = prepared_config.get("orchestration", {}).get("entry_team", "discovery")
 
-                # Execute workflow using the main orchestrator instance but provide the up-to-date context/config
+                # Execute using the main orchestrator instance, but pass the prepared context
+                # which contains the potentially run-specific prepared_config
                 result = app.state.orchestrator.execute_workflow(
                     entry_team=entry_team,
-                    context=context # Pass context containing the prepared_config
-                ) # cite: 1696
+                    context=context
+                )
 
-                # Store result
                 workflow_storage[workflow_id] = {
                     "status": result.get("status", "error"),
-                    "team_results": result.get("team_results", {}), # cite: 1697
+                    "team_results": result.get("team_results", {}),
                     "changes": result.get("data", {}).get("changes", []),
-                    "storage_path": os.path.join("workspaces", "lineage", workflow_id) if prepared_config.get("runtime", {}).get("lineage", {}).get("enabled", False) else None # cite: 1697 (logic adjusted)
+                    "storage_path": os.path.join("workspaces", "lineage", workflow_id) if prepared_config.get("runtime", {}).get("lineage", {}).get("enabled", False) else None
                 }
 
                 return WorkflowResponse(
-                     workflow_id=workflow_id, # cite: 1698
+                     workflow_id=workflow_id,
                      status=result.get("status", "error"),
-                     storage_path=workflow_storage[workflow_id].get("storage_path"), # cite: 1698
+                     storage_path=workflow_storage[workflow_id].get("storage_path"),
                      error=result.get("error") if result.get("status") == "error" else None
                 )
 
             except Exception as e:
                 logger.error("workflow.execution_failed",
                         workflow_id=workflow_id,
-                        error=str(e)) # cite: 1699
+                        error=str(e), exc_info=True)
 
                 workflow_storage[workflow_id] = {
-                     "status": "error", # cite: 1700
+                     "status": "error",
                      "error": str(e),
                      "storage_path": None
                 }
 
                 return WorkflowResponse(
-                     workflow_id=workflow_id, # cite: 1701
+                     workflow_id=workflow_id,
                      status="error",
                      error=str(e)
                 )
 
         except Exception as e:
-            logger.error("workflow.request_failed", error=str(e)) # cite: 1701
+            logger.error("workflow.request_failed", error=str(e), exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
     async def get_workflow(workflow_id: str):
         """Get workflow status and results"""
         if workflow_id in workflow_storage:
-            data = workflow_storage[workflow_id] # cite: 1702
+            data = workflow_storage[workflow_id]
             return WorkflowResponse(
                 workflow_id=workflow_id,
                 status=data.get("status", "unknown"),
-                storage_path=data.get("storage_path"), # cite: 1703
-                error=data.get("error") # cite: 1703
+                storage_path=data.get("storage_path"),
+                error=data.get("error")
             )
         else:
             raise HTTPException(status_code=404, detail="Workflow not found")
 
-    # --- API Endpoints ---
 
+    # --- API Endpoints ---
     @app.get("/health")
     async def health_check():
-        """Simple health check endpoint"""
+        # ... (health check remains the same) ...
         return {
             "status": "healthy",
-            "workflows_tracked": len(workflow_storage), # cite: 1704
-            "teams_available": len(app.state.orchestrator.teams) # cite: 1704
+            "workflows_tracked": len(workflow_storage),
+            "jobs_tracked": len(job_storage),
+            "teams_available": len(app.state.orchestrator.teams)
         }
 
-
     @app.post("/api/v1/jobs", response_model=JobResponse)
-    async def create_job(request: JobRequestUnion): # Use JobRequestUnion
-        # ... (initialization code: job_id, merged_config, etc.) ...
+    async def create_job(request: JobRequestUnion):
+        # ... (create_job logic remains the same, it calls run_workflow) ...
         job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}"
         merged_config = None
         project_path = None
@@ -492,86 +487,71 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
         workflow_request = None
 
         try:
-            # ... (code to handle request type: MultiConfigJobRequest or JobRequest) ...
-
             if isinstance(request, MultiConfigJobRequest):
                 logger.info("jobs.multi_config_request_received",
                         job_id=job_id,
                         configs_count=len(request.configs))
 
-                for i, frag in enumerate(request.configs):
-                    logger.debug("jobs.config_fragment_received",
-                                job_id=job_id,
-                                fragment_index=i,
-                                fragment_keys=list(frag.keys()))
-
-                base_config = getattr(app.state, 'default_config', {})
+                # Start with a deep copy of the default config from app state
+                base_config = deepcopy(app.state.config) # Use app state config
                 if not isinstance(base_config, dict):
-                    logger.warning("Default config is not a dictionary, starting merge with empty dict.", job_id=job_id)
+                    logger.warning("App state config is not a dictionary, starting merge with empty dict.", job_id=job_id)
                     base_config = {}
-                merged_config = base_config.copy()
+                merged_config = base_config
 
-                # --- CORRECTED MERGE ORDER ---
+                # Merge fragments onto the base config
                 for i, config_fragment in enumerate(request.configs):
                     logger.debug("jobs.merging_fragment", job_id=job_id, fragment_index=i, fragment_keys=list(config_fragment.keys()))
                     merged_config = deep_merge(merged_config, config_fragment)
-                # --- END CORRECTION ---
 
-                # --- REPLACE previous full structure log with calls to log_config_node ---
                 log_config_node(logger, merged_config, "workorder", log_prefix=f"jobs.final_merged.{job_id}")
-                log_config_node(logger, merged_config, "team.llm_config.agents.solution_designer", log_prefix=f"jobs.final_merged.{job_id}")
-                # Optionally log the path the agent *expects* to find config at, for comparison:
-                log_config_node(logger, merged_config, "llm_config.agents.solution_designer", log_prefix=f"jobs.final_merged.{job_id}")
-                log_config_node(logger, merged_config, "team.llm_config.agents.discovery.tartxt_config", log_prefix=f"jobs.final_merged.{job_id}")
-                # --- END REPLACEMENT ---
+                log_config_node(logger, merged_config, "team", log_prefix=f"jobs.final_merged.{job_id}")
+                log_config_node(logger, merged_config, "runtime", log_prefix=f"jobs.final_merged.{job_id}")
+                log_config_node(logger, merged_config, "llm_config.agents", log_prefix=f"jobs.final_merged.{job_id}")
 
                 logger.debug("jobs.configs_merged",
                         job_id=job_id,
                         merged_config_keys=list(merged_config.keys()))
 
-                # --- NEW: Extract fields from the merged config ---
                 try:
                     workflow_request = extract_from_merged_config(merged_config)
-                    logger.info("jobs.workflow_request_created_from_merged_config", 
-                               job_id=job_id, 
+                    logger.info("jobs.workflow_request_created_from_merged_config",
+                               job_id=job_id,
                                project_path=workflow_request.project_path,
                                has_intent=bool(workflow_request.intent))
+                    project_path = workflow_request.project_path
+                    intent = workflow_request.intent
                 except Exception as e:
-                    logger.error("jobs.extract_from_merged_config_failed", 
-                               job_id=job_id, 
-                               error=str(e), 
-                               error_type=type(e).__name__, 
-                               exc_info=True)
+                    logger.error("jobs.extract_from_merged_config_failed",
+                               job_id=job_id, error=str(e), error_type=type(e).__name__, exc_info=True)
                     raise HTTPException(status_code=400, detail=f"Invalid merged configuration: {str(e)}")
 
-
             elif isinstance(request, JobRequest):
-                # ... (handling for traditional JobRequest - Ensure logging replacement happens here too if applicable) ...
                 logger.info("jobs.traditional_request_received",
                         job_id=job_id, project_path=request.workorder.project.path,
                         has_team_config=request.team is not None, has_runtime_config=request.runtime is not None)
                 try:
-                    # map_job_to_workflow_request essentially performs the merge for the traditional request
                     workflow_request = map_job_to_workflow_request(request)
                     project_path = workflow_request.project_path
                     intent = workflow_request.intent
-                    merged_config = workflow_request.app_config # Get the merged config resulting from mapping
+                    merged_config = workflow_request.app_config
 
-                    # --- Log specific nodes for the traditional request's merged config ---
                     log_config_node(logger, merged_config, "workorder", log_prefix=f"jobs.mapped.{job_id}")
-                    log_config_node(logger, merged_config, "team.llm_config.agents.solution_designer", log_prefix=f"jobs.mapped.{job_id}")
-                    log_config_node(logger, merged_config, "llm_config.agents.solution_designer", log_prefix=f"jobs.mapped.{job_id}")
-                    # --- End logging ---
+                    log_config_node(logger, merged_config, "team", log_prefix=f"jobs.mapped.{job_id}")
+                    log_config_node(logger, merged_config, "runtime", log_prefix=f"jobs.mapped.{job_id}")
 
                     logger.debug("jobs.request_mapped", job_id=job_id, workflow_request_keys=list(workflow_request.dict().keys()))
                 except Exception as e:
-                    logger.error("jobs.request_mapping_failed", job_id=job_id, error=str(e))
+                    logger.error("jobs.request_mapping_failed", job_id=job_id, error=str(e), exc_info=True)
                     raise HTTPException(status_code=400, detail=f"Invalid job configuration: {str(e)}")
             else:
                 logger.error("jobs.unknown_request_type", job_id=job_id, request_type=type(request).__name__)
                 raise HTTPException(status_code=400, detail="Unknown job request format")
 
-            # ... (rest of the function: pre_run_workflow_check, run_workflow call, response handling, job storage) ...
+            if not workflow_request:
+                 logger.error("jobs.workflow_request_creation_failed", job_id=job_id)
+                 raise HTTPException(status_code=500, detail="Internal error: Failed to create workflow request")
+
             logger.debug("jobs.pre_run_workflow_check",
                         job_id=job_id,
                         wf_request_type=type(workflow_request).__name__,
@@ -580,13 +560,19 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
                         wf_req_app_config_keys=list(getattr(workflow_request, 'app_config', {}).keys()))
 
             try:
+                # Update workflow_request's app_config to ensure it uses the final merged version
+                workflow_request.app_config = merged_config
                 workflow_response = await run_workflow(workflow_request)
                 logger.info("jobs.workflow_executed",
                         job_id=job_id, workflow_id=workflow_response.workflow_id,
                         status=workflow_response.status)
             except Exception as e:
-                logger.error("jobs.workflow_execution_failed", job_id=job_id, error=str(e))
+                logger.error("jobs.workflow_execution_failed", job_id=job_id, error=str(e), exc_info=True)
                 error_detail = f"Workflow execution failed: {str(e)}"
+                job_storage[job_id] = {
+                    "status": "error", "error": error_detail, "created_at": datetime.now().isoformat(),
+                    "workflow_id": None, "project_path": project_path, "last_updated": datetime.now().isoformat()
+                }
                 raise HTTPException(status_code=500, detail=error_detail)
 
             job_response = JobResponse(
@@ -596,20 +582,13 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
                 error=workflow_response.error
             )
 
-            final_project_path = project_path
-            if final_project_path is None and hasattr(workflow_request, 'project_path'):
-                final_project_path = workflow_request.project_path
-                
-            if final_project_path is None:
-                logger.warning("Could not determine project_path for final job storage", job_id=job_id)
-
             job_storage[job_id] = {
                 "status": workflow_response.status,
                 "storage_path": workflow_response.storage_path,
                 "error": workflow_response.error,
                 "created_at": datetime.now().isoformat(),
                 "workflow_id": workflow_response.workflow_id,
-                "project_path": final_project_path,
+                "project_path": project_path,
                 "last_updated": datetime.now().isoformat()
             }
             job_to_workflow_map[job_id] = workflow_response.workflow_id
@@ -623,153 +602,99 @@ def create_app(default_config: Dict[str, Any] = None) -> FastAPI:
         except HTTPException:
             raise
         except Exception as e:
-            logger.error("jobs.creation_failed", job_id=job_id, error=str(e), error_type=type(e).__name__)
-            logger.error(f"Top-level exception in create_job {job_id}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Job creation failed: {str(e)}")
+            logger.error("jobs.creation_failed_unexpected", job_id=job_id, error=str(e), error_type=type(e).__name__, exc_info=True)
+            job_storage[job_id] = {
+                "status": "error", "error": f"Unexpected job creation error: {str(e)}",
+                "created_at": datetime.now().isoformat(), "workflow_id": None,
+                "project_path": project_path, "last_updated": datetime.now().isoformat()
+            }
+            raise HTTPException(status_code=500, detail=f"Job creation failed unexpectedly: {str(e)}")
 
 
     @app.get("/api/v1/jobs/{job_id}", response_model=JobStatus)
     async def get_job_status(job_id: str):
-        """
-        Get status of a job.
-        Retrieves the workflow status and maps it to job status format.
-        Args:
-            job_id: Unique identifier for the job
-
-        Returns:
-            JobStatus with current status, changes, and error information
-        """
+        # ... (get_job_status remains the same) ...
         try:
-            # Check if job exists
             if job_id not in job_storage:
-                logger.error("jobs.not_found", job_id=job_id) # cite: 1740
+                logger.error("jobs.not_found", job_id=job_id)
                 raise HTTPException(status_code=404, detail="Job not found")
 
-            # Get workflow ID from mapping
-            workflow_id = job_to_workflow_map.get(job_id) # cite: 1740
+            workflow_id = job_to_workflow_map.get(job_id)
             if not workflow_id:
-                logger.error("jobs.workflow_mapping_missing", job_id=job_id)
-                raise HTTPException(status_code=404, detail="No workflow found for this job") # cite: 1741
-
-            logger.info("jobs.status_request",
+                logger.warning("jobs.workflow_mapping_missing_using_stored", job_id=job_id)
+                stored_job_data = job_storage[job_id]
+                return JobStatus(
                     job_id=job_id,
-                    workflow_id=workflow_id) # cite: 1741
+                    status=stored_job_data.get("status", "unknown"),
+                    storage_path=stored_job_data.get("storage_path"),
+                    error=stored_job_data.get("error"),
+                    changes=stored_job_data.get("changes", [])
+                )
 
-            # Get workflow status
-            workflow_data = workflow_storage.get(workflow_id, {}) # cite: 1742
+            logger.info("jobs.status_request", job_id=job_id, workflow_id=workflow_id)
+            workflow_data = workflow_storage.get(workflow_id, {})
 
-            # If workflow data not in memory storage, try to get from API
             if not workflow_data:
-                logger.debug("jobs.workflow_data_not_in_memory",
-                        job_id=job_id,
-                        workflow_id=workflow_id) # cite: 1742
+                logger.warning("jobs.workflow_data_not_in_memory", job_id=job_id, workflow_id=workflow_id)
+                workflow_data = job_storage[job_id]
+                logger.debug("jobs.using_stored_job_data", job_id=job_id, last_updated=workflow_data.get("last_updated"))
+            else:
+                 job_storage[job_id].update({
+                     "status": workflow_data.get("status"),
+                     "storage_path": workflow_data.get("storage_path"),
+                     "error": workflow_data.get("error"),
+                     "last_checked": datetime.now().isoformat(),
+                     "changes": map_workflow_to_job_changes(workflow_data)
+                 })
 
-                try:
-                    # Get fresh data from workflow endpoint
-                    workflow_response = await get_workflow(workflow_id) # cite: 1743
-                    workflow_data = {
-                         "status": workflow_response.status, # cite: 1744
-                         "storage_path": workflow_response.storage_path,
-                         "error": workflow_response.error
-                    }
-                    logger.debug("jobs.workflow_data_retrieved", # cite: 1745
-                            job_id=job_id,
-                            workflow_id=workflow_id,
-                            status=workflow_response.status) # cite: 1745
-
-                except Exception as e:
-                    logger.error("jobs.workflow_status_fetch_failed",
-                            job_id=job_id,
-                            workflow_id=workflow_id,
-                            error=str(e)) # cite: 1747
-                    # Fall back to stored job data
-                    workflow_data = job_storage[job_id] # cite: 1747
-                    logger.debug("jobs.using_stored_job_data",
-                             job_id=job_id, # cite: 1748
-                             last_updated=workflow_data.get("last_updated")) # cite: 1748
-
-            # Map workflow changes to job changes format
-            changes = map_workflow_to_job_changes(workflow_data) # cite: 1748
-
-            # Update job storage with latest status
-            job_storage[job_id].update({
-                 "status": workflow_data.get("status"), # cite: 1749
-                 "storage_path": workflow_data.get("storage_path"),
-                 "error": workflow_data.get("error"),
-                 "last_checked": datetime.now().isoformat(),
-                 "changes": changes # cite: 1749
-            })
-
-            # Create job status response
+            final_job_data = job_storage[job_id]
             job_status = JobStatus(
-                job_id=job_id, # cite: 1750
-                status=workflow_data.get("status", "unknown"), # cite: 1750
-                storage_path=workflow_data.get("storage_path"), # cite: 1750
-                error=workflow_data.get("error"), # cite: 1750
-                changes=changes # cite: 1751
+                job_id=job_id,
+                status=final_job_data.get("status", "unknown"),
+                storage_path=final_job_data.get("storage_path"),
+                error=final_job_data.get("error"),
+                changes=final_job_data.get("changes", [])
             )
 
             logger.info("jobs.status_checked",
-                    job_id=job_id,
-                    workflow_id=workflow_id,
-                    status=job_status.status,
-                    changes_count=len(changes) if changes else 0) # cite: 1752
+                    job_id=job_id, workflow_id=workflow_id, status=job_status.status,
+                    changes_count=len(job_status.changes) if job_status.changes else 0)
 
             return job_status
 
         except HTTPException:
-            # Re-raise HTTP exceptions without wrapping
             raise
         except Exception as e:
-            logger.error("jobs.status_check_failed",
-                     job_id=job_id, # cite: 1753
-                     error=str(e),
-                     error_type=type(e).__name__)
+            logger.error("jobs.status_check_failed", job_id=job_id, error=str(e), error_type=type(e).__name__, exc_info=True)
             raise HTTPException(status_code=500, detail=f"Job status check failed: {str(e)}")
+
 
     @app.post("/api/v1/configs/merge", response_model=MergeResponse)
     async def merge_configs(request: MergeRequest):
-        """
-        Utility endpoint to merge multiple configuration dictionaries.
-        Merges configurations from right to left (rightmost has lowest priority).
-        Optionally includes system_config as the base configuration.
-        Args:
-            request: MergeRequest containing configs to merge
-
-        Returns:
-            MergeResponse with the merged configuration
-        """
+        # ... (merge_configs remains the same) ...
         try:
-            # Start with system config if requested
-            if request.include_system_config: # cite: 1755
-                # Try to load system config from disk
+            if request.include_system_config:
                 try:
-                    system_config = load_config(app.state.system_config_path) # cite: 1756
+                    # Use the default path stored in app state
+                    system_config = load_config(app.state.system_config_path_default)
                     merged_config = system_config.copy()
-                    logger.debug("configs.merge.using_system_config",
-                                system_config_keys=list(system_config.keys())) # cite: 1757
+                    logger.debug("configs.merge.using_system_config", system_config_keys=list(system_config.keys()))
                 except Exception as e:
-                    logger.warning("configs.merge.system_config_load_failed",
-                            error=str(e)) # cite: 1757
-                    # Fall back to default config
-                    merged_config = app.state.default_config.copy() # cite: 1758
+                    logger.warning("configs.merge.system_config_load_failed", error=str(e))
+                    # Fall back to app's current config if default load fails
+                    merged_config = deepcopy(app.state.config)
             else:
-                # Start with empty dict
                 merged_config = {}
 
-            # Merge configurations from right to left
-            for i, config in enumerate(reversed(request.configs)): # cite: 1759
+            for i, config in enumerate(reversed(request.configs)):
                  merged_config = deep_merge(merged_config, config)
-                 logger.debug(f"configs.merge.step_{i+1}", config_keys=list(config.keys())) # cite: 1759
+                 logger.debug(f"configs.merge.step_{i+1}", config_keys=list(config.keys()))
 
-            return MergeResponse(merged_config=merged_config) # cite: 1801
+            return MergeResponse(merged_config=merged_config)
 
         except Exception as e:
-            logger.error("configs.merge.failed", error=str(e)) # cite: 1760
+            logger.error("configs.merge.failed", error=str(e), exc_info=True)
             raise HTTPException(status_code=500, detail=f"Configuration merge failed: {str(e)}")
 
 
     return app
-
-# Default app instance for direct imports
-app = create_app()

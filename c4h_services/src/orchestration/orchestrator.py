@@ -16,11 +16,13 @@ import json
 from c4h_agents.config import create_config_node, deep_merge
 from c4h_services.src.intent.impl.prefect.models import AgentTaskConfig
 from c4h_services.src.orchestration.team import Team
-from c4h_services.src.intent.impl.prefect.factories import (
-    create_discovery_task,
-    create_solution_task,
-    create_coder_task
-)
+# --- REMOVED THIS IMPORT BLOCK ---
+# from c4h_services.src.intent.impl.prefect.factories import (
+#     create_discovery_task,
+#     create_solution_task,
+#     create_coder_task
+# )
+# --- END REMOVED BLOCK ---
 
 logger = get_logger()
 
@@ -29,13 +31,9 @@ class Orchestrator:
     Manages execution of team-based workflows using Prefect.
     Handles team loading, chaining, and execution.
     """
-    
+
     def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize orchestrator with configuration.
-        Args:
-            config: Complete configuration dictionary
-        """
+        # ... (rest of the __init__ method remains the same) ...
         # Use a unique ID for this instance for clearer logging
         self.instance_id = str(uuid.uuid4())[:4]
         # Get logger early
@@ -60,16 +58,16 @@ class Orchestrator:
              # Attempt to load default teams as a fallback during init failure
              self.logger.warning("orchestrator.__init__.attempting_default_load_on_error")
              try:
-                 self._load_default_teams()
-                 self.logger.info("orchestrator.__init__.default_teams_loaded_after_error", teams_loaded=len(self.teams))
+                 # Remove call to deleted _load_default_teams
+                 # self._load_default_teams()
+                 self.logger.info("orchestrator.__init__._load_default_teams call removed as it relied on deleted factories.")
              except Exception as default_e:
                   self.logger.error("orchestrator.__init__.default_team_load_failed", error=str(default_e))
 
+
     def _load_teams(self) -> None:
-        """
-        Load team configurations from config.
-        Creates Team instances for each team configuration.
-        """
+        # ... (rest of _load_teams method remains the same,
+        #      it should already be using agent_type/persona_key from system_config.yml) ...
         # Access config via the instance attribute self.config_node
         teams_config = self.config_node.get_value("orchestration.teams") or {}
 
@@ -78,12 +76,11 @@ class Orchestrator:
                           has_orchestration_key="orchestration" in self.config,
                           has_teams_key="teams" in self.config.get("orchestration", {}),
                           teams_config_retrieved=bool(teams_config),
-                          teams_config_keys=list(teams_config.keys()) if teams_config else []) # cite: 1605
+                          teams_config_keys=list(teams_config.keys()) if teams_config else [])
 
         if not teams_config:
-            self.logger.warning("orchestrator.no_teams_found") # cite: 1606
-            # Load default teams for backward compatibility
-            self._load_default_teams()
+            self.logger.warning("orchestrator.no_teams_found - No teams defined in orchestration.teams section.")
+            # Removed call to _load_default_teams as it's deleted
             return
 
         # Clear existing teams before loading
@@ -93,125 +90,68 @@ class Orchestrator:
             try:
                 # Get basic team info
                 name = team_config.get("name", team_id)
-                self.logger.debug("_load_teams.processing_team", team_id=team_id, name=name) # cite: 1607
+                self.logger.debug("_load_teams.processing_team", team_id=team_id, name=name)
 
                 # Get task configurations
                 tasks = []
-                for task_config_def in team_config.get("tasks", []): # Renamed loop var cite: 1608
-                    agent_class_str = task_config_def.get("agent_class") # Use distinct name cite: 1608
-                    if not agent_class_str:
-                        self.logger.error("orchestrator.missing_agent_class", team_id=team_id, task=task_config_def) # cite: 1609
+                for task_config_def in team_config.get("tasks", []):
+                    # Ensure task config uses agent_type and name (persona_key is optional)
+                    agent_type = task_config_def.get("agent_type")
+                    task_name = task_config_def.get("name") # This is the unique_name for the agent instance
+                    persona_key = task_config_def.get("persona_key") # Optional
+
+                    if not agent_type or not task_name:
+                        self.logger.error("orchestrator.missing_task_fields", team_id=team_id, task_config=task_config_def, required_fields="agent_type, name")
                         continue
 
                     # --- Merge Task-Specific Overrides ---
-                    task_specific_override = task_config_def.get("config", {}) # cite: 1609
-                    task_base_config = self.config.copy() # Start with the orchestrator's current full config cite: 1610
-                    final_task_config_for_agent = deep_merge(task_base_config, task_specific_override) # cite: 1611
-                    # --- End Merge ---
+                    # Task-specific overrides are applied *before* snapshot creation
+                    # The AgentTaskConfig here just needs identifiers; the full config is in the snapshot
+                    task_specific_override = task_config_def.get("config", {})
 
-                    # --- ADDED: Log the specific nodes AFTER task override merge ---
-                    current_task_name = task_config_def.get("name", "unknown_task")
-                    # Derive agent name string for path lookup, handling potential errors
-                    try:
-                        agent_name_for_path = agent_class_str.split('.')[-1].lower().replace('_agent','')
-                    except:
-                        agent_name_for_path = "unknown_agent_name" # Fallback if class string is malformed
+                    # --- Log the specific nodes AFTER task override merge (Conceptually, this happens pre-snapshot) ---
+                    # Logging the effective config passed to the agent factory is more relevant now
+                    # log_config_node(...) calls removed here, as the final config is handled pre-snapshot
 
-                    # Use self.logger (the orchestrator's logger instance)
-                    log_config_node(self.logger, final_task_config_for_agent, "workorder", log_prefix=f"orchestrator.task_config.{team_id}.{current_task_name}")
-                    log_config_node(self.logger, final_task_config_for_agent, "team.llm_config.agents.solution_designer", log_prefix=f"orchestrator.task_config.{team_id}.{current_task_name}")
-                    # Log the node the agent *expects* to find its config at
-                    log_config_node(self.logger, final_task_config_for_agent, f"llm_config.agents.{agent_name_for_path}", log_prefix=f"orchestrator.task_config.{team_id}.{current_task_name}")
-                    # --- END ADDED ---
-
+                    # Create AgentTaskConfig using the NEW model definition
                     agent_config = AgentTaskConfig(
-                        agent_class=agent_class_str, # Pass the string path for dynamic loading later
-                        config=final_task_config_for_agent, # Pass the merged config for *this specific task* cite: 1612
-                        task_name=current_task_name, # Use variable defined above
-                        requires_approval=task_config_def.get("requires_approval", False), # cite: 1613
-                        max_retries=task_config_def.get("max_retries", 3),
-                        retry_delay_seconds=task_config_def.get("retry_delay_seconds", 30) # cite: 1613
+                        agent_type=agent_type, # Required
+                        task_name=task_name, # Required (maps to unique_name)
+                        persona_key=persona_key, # Optional
+                        config=task_specific_override, # Store only the overrides here, full config comes from snapshot
+                        # Removed fields related to direct class instantiation
+                        # requires_approval=task_config_def.get("requires_approval", False),
+                        max_retries=task_config_def.get("max_retries", 1) # Default from model
+                        # retry_delay_seconds=task_config_def.get("retry_delay_seconds", 30) # Not in current AgentTaskConfig model
                     )
                     tasks.append(agent_config)
 
                 self.teams[team_id] = Team(
                     team_id=team_id,
-                    name=name, # cite: 1614
-                    tasks=tasks,
-                    config=team_config # Store the original team-specific config part cite: 1614
+                    name=name,
+                    tasks=tasks, # Pass the list of AgentTaskConfig objects
+                    config=team_config # Store the original team-specific config part
                 )
                 loaded_count += 1
-                self.logger.info("orchestrator.team_loaded", team_id=team_id, name=name, tasks=len(tasks)) # cite: 1615
+                self.logger.info("orchestrator.team_loaded", team_id=team_id, name=name, tasks=len(tasks))
 
             except Exception as e:
-                self.logger.error("orchestrator.team_load_failed", team_id=team_id, error=str(e), exc_info=True) # cite: 1615; Add traceback
+                self.logger.error("orchestrator.team_load_failed", team_id=team_id, error=str(e), exc_info=True)
         self.logger.debug("_load_teams.finished", loaded_count=loaded_count, final_team_keys=list(self.teams.keys()))
 
 
-    def _load_default_teams(self) -> None:
-        """
-        Load default teams for backward compatibility.
-        Creates default discovery, solution, and coder teams.
-        """
-        # Create discovery team
-        discovery_task = create_discovery_task(self.config)
-        self.teams["discovery"] = Team(
-            team_id="discovery",
-            name="Discovery Team",
-            tasks=[discovery_task],
-            config={
-                "routing": {
-                    "default": "solution"
-                }
-            }
-        )
-        
-        # Create solution team
-        solution_task = create_solution_task(self.config)
-        self.teams["solution"] = Team(
-            team_id="solution",
-            name="Solution Design Team",
-            tasks=[solution_task],
-            config={
-                "routing": {
-                    "default": "coder"
-                }
-            }
-        )
-        
-        # Create coder team
-        coder_task = create_coder_task(self.config)
-        self.teams["coder"] = Team(
-            team_id="coder",
-            name="Coder Team",
-            tasks=[coder_task],
-            config={
-                "routing": {
-                    "default": None  # End of flow
-                }
-            }
-        )
-        
-        logger.info("orchestrator.default_teams_loaded", 
-                  teams=["discovery", "solution", "coder"])
-    
+    # --- REMOVE the _load_default_teams method ---
+    # def _load_default_teams(self) -> None:
+    #    ... (method body deleted) ...
+
+
     def execute_workflow(
-        self, 
+        self,
         entry_team: str = "discovery",
         context: Dict[str, Any] = None,
         max_teams: int = 10
     ) -> Dict[str, Any]:
-        """
-        Execute a workflow starting from the specified team.
-        
-        Args:
-            entry_team: ID of the team to start execution with
-            context: Initial context for execution
-            max_teams: Maximum number of teams to execute (prevent infinite loops)
-            
-        Returns:
-            Final workflow result
-        """
+        # ... (rest of execute_workflow method remains the same) ...
         # Use the configuration from the context if provided
         if context and "config" in context:
             # Update the orchestrator's config with the context's config
@@ -223,32 +163,36 @@ class Orchestrator:
                 # Reload teams with the new configuration
                 self.teams = {}
                 self._load_teams()
-                logger.info("orchestrator.teams_reloaded_with_updated_config", 
+                logger.info("orchestrator.teams_reloaded_with_updated_config",
                         teams_count=len(self.teams),
                         teams=list(self.teams.keys()))
 
         if entry_team not in self.teams:
-            raise ValueError(f"Entry team {entry_team} not found")
-            
+            # Check if teams dict is empty, indicating a load failure
+            if not self.teams:
+                 raise ValueError(f"Entry team '{entry_team}' not found. No teams were loaded, check configuration and logs.")
+            else:
+                 raise ValueError(f"Entry team '{entry_team}' not found. Available teams: {list(self.teams.keys())}")
+
         # Initialize context if needed
         if context is None:
             context = {}
-            
+
         # Generate workflow ID if not provided
         workflow_run_id = context.get("workflow_run_id") or str(uuid.uuid4())
         if "system" not in context:
             context["system"] = {}
         context["system"]["runid"] = workflow_run_id
         context["workflow_run_id"] = workflow_run_id
-        
-        logger.info("orchestrator.workflow_starting", 
+
+        logger.info("orchestrator.workflow_starting",
                 entry_team=entry_team,
                 workflow_run_id=workflow_run_id)
-        
+
         # Track execution path
         execution_path = []
         team_results = {}
-        
+
         # Initial setup
         current_team_id = entry_team
         team_count = 0
@@ -260,7 +204,7 @@ class Orchestrator:
             "team_results": {},
             "data": {}
         }
-        
+
         # Execute teams in sequence
         while current_team_id and team_count < max_teams:
             if current_team_id not in self.teams:
@@ -268,34 +212,37 @@ class Orchestrator:
                 final_result["status"] = "error"
                 final_result["error"] = f"Team {current_team_id} not found"
                 break
-                
+
             team = self.teams[current_team_id]
-            logger.info("orchestrator.executing_team", 
+            logger.info("orchestrator.executing_team",
                     team_id=current_team_id,
                     step=team_count + 1)
-                    
+
             # Track this team in the execution path
             execution_path.append(current_team_id)
-            
+
             # Execute the team
-            team_result = team.execute(context)
-            
+            # Ensure the team's execute method uses the context correctly
+            # The context passed here should contain the effective_config if needed by run_agent_task
+            # It's assumed execute_team_subflow in workflows.py handles passing effective_config correctly
+            team_result = team.execute(context) # Assuming team.execute doesn't need effective_config directly
+
             # Store team result
             team_results[current_team_id] = team_result
-            
+
             # Update context with team result data
             if team_result.get("success", False):
                 # Handle standard data
                 if "data" in team_result:
                     context.update(team_result["data"])
                     final_result["data"].update(team_result["data"])
-                
+
                 # Handle special structured input_data for team-to-team communication
                 if "input_data" in team_result:
                     if "input_data" not in context:
                         context["input_data"] = {}
                     context["input_data"] = team_result["input_data"]
-            
+
             # Check for failure
             if not team_result.get("success", False):
                 logger.warning("orchestrator.team_execution_failed",
@@ -304,36 +251,37 @@ class Orchestrator:
                 final_result["status"] = "error"
                 final_result["error"] = team_result.get("error")
                 break
-                
+
             # Get next team
             current_team_id = team_result.get("next_team")
             team_count += 1
-            
+
             # Check if we've reached the end
             if not current_team_id:
                 logger.info("orchestrator.workflow_completed",
                         teams_executed=team_count,
                         final_team=team.team_id)
                 break
-        
+
         # Check if we hit the team limit
         if team_count >= max_teams:
             logger.warning("orchestrator.max_teams_reached", max_teams=max_teams)
             final_result["status"] = "error"
             final_result["error"] = f"Exceeded maximum team limit of {max_teams}"
-        
+
         # Build final result
         final_result["execution_path"] = execution_path
         final_result["team_results"] = team_results
         final_result["teams_executed"] = team_count
         final_result["timestamp"] = datetime.now(timezone.utc).isoformat()
-        
-        logger.info("orchestrator.workflow_result", 
+
+        logger.info("orchestrator.workflow_result",
                 status=final_result["status"],
                 teams_executed=team_count,
                 execution_path=execution_path)
-                
+
         return final_result
+
 
     def initialize_workflow(
         self,
@@ -341,16 +289,7 @@ class Orchestrator:
         intent_desc: Dict[str, Any],
         config: Dict[str, Any]
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """
-        Initialize workflow configuration with consistent defaults and parameter handling.
-        Args:
-            project_path: Path to the project
-            intent_desc: Description of the intent
-            config: Base configuration (This should be the merged config from the request)
-
-        Returns:
-            Tuple of (prepared_config, context_dict)
-        """
+        # ... (initialize_workflow method remains the same) ...
         # Use a logger specific to this instance if available, else use global
         instance_logger = getattr(self, 'logger', logger)
         instance_logger.debug("initialize_workflow.entry", config_keys=list(config.keys()))
@@ -416,9 +355,12 @@ class Orchestrator:
             # Add default configs for crucial components
             if 'llm_config' not in prepared_config: prepared_config['llm_config'] = {}
             if 'agents' not in prepared_config['llm_config']: prepared_config['llm_config']['agents'] = {}
-            if 'discovery' not in prepared_config['llm_config']['agents']: prepared_config['llm_config']['agents']['discovery'] = {}
+            # Ensure discovery persona config path exists
+            discovery_agent_path = "llm_config.agents.discovery_phase" # Example unique name
+            if not config_node.get_value(discovery_agent_path):
+                prepared_config['llm_config']['agents']['discovery_phase'] = {} # Create if missing
 
-            discovery_config = prepared_config['llm_config']['agents']['discovery']
+            discovery_config = config_node.get_value(discovery_agent_path) or {} # Get the node data
             instance_logger.debug("initialize_workflow.discovery_config_retrieved", config_keys=list(discovery_config.keys()))
 
             if 'tartxt_config' not in discovery_config:
@@ -445,7 +387,7 @@ class Orchestrator:
                     instance_logger.info("initialize_workflow.attempting_package_lookup") # Added logging
                     script_path_found_in_package = None
                     try:
-                        import c4h_agents
+                        import c4h_agents.skills # Import skills package
                         import importlib.resources as pkg_resources
                         # Use importlib.resources for better package data access
                         with pkg_resources.path(c4h_agents.skills, 'tartxt.py') as script_path_obj:
@@ -490,7 +432,7 @@ class Orchestrator:
                 "config": prepared_config # Pass the fully prepared config
             }
 
-            instance_logger.info("workflow.initialized", # cite: 1460
+            instance_logger.info("workflow.initialized",
                         workflow_id=workflow_id,
                         project_path=project_path,
                         tartxt_script_path=tartxt_config.get('script_path'), # Log final path used
@@ -499,6 +441,6 @@ class Orchestrator:
             return prepared_config, context
 
         except Exception as e:
-            instance_logger.error("workflow.initialization_failed", error=str(e)) # cite: 1461
+            instance_logger.error("workflow.initialization_failed", error=str(e), exc_info=True) # Log traceback
             # Re-raise the exception to ensure the calling function knows about the failure
             raise

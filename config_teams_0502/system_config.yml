@@ -16,26 +16,98 @@ llm_config:
       valid_models:
         - "claude-3-7-sonnet-20250219"
         - "claude-3-5-sonnet-20241022"
+        - "claude-3-5-haiku-20241022"
         - "claude-3-opus-20240229"
         - "claude-3-sonnet-20240229"
         - "claude-3-haiku-20240307"
       extended_thinking:
         enabled: false
         budget_tokens: 32000
+        min_budget_tokens: 1024
+        max_budget_tokens: 128000
       litellm_params:
+        vertex_project: "{YOUR_GCP_PROJECT_ID}" # Replace with your project ID
+        vertex_location: "{YOUR_GCP_REGION}"   # Replace with your region (e.g., us-central1)
         retry: true
         max_retries: 5
         timeout: 30
+        rate_limit_policy:
+          tokens: 8000
+          requests: 50
+          period: 60
         backoff:
           initial_delay: 1
           max_delay: 30
           exponential: true
     openai:
-      # ... (Your OpenAI config) ...
+      api_base: "https://api.openai.com/v1"
+      env_var: "OPENAI_API_KEY"
+      default_model: "gpt-4o"
+      valid_models:
+        - "gpt-4o"
+        - "gpt-4o-mini"
+        - "gpt-4"
+        - "gpt-4-turbo"
+        - "o1"
+        - "o1-mini"
+        - "o3-mini"
+      litellm_params:
+        retry: true
+        max_retries: 3
+        timeout: 30
+        rate_limit_policy:
+          tokens: 4000
+          requests: 200
+          period: 60
+        backoff:
+          initial_delay: 1
+          max_delay: 20
+          exponential: true
     gemini:
-      # ... (Your Gemini config) ...
+      # IMPORTANT: Use the base API endpoint WITHOUT /models
+      # LiteLLM will construct this incorrectly, which is why we need this specific format
+      api_base: "https://generativelanguage.googleapis.com/v1beta"
+      context_length: 32000
+      env_var: "GEMINI_API_KEY"
+      default_model: "gemini-1.5-pro-latest"
+      valid_models:
+        - "gemini-2.5-pro-preview-03-25"  # Exact model name that works with curl
+      # Set model parameters specific to Gemini
+      model_params:
+        # Use camelCase format for params as required by Google API
+        maxOutputTokens: 8192
+        temperature: 0.7
+      litellm_params:
+        # Skip LiteLLM's Gemini handling with a custom call
+        custom_gemini_call: true  # We'll add this flag in our code
+        retry: true
+        max_retries: 3
+        timeout: 60
+        backoff:
+          initial_delay: 2
+          max_delay: 30
+          exponential: true
     xai:
-      # ... (Your XAI config) ...
+      api_base: "https://api.x.ai/v1"  # Official xAI API base URL
+      env_var: "XAI_API_KEY"          # Environment variable for API key
+      default_model: "grok-1.5-flash" # Defaulting to flash version
+      valid_models:
+        - "grok-1"                   # Original Grok-1
+        - "grok-1.5"                 # Grok 1.5
+        - "grok-1.5-flash"           # Faster variant of Grok 1.5
+      context_length: 128000         # Adjust based on actual Grok specs
+      litellm_params:
+        retry: true
+        max_retries: 3
+        timeout: 45
+        rate_limit_policy:
+          tokens: 10000             # Adjust based on xAI rate limits
+          requests: 50
+          period: 60
+        backoff:
+          initial_delay: 1
+          max_delay: 20
+          exponential: true
 
   default_provider: "anthropic"
   default_model: "claude-3-opus-20240229" # Example default
@@ -48,6 +120,7 @@ llm_config:
     temperature: 0.7
     extended_thinking:
       enabled: true
+      budget_tokens: 32000
     prompts:
       system: null
       user: null
@@ -56,7 +129,28 @@ llm_config:
       steps: []
     model_params:
       max_tokens: 4096
-    # Add other common fields if needed
+    storage:
+      root_dir: "workspaces"
+      retention:
+        max_age_days: 30
+        max_runs: 10
+      error_handling:
+        ignore_failures: true
+        log_level: "ERROR"
+    lineage:
+      enabled: true
+      namespace: "c4h_agents"
+      backend:
+        type: "file"
+        path: "workspaces/lineage"
+        url: null
+      retention:
+        max_age_days: 30
+        max_runs: 100
+      context:
+        include_metrics: true
+        include_token_usage: true
+        record_timestamps: true
 
 # Orchestration using the new factory model
 orchestration:
@@ -72,9 +166,10 @@ orchestration:
     discovery:
       name: "Discovery Team"
       tasks:
-        - name: "discovery_task_1" # Unique instance name
-          agent_type: "generic_single_shot"
+        - name: "discovery_phase" # Unique instance name
+          agent_type: "generic_single_shot" # Specify generic agent type
           persona_key: "discovery_v1" # References personas/discovery_v1.yml
+          description: "Analyze project structure and files" # Optional description
           requires_approval: false
           max_retries: 2
       routing:
@@ -83,41 +178,54 @@ orchestration:
     solution:
       name: "Solution Design Team"
       tasks:
-        - name: "solution_design_task_1" # Unique instance name
-          agent_type: "generic_single_shot"
+        - name: "solution_design_phase" # Unique instance name
+          agent_type: "generic_single_shot" # Specify generic agent type
           persona_key: "solution_designer_v1" # References personas/solution_designer_v1.yml
+          description: "Create solution design and code changes" # Optional description
           requires_approval: true
           max_retries: 1
       routing:
         rules:
+          # Example routing rule based on task success
+          # Note: Condition structure might need adjustment based on evaluate_routing_task implementation
           - condition:
-              task: "solution_design_task_1"
+              task: "solution_design_phase" # Name of the task in this team
               status: "success"
             next_team: "coder"
-        default: "fallback"
+          # Example routing rule based on failure (could also check specific error types)
+          - condition:
+              task: "solution_design_phase"
+              status: "failure"
+            next_team: "fallback"
+        default: "coder" # Default if no rules match (e.g., if condition structure is simple string)
 
     coder:
       name: "Coder Team"
       tasks:
-        - name: "coder_task_1" # Unique instance name
-          # Assuming coder might need orchestration
+        - name: "coding_phase" # Unique instance name
+          # Assuming coder might need internal orchestration based on its persona
           agent_type: "generic_orchestrating"
           persona_key: "coder_v1" # References personas/coder_v1.yml
+          description: "Implement code changes based on solution design" # Optional description
           requires_approval: true
           max_retries: 1
       routing:
-        default: null # End workflow
+        rules:
+          - condition: "all_success" # Simple condition based on task success
+            next_team: null # End workflow on success
+        default: null # End workflow by default
 
     fallback:
       name: "Fallback Team"
       tasks:
-        - name: "fallback_coder_task_1" # Unique instance name
-          agent_type: "generic_orchestrating"
-          persona_key: "coder_v1" # Reuse coder persona
-          config: # Task-specific override
+        - name: "fallback_coding_phase" # Unique instance name
+          agent_type: "generic_orchestrating" # Or single_shot depending on fallback logic
+          persona_key: "coder_v1" # Reuse coder persona or have a specific fallback persona
+          description: "Implement code changes with conservative approach" # Optional description
+          config: # Task-specific override for the persona
             temperature: 0 # Make fallback more conservative
       routing:
-        default: null
+        default: null # End workflow after fallback
 
 # Runtime configuration
 runtime:
@@ -175,3 +283,5 @@ logging:
   truncate:
     prefix_length: 2000
     suffix_length: 1000
+
+# Ensure the file ends properly

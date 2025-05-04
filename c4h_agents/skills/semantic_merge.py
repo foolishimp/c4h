@@ -16,7 +16,10 @@ class SemanticMerge(BaseAgent):
     
     def __init__(self, config: Dict[str, Any] = None):
         """Initialize merger with configuration."""
-        super().__init__(config=config)
+        # Pass positional parameters to BaseAgent
+        super().__init__(config, "semantic_merge")
+        
+        # The unique_name is now stored by BaseAgent
         
         # Get merge-specific configs
         merge_config = locate_config(self.config or {}, self._get_agent_name())

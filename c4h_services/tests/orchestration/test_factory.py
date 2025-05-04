@@ -69,8 +69,8 @@ class TestAgentFactory(unittest.TestCase):
         # Verify
         mock_import.assert_called_once_with("c4h_agents.agents.generic")
         mock_agent_class.assert_called_once_with(
-            full_effective_config=self.effective_config, 
-            unique_name="test_agent"
+            self.effective_config, 
+            "test_agent"
         )
         self.assertEqual(result, mock_agent_instance)
     

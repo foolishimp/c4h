@@ -53,19 +53,18 @@ class Team:
                         task_index=i)
                 
                 # Add team context to the task execution
-                task_context = {
-                    **context,
-                    "team_id": self.team_id,
-                    "team_name": self.name,
-                    "task_index": i
+                task_config_dict = {
+                    "name": task_config.task_name,
+                    "agent_type": task_config.agent_type,
+                    "persona_key": task_config.persona_key,
+                    "config": task_config.config
                 }
-                
-                # Run the agent task
+
                 result = run_agent_task(
-                    agent_config=task_config,
-                    context=task_context
+                    task_config=task_config_dict,
+                    context=context,
+                    effective_config=context.get("config", {})
                 )
-                
                 results.append(result)
                 
                 # Stop sequence on failure if configured

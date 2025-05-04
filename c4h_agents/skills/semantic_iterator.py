@@ -54,7 +54,10 @@ class SemanticIterator(BaseAgent):
     
     def __init__(self, config: Dict[str, Any] = None):
         """Initialize iterator with configuration."""
-        super().__init__(config=config)
+        # Pass positional parameters to BaseAgent
+        super().__init__(config, "semantic_iterator")
+        
+        # The unique_name is now stored by BaseAgent
         
         # Get iterator-specific config using inherited method
         iterator_config = self._get_agent_config() # Gets llm_config.agents.semantic_iterator
