@@ -7,13 +7,14 @@ their type, as defined in configuration.
 
 import json
 import os
+import uuid
 import logging
 from typing import Any, Dict, Optional, Type
 
-from ...context.execution_context import ExecutionContext
-from ...skills.registry import SkillRegistry
-from .type_base_agent import BaseTypeAgent
-from .type_generic import GenericLLMAgent, GenericOrchestratorAgent
+from c4h_agents.context.execution_context import ExecutionContext
+from c4h_agents.skills.registry import SkillRegistry
+from c4h_agents.agents.type_based.type_base_agent import BaseTypeAgent
+from c4h_agents.agents.type_based.type_generic import GenericLLMAgent, GenericOrchestratorAgent
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,7 @@ class AgentFactory:
         if not persona_config:
             raise ValueError(f"Persona '{persona_key}' not found")
         
-        # Create execution context
+        # Create execution context with proper lineage structure
         exec_context = {
             'system': self.system_config,
             'agent': {
@@ -88,8 +89,62 @@ class AgentFactory:
         # Merge with provided context
         exec_context.update(context)
         
+        # Ensure workflow run ID is set up for lineage tracking
+        run_id = exec_context.get('workflow_run_id')
+        if not run_id:
+            # Check in system section
+            if 'system' in exec_context and isinstance(exec_context['system'], dict):
+                run_id = exec_context['system'].get('runid')
+            
+            # Generate if not found
+            if not run_id:
+                import datetime
+                time_str = datetime.datetime.now().strftime('%H%M')
+                run_id = f"wf_{time_str}_{uuid.uuid4()}"
+                logger.info(f"Generated new workflow run ID: {run_id}")
+        
+        # Ensure run_id is set in all required locations
+        exec_context['workflow_run_id'] = run_id
+        if 'system' not in exec_context:
+            exec_context['system'] = {}
+        exec_context['system']['runid'] = run_id
+        
+        # Set up runtime section if missing
+        if 'runtime' not in exec_context:
+            exec_context['runtime'] = {}
+        # Add run_id to runtime for compatibility
+        exec_context['runtime']['workflow_run_id'] = run_id
+        
+        # Configure lineage in BOTH locations where BaseLineage looks for it
+        # Use absolute path for lineage to ensure consistency
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../..'))
+        lineage_path = os.path.join(repo_root, 'workspaces/lineage')
+        
+        lineage_config = {
+            'enabled': True,
+            'namespace': 'c4h_agents.type_based',
+            'backends': {
+                'file': {
+                    'enabled': True,
+                    'path': lineage_path
+                }
+            }
+        }
+        
+        # Set in runtime.lineage (first fallback location)
+        if 'runtime' not in exec_context:
+            exec_context['runtime'] = {}
+        exec_context['runtime']['lineage'] = lineage_config
+        
+        # Set in llm_config.agents.lineage (primary location)
+        if 'llm_config' not in exec_context:
+            exec_context['llm_config'] = {}
+        if 'agents' not in exec_context['llm_config']:
+            exec_context['llm_config']['agents'] = {}
+        exec_context['llm_config']['agents']['lineage'] = lineage_config
+        
         # Create agent instance
-        logger.info(f"Creating agent '{agent_key}' of type '{agent_type}'")
+        logger.info(f"Creating agent '{agent_key}' of type '{agent_type}' with run_id {run_id}")
         agent = agent_class(persona_config, exec_context, self.skill_registry)
         
         return agent

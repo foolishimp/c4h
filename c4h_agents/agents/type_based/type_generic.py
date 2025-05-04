@@ -10,9 +10,9 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from ...context.execution_context import ExecutionContext
-from ...context.template import TemplateResolver
-from .type_base_agent import BaseTypeAgent, AgentResponse
+from c4h_agents.context.execution_context import ExecutionContext
+from c4h_agents.context.template import TemplateResolver
+from c4h_agents.agents.type_based.type_base_agent import BaseTypeAgent, AgentResponse
 
 logger = logging.getLogger(__name__)
 
@@ -100,17 +100,46 @@ class GenericLLMAgent(BaseTypeAgent):
         """
         Call LLM with prompt and configuration.
         
-        This is a placeholder implementation. In a real implementation,
-        this would use an appropriate LLM client based on the provider.
+        This is a placeholder implementation with lineage tracking.
+        In a real implementation, this would use an appropriate LLM client
+        based on the provider.
         """
         provider = config.get('provider', 'unknown')
         model = config.get('model', 'unknown')
         
         logger.info(f"Calling LLM provider '{provider}' with model '{model}'")
         
+        # Create messages object for lineage tracking
+        from c4h_agents.agents.types import LLMMessages
+        messages = LLMMessages(
+            system=self.persona_config.get('llm_configuration', {}).get('system_prompt', ''),
+            user=prompt
+        )
+        
+        # Create context for lineage tracking
+        lineage_context = {
+            "workflow_run_id": self.run_id,
+            "system": {"runid": self.run_id},
+            "agent_execution_id": self.agent_id,
+            "provider": provider,
+            "model": model,
+            "config": config
+        }
+        
+        # Include configuration snapshot information in lineage context
+        base_context = self.context.to_dict()
+        if "config_snapshot_path" in base_context:
+            lineage_context["config_snapshot_path"] = base_context["config_snapshot_path"]
+        if "config_hash" in base_context:
+            lineage_context["config_hash"] = base_context["config_hash"]
+        
+        # Include runtime config metadata if present
+        if "runtime" in base_context and isinstance(base_context["runtime"], dict) and "config_metadata" in base_context["runtime"]:
+            lineage_context["runtime"] = {"config_metadata": base_context["runtime"]["config_metadata"]}
+        
         # This is where you would call the actual LLM
-        # For now, just return a mock response
-        return {
+        # For now, just create a mock response
+        mock_response = {
             'content': f"This is a mock response from {provider} {model}.",
             'usage': {
                 'prompt_tokens': len(prompt.split()),
@@ -118,6 +147,23 @@ class GenericLLMAgent(BaseTypeAgent):
                 'total_tokens': len(prompt.split()) + 20
             }
         }
+        
+        # Track the interaction with lineage
+        metrics = {
+            "prompt_tokens": len(prompt.split()),
+            "completion_tokens": 20,
+            "total_tokens": len(prompt.split()) + 20
+        }
+        
+        # Record lineage if enabled
+        self._track_llm_interaction(
+            context=lineage_context,
+            messages=messages,
+            response=mock_response,
+            metrics=metrics
+        )
+        
+        return mock_response
     
     def _process_llm_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """Process the LLM response into a structured format."""

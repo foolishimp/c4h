@@ -316,11 +316,34 @@ class BaseLineage:
 
     def _write_file_event(self, event: LineageEvent) -> None:
         """Write event to file system with minimal processing"""
-        if not self.enabled or not self.lineage_dir or not self.backends.get("file", {}).get("enabled", False):
+        # Add detailed debug logging to diagnose file writing issues
+        logger.debug(f"_write_file_event called with event_id: {event.event_id}")
+        logger.debug(f"self.enabled = {self.enabled}")
+        logger.debug(f"self.lineage_dir exists: {hasattr(self, 'lineage_dir')}")
+        if hasattr(self, 'lineage_dir'):
+            logger.debug(f"self.lineage_dir = {self.lineage_dir}")
+            logger.debug(f"lineage_dir exists on disk: {os.path.exists(str(self.lineage_dir))}")
+        logger.debug(f"file backend enabled: {self.backends.get('file', {}).get('enabled', False)}")
+        
+        if not self.enabled:
+            logger.warning("_write_file_event skipped: lineage not enabled")
+            return
+            
+        if not hasattr(self, 'lineage_dir') or not self.lineage_dir:
+            logger.warning("_write_file_event skipped: lineage_dir not set")
+            return
+            
+        if not self.backends.get("file", {}).get("enabled", False):
+            logger.warning("_write_file_event skipped: file backend not enabled")
             return
             
         try:
             events_dir = self.lineage_dir / "events"
+            logger.debug(f"events_dir = {events_dir}")
+            logger.debug(f"events_dir exists: {os.path.exists(str(events_dir))}")
+            
+            # Make sure events directory exists
+            os.makedirs(str(events_dir), exist_ok=True)
             
             # Create timestamped filename but keep the original event_id in the content
             timestamp = datetime.now().strftime('%H%M%S')
@@ -328,6 +351,8 @@ class BaseLineage:
             
             event_file = events_dir / event_filename
             temp_file = events_dir / f"tmp_{event_filename}"
+            
+            logger.debug(f"Will write to temp file: {temp_file}, then rename to: {event_file}")
             
             # Create clear, complete event structure without duplication
             event_data = {
@@ -362,10 +387,14 @@ class BaseLineage:
                 "error": event.error
             }
             
+            logger.debug(f"Writing event data to file: {len(str(event_data))} bytes")
+            
             # Write to temp file first (atomic operation)
             with open(temp_file, 'w') as f:
                 json.dump(event_data, f, indent=2, default=str)
                 
+            logger.debug(f"Successfully wrote to temp file, now renaming")
+            
             # Rename to final filename (atomic operation)
             temp_file.rename(event_file)
             
@@ -377,11 +406,13 @@ class BaseLineage:
                     event_id=event.event_id)
                 
         except Exception as e:
+            import traceback
             logger.error("lineage.write_failed",
                         error=str(e),
-                        lineage_dir=str(self.lineage_dir),
+                        lineage_dir=str(self.lineage_dir) if hasattr(self, 'lineage_dir') else "not_set",
                         agent=event.agent_name,
                         event_id=event.event_id)
+            logger.debug(f"Write failure traceback: {traceback.format_exc()}")
 
     def _emit_marquez_event(self, event: LineageEvent) -> None:
         """Emit event to Marquez"""
@@ -462,21 +493,41 @@ class BaseLineage:
                               response: Any,
                               metrics: Optional[Dict] = None) -> None:
         """Track complete LLM interaction"""
+        logger.debug(f"track_llm_interaction called with message type: {type(messages)}")
+        logger.debug(f"self.enabled = {self.enabled}")
+        logger.debug(f"self.run_id = {self.run_id}")
+        logger.debug(f"Backends: {self.backends if hasattr(self, 'backends') else 'not initialized'}")
+        
         if not self.enabled:
-            logger.debug("lineage.tracking_skipped", enabled=False)
+            logger.warning("lineage.tracking_skipped", enabled=False)
             return
             
         try:
             # Extract lineage metadata
             event_id, parent_id, step, execution_path = self._extract_lineage_metadata(context)
+            logger.debug(f"Extracted metadata: event_id={event_id}, parent_id={parent_id}, step={step}")
             
             # Extract configuration snapshot information if available in context
             config_snapshot_path = None
             config_hash = None
             
+            # Debug log the context fields
+            logger.debug(f"Looking for config snapshot path in context keys: {list(context.keys())}")
+            if "runtime" in context:
+                logger.debug(f"Runtime section keys: {list(context['runtime'].keys())}")
+            
+            # First check direct top-level keys (added in test_type_coder.py)
             if "config_snapshot_path" in context:
                 config_snapshot_path = context["config_snapshot_path"]
+                logger.debug(f"Found config_snapshot_path in top-level context: {config_snapshot_path}")
+                
+            if "config_hash" in context:
+                config_hash = context["config_hash"]
+                logger.debug(f"Found config_hash in top-level context: {config_hash}")
+            
+            # Check for config_metadata in top level
             elif "config_metadata" in context and isinstance(context["config_metadata"], dict):
+                logger.debug("Checking config_metadata in top-level context")
                 if "snapshot_path" in context["config_metadata"]:
                     config_snapshot_path = context["config_metadata"]["snapshot_path"]
                 if "config_hash" in context["config_metadata"]:
@@ -484,16 +535,27 @@ class BaseLineage:
             
             # Also check runtime section
             if not config_snapshot_path and "runtime" in context:
+                logger.debug("Checking runtime section for config_metadata")
                 runtime = context.get("runtime", {})
                 if isinstance(runtime, dict) and "config_metadata" in runtime:
                     config_metadata = runtime["config_metadata"]
                     if isinstance(config_metadata, dict):
+                        logger.debug(f"Found config_metadata in runtime section: {config_metadata}")
                         if "snapshot_path" in config_metadata:
                             config_snapshot_path = config_metadata["snapshot_path"]
                         if "config_hash" in config_metadata:
                             config_hash = config_metadata["config_hash"]
+                            
+            logger.debug(f"Final config_snapshot_path: {config_snapshot_path}, config_hash: {config_hash}")
+            
+            logger.debug(f"Config snapshot path: {config_snapshot_path}, hash: {config_hash}")
+            
+            # Check message format
+            logger.debug(f"Messages has system: {hasattr(messages, 'system')}")
+            logger.debug(f"Messages has user: {hasattr(messages, 'user')}")
             
             # Create the lineage event with snapshot information
+            logger.debug(f"Creating LineageEvent object")
             event = LineageEvent(
                 event_id=event_id,
                 agent_name=self.agent_name,
@@ -509,42 +571,56 @@ class BaseLineage:
                 config_snapshot_path=config_snapshot_path,
                 config_hash=config_hash
             )
+            logger.debug(f"LineageEvent created with id: {event.event_id}")
             
             # Track to file backend
-            if self.backends.get("file", {}).get("enabled", False):
+            file_success = False
+            if hasattr(self, 'backends') and self.backends.get("file", {}).get("enabled", False):
+                logger.debug(f"File backend is enabled, attempting to write event")
                 try:
                     self._write_file_event(event)
                     file_success = True
+                    logger.debug(f"File event write succeeded")
                 except Exception as e:
+                    import traceback
                     logger.error("lineage.file_backend_failed", error=str(e))
+                    logger.debug(f"File backend failure traceback: {traceback.format_exc()}")
                     file_success = False
             else:
+                logger.debug(f"File backend is not enabled or not initialized")
                 file_success = False
             
             # Track to Marquez backend
-            if self.use_marquez and self.backends.get("marquez", {}).get("enabled", False):
+            marquez_success = False
+            if hasattr(self, 'use_marquez') and self.use_marquez and hasattr(self, 'backends') and self.backends.get("marquez", {}).get("enabled", False):
+                logger.debug(f"Marquez backend is enabled, attempting to emit event")
                 try:
                     self._emit_marquez_event(event)
                     marquez_success = True
+                    logger.debug(f"Marquez event emit succeeded")
                 except Exception as e:
+                    import traceback
                     logger.error("lineage.marquez_backend_failed", error=str(e))
+                    logger.debug(f"Marquez backend failure traceback: {traceback.format_exc()}")
                     marquez_success = False
             else:
+                logger.debug(f"Marquez backend is not enabled or not initialized")
                 marquez_success = False
             
             # Count successful backends
             backend_count = 0
             success_count = 0
             
-            if "file" in self.backends and self.backends["file"].get("enabled", False):
-                backend_count += 1
-                if file_success:
-                    success_count += 1
-                    
-            if "marquez" in self.backends and self.backends["marquez"].get("enabled", False):
-                backend_count += 1
-                if marquez_success:
-                    success_count += 1
+            if hasattr(self, 'backends'):
+                if "file" in self.backends and self.backends["file"].get("enabled", False):
+                    backend_count += 1
+                    if file_success:
+                        success_count += 1
+                        
+                if "marquez" in self.backends and self.backends["marquez"].get("enabled", False):
+                    backend_count += 1
+                    if marquez_success:
+                        success_count += 1
             
             # Log overall tracking status
             logger.info("lineage.event_saved",
@@ -556,4 +632,6 @@ class BaseLineage:
                     path_length=len(execution_path) if execution_path else 0)
                         
         except Exception as e:
+            import traceback
             logger.error("lineage.track_failed", error=str(e), agent=self.agent_name)
+            logger.debug(f"track_llm_interaction failure traceback: {traceback.format_exc()}")
