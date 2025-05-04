@@ -11,7 +11,7 @@ from typing import Dict, Any, Optional, List, Tuple
 import re
 import structlog # Ensure structlog is imported if used directly
 from c4h_agents.agents.base_config import BaseConfig
-from c4h_agents.agents.base_lineage import BaseLineage # Correct import
+from c4h_agents.lineage.event_logger import EventLogger, EventType # New import for EventLogger
 from c4h_agents.agents.lineage_context import LineageContext # Correct import
 from c4h_agents.agents.base_llm import BaseLLM
 from c4h_agents.agents.continuation.continuation_handler import ContinuationHandler
@@ -158,24 +158,31 @@ class BaseAgent(BaseConfig, BaseLLM):
         })
         self.logger = self.logger.bind(**log_context)
 
-        # --- Step 14: Initialize Lineage ---
-        self.lineage = None
+        # --- Step 14: Initialize EventLogger for Lineage ---
+        self.event_logger = None
         try:
-            self.logger.debug(f"{agent_name}.lineage_init", has_runtime="runtime" in self.config, has_system="system" in self.config, has_workflow_run_id=bool(self.run_id))
+            self.logger.debug(f"{agent_name}.event_logger_init", has_runtime="runtime" in self.config, has_system="system" in self.config, has_workflow_run_id=bool(self.run_id))
             self.logger.debug(f"{agent_name}.using_run_id", run_id=self.run_id)
-            # Pass self.config (the full effective snapshot)
-            self.lineage = BaseLineage(
-                namespace="c4h_agents",
-                agent_name=agent_name, # Use variable defined above
-                config=self.config
+            
+            # Extract lineage config from runtime section
+            lineage_config = self.config_node.get_value("runtime.lineage") or {}
+            if not lineage_config:
+                # Try llm_config path as fallback
+                lineage_config = self.config_node.get_value("llm_config.agents.lineage") or {}
+            
+            # Initialize with run_id
+            self.event_logger = EventLogger(
+                lineage_config,
+                self.run_id
             )
-            # Update run_id if lineage loaded an existing one
-            if self.lineage and hasattr(self.lineage, 'run_id') and self.lineage.run_id != self.run_id:
-                 self.run_id = self.lineage.run_id
-                 self.logger = self.logger.bind(run_id=self.run_id)
-                 self.logger.info(f"{agent_name}.lineage_loaded_existing_run", loaded_run_id=self.run_id)
+            
+            # Set agent type and name in event logger
+            self.event_logger.agent_name = agent_name
+            self.event_logger.agent_type = self.agent_type if hasattr(self, 'agent_type') else agent_name
+            
+            self.logger.info(f"{agent_name}.event_logger_initialized", run_id=self.run_id)
         except Exception as e:
-            self.logger.error(f"{agent_name}.lineage_init_failed", error=str(e), exc_info=True)
+            self.logger.error(f"{agent_name}.event_logger_init_failed", error=str(e), exc_info=True)
 
         # --- Step 15: Initialize Continuation Handler ---
         # Ensure it's initialized AFTER all necessary parent attributes (like logger, model_str) are set
@@ -285,8 +292,38 @@ class BaseAgent(BaseConfig, BaseLLM):
             )
 
             try:
-                # Check if lineage tracking is enabled
-                lineage_enabled = hasattr(self, 'lineage') and self.lineage and getattr(self.lineage, 'enabled', False)
+                # Check if event logger is enabled
+                event_logger_enabled = hasattr(self, 'event_logger') and self.event_logger and getattr(self.event_logger, 'enabled', False)
+
+                # Log STEP_START event
+                if event_logger_enabled:
+                    try:
+                        # Extract config metadata
+                        config_snapshot_path = lineage_context.get("config_snapshot_path")
+                        config_hash = lineage_context.get("config_hash")
+                        
+                        # Log step start event
+                        self.event_logger.log_event(
+                            EventType.STEP_START,
+                            {
+                                "step_type": self._get_agent_name(),
+                                "context_keys": list(lineage_context.keys()),
+                                "agent_id": self.agent_id
+                            },
+                            step_name=self._get_agent_name(),
+                            parent_id=parent_id,
+                            config_snapshot_path=config_snapshot_path,
+                            config_hash=config_hash
+                        )
+                        self.logger.info("event_logger.step_start_logged",
+                                         agent=self._get_agent_name(),
+                                         agent_execution_id=agent_execution_id)
+                    except Exception as e:
+                        self.logger.error("event_logger.step_start_failed",
+                                          error=str(e),
+                                          error_type=type(e).__name__,
+                                          agent=self._get_agent_name(),
+                                          agent_execution_id=agent_execution_id)
 
                 # Get completion with automatic continuation handling (calls BaseLLM method)
                 # Pass lineage_context to support runtime configuration overrides
@@ -314,40 +351,54 @@ class BaseAgent(BaseConfig, BaseLLM):
                 # Calculate metrics
                 response_metrics = {"token_usage": getattr(raw_response, 'usage', {})}
 
-                # Track lineage if enabled
-                if lineage_enabled:
+                # Log STEP_END event
+                if event_logger_enabled:
                     try:
-                        self.logger.debug("lineage.tracking_attempt", # Use self.logger
-                                    agent=self._get_agent_name(),
-                                    agent_execution_id=agent_execution_id,
-                                    parent_id=parent_id, #
-                                    has_context=bool(lineage_context),
-                                    has_messages=bool(messages),
-                                    has_metrics=hasattr(raw_response, 'usage'))
-
-                        # Track LLM interaction with full context for event sourcing
-                        if hasattr(self.lineage, 'track_llm_interaction'):
-                            self.lineage.track_llm_interaction(
-                                context=lineage_context,
-                                messages=messages,
-                                response=raw_response,
-                                metrics=response_metrics
-                            )
-                        self.logger.info("lineage.tracking_complete", # Use self.logger
-                                agent=self._get_agent_name(),
-                                agent_execution_id=agent_execution_id)
-                    except Exception as e: # Use self.logger below
-                        self.logger.error("lineage.tracking_failed",
-                                    error=str(e),
-                                    error_type=type(e).__name__,
-                                    agent=self._get_agent_name(),
-                                    agent_execution_id=agent_execution_id)
+                        # Extract config metadata
+                        config_snapshot_path = lineage_context.get("config_snapshot_path")
+                        config_hash = lineage_context.get("config_hash")
+                        
+                        # Log step end event
+                        self.event_logger.log_event(
+                            EventType.STEP_END,
+                            {
+                                "step_type": self._get_agent_name(),
+                                "agent_response_summary": {
+                                    "success": True,
+                                    "content": processed_data.get("response", "")
+                                },
+                                "metrics": response_metrics,
+                                "llm_input": {
+                                    "system": messages.system,
+                                    "user": messages.user,
+                                    "formatted_request": messages.formatted_request if hasattr(messages, "formatted_request") else ""
+                                },
+                                "llm_output": self.event_logger._serialize_value(raw_response),
+                                "llm_model": {
+                                    "provider": self.provider.value if hasattr(self, 'provider') else "unknown",
+                                    "model": self.model if hasattr(self, 'model') else "unknown"
+                                }
+                            },
+                            step_name=self._get_agent_name(),
+                            parent_id=parent_id,
+                            config_snapshot_path=config_snapshot_path,
+                            config_hash=config_hash
+                        )
+                        self.logger.info("event_logger.step_end_logged",
+                                         agent=self._get_agent_name(),
+                                         agent_execution_id=agent_execution_id)
+                    except Exception as e:
+                        self.logger.error("event_logger.step_end_failed",
+                                          error=str(e),
+                                          error_type=type(e).__name__,
+                                          agent=self._get_agent_name(),
+                                          agent_execution_id=agent_execution_id)
                 else:
-                    # --- MODIFIED: Use self.logger ---
-                    self.logger.debug("lineage.tracking_skipped",
-                            has_lineage=hasattr(self, 'lineage'),
-                            lineage_enabled=getattr(self.lineage, 'enabled', False) if hasattr(self, 'lineage') else False,
-                            agent=self._get_agent_name())
+                    # Log when event logging is skipped
+                    self.logger.debug("event_logger.tracking_skipped",
+                                     has_event_logger=hasattr(self, 'event_logger'),
+                                     event_logger_enabled=getattr(self.event_logger, 'enabled', False) if hasattr(self, 'event_logger') else False,
+                                     agent=self._get_agent_name())
 
                 # Return successful response with lineage tracking metadata
                 return AgentResponse(
@@ -359,24 +410,43 @@ class BaseAgent(BaseConfig, BaseLLM):
                     metrics=response_metrics
                 )
             except Exception as e:
-                # Handle errors with lineage tracking
-                if lineage_enabled and hasattr(self.lineage, 'track_llm_interaction'):
+                # Log ERROR_EVENT
+                if event_logger_enabled:
                     try:
-                        error_context = {
-                            **lineage_context,
-                            "error": str(e),
-                            "error_type": type(e).__name__
-                        }
-                        self.lineage.track_llm_interaction(
-                            context=error_context,
-                            messages=messages,
-                            response={"error": str(e)},
-                            metrics={"error": True}
+                        # Extract config metadata
+                        config_snapshot_path = lineage_context.get("config_snapshot_path")
+                        config_hash = lineage_context.get("config_hash")
+                        
+                        # Log error event
+                        self.event_logger.log_event(
+                            EventType.ERROR_EVENT,
+                            {
+                                "error_message": str(e),
+                                "error_type": type(e).__name__,
+                                "traceback": traceback.format_exc(),
+                                "location": self._get_agent_name(),
+                                "llm_input": {
+                                    "system": messages.system,
+                                    "user": messages.user,
+                                    "formatted_request": messages.formatted_request if hasattr(messages, "formatted_request") else ""
+                                },
+                                "llm_model": {
+                                    "provider": self.provider.value if hasattr(self, 'provider') else "unknown",
+                                    "model": self.model if hasattr(self, 'model') else "unknown"
+                                }
+                            },
+                            step_name=self._get_agent_name(),
+                            parent_id=parent_id,
+                            config_snapshot_path=config_snapshot_path,
+                            config_hash=config_hash
                         )
-                    except Exception as lineage_error: # Use self.logger below
-                        self.logger.error("lineage.failure_tracking_failed",
-                                    error=str(lineage_error),
-                                    original_error=str(e))
+                        self.logger.info("event_logger.error_event_logged",
+                                        agent=self._get_agent_name(),
+                                        agent_execution_id=agent_execution_id)
+                    except Exception as event_logger_error:
+                        self.logger.error("event_logger.error_event_failed",
+                                        error=str(event_logger_error),
+                                        original_error=str(e))
 
                 self.logger.error("llm.completion_failed",
                         error=str(e),
