@@ -1,0 +1,201 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "C4H Type-Based System Configuration",
+  "description": "Schema for validating the type-based system configuration",
+  "type": "object",
+  "required": ["version", "agents", "skills", "orchestration"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Schema version"
+    },
+    "llm_config": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["anthropic", "openai", "google"],
+          "description": "Default LLM provider"
+        },
+        "model": {
+          "type": "string",
+          "description": "Default LLM model"
+        },
+        "default_parameters": {
+          "type": "object",
+          "properties": {
+            "temperature": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 2,
+              "description": "Temperature setting for LLM generation"
+            },
+            "max_tokens": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum tokens to generate"
+            }
+          }
+        }
+      }
+    },
+    "agents": {
+      "type": "object",
+      "description": "Agent configurations",
+      "patternProperties": {
+        "^[a-zA-Z0-9_]+$": {
+          "type": "object",
+          "required": ["agent_type", "persona_key"],
+          "properties": {
+            "agent_type": {
+              "type": "string",
+              "enum": ["GenericLLMAgent", "GenericOrchestratorAgent"],
+              "description": "Type of agent to instantiate"
+            },
+            "persona_key": {
+              "type": "string",
+              "description": "Reference to persona configuration"
+            },
+            "llm_provider": {
+              "type": "string",
+              "description": "Override for LLM provider"
+            },
+            "llm_model": {
+              "type": "string",
+              "description": "Override for LLM model"
+            }
+          }
+        }
+      }
+    },
+    "skills": {
+      "type": "object",
+      "description": "Skill registry",
+      "patternProperties": {
+        "^[a-zA-Z0-9_]+$": {
+          "type": "object",
+          "required": ["module", "class"],
+          "properties": {
+            "module": {
+              "type": "string",
+              "description": "Python module containing the skill implementation"
+            },
+            "class": {
+              "type": "string",
+              "description": "Class name of the skill implementation"
+            },
+            "method": {
+              "type": "string",
+              "description": "Method name to invoke (default is 'execute')"
+            },
+            "description": {
+              "type": "string",
+              "description": "Human-readable description of the skill"
+            }
+          }
+        }
+      }
+    },
+    "orchestration": {
+      "type": "object",
+      "required": ["default_entry_point"],
+      "properties": {
+        "default_entry_point": {
+          "type": ["string", "null"],
+          "description": "Default entry point for workflow execution"
+        },
+        "error_handling": {
+          "type": "object",
+          "properties": {
+            "fallback": {
+              "type": "string",
+              "enum": ["fail", "retry", "skip"],
+              "description": "Default error handling strategy"
+            },
+            "max_retries": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Maximum retry attempts for failed operations"
+            }
+          }
+        },
+        "lineage_tracking": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Whether lineage tracking is enabled"
+            },
+            "storage_path": {
+              "type": "string",
+              "description": "Path to store lineage information"
+            }
+          }
+        },
+        "agents": {
+          "type": "array",
+          "description": "Agent sequence for orchestration",
+          "items": {
+            "type": "object",
+            "required": ["key", "agent", "inputs"],
+            "properties": {
+              "key": {
+                "type": "string",
+                "description": "Unique identifier for this agent step"
+              },
+              "agent": {
+                "type": "string",
+                "description": "Reference to agent configuration"
+              },
+              "inputs": {
+                "type": "object",
+                "description": "Input mappings for this agent step"
+              },
+              "outputs": {
+                "type": "object",
+                "description": "Output mappings from this agent step"
+              },
+              "next": {
+                "type": ["object", "null"],
+                "description": "Next agent step",
+                "properties": {
+                  "agent": {
+                    "type": "string",
+                    "description": "Key of the next agent step"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "loops": {
+          "type": "array",
+          "description": "Loop patterns for iterative execution",
+          "items": {
+            "type": "object",
+            "required": ["key", "condition", "start_agent"],
+            "properties": {
+              "key": {
+                "type": "string",
+                "description": "Unique identifier for this loop"
+              },
+              "condition": {
+                "type": "string",
+                "description": "Condition expression for continuing the loop"
+              },
+              "start_agent": {
+                "type": "string",
+                "description": "Agent step to start the loop from"
+              },
+              "max_iterations": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum number of loop iterations"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

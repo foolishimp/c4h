@@ -15,7 +15,7 @@ from c4h_agents.agents.base_lineage import BaseLineage # Correct import
 from c4h_agents.agents.lineage_context import LineageContext # Correct import
 from c4h_agents.agents.base_llm import BaseLLM
 from c4h_agents.agents.continuation.continuation_handler import ContinuationHandler
-from c4h_agents.agents.types import AgentResponse, AgentMetrics, LLMProvider, LLMMessages, LogDetail
+from c4h_agents.agents.types import AgentResponse, AgentMetrics, LLMProvider, LLMMessages, LogDetail, SkillResult
 from c4h_agents.config import create_config_node # Keep create_config_node
 from c4h_agents.core.project import Project
 # Import get_logger and log_config_node from the correct utility path
@@ -264,9 +264,9 @@ class BaseAgent(BaseConfig, BaseLLM):
             # Extract data from context
             data = self._get_data(lineage_context)
 
-            # Prepare system and user messages
-            system_message = self._get_system_message()
-            user_message = self._format_request(data)
+            # Prepare system and user messages with context for potential overrides
+            system_message = self._get_system_message(lineage_context)
+            user_message = self._format_request(data, lineage_context)
 
             if self._should_log(LogDetail.DEBUG): # Use self.logger below
                 self.logger.debug("agent.messages",
@@ -289,10 +289,14 @@ class BaseAgent(BaseConfig, BaseLLM):
                 lineage_enabled = hasattr(self, 'lineage') and self.lineage and getattr(self.lineage, 'enabled', False)
 
                 # Get completion with automatic continuation handling (calls BaseLLM method)
-                content, raw_response = self._get_completion_with_continuation([
-                    {"role": "system", "content": messages.system},
-                    {"role": "user", "content": messages.user}
-                ])
+                # Pass lineage_context to support runtime configuration overrides
+                content, raw_response = self._get_completion_with_continuation(
+                    [
+                        {"role": "system", "content": messages.system},
+                        {"role": "user", "content": messages.user}
+                    ],
+                    context=lineage_context
+                )
 
                 # Process response - Calls THIS class's _process_response
                 processed_data = self._process_response(content, raw_response)
@@ -419,17 +423,63 @@ class BaseAgent(BaseConfig, BaseLLM):
             logger_to_use.error("_get_data.failed", error=str(e))
             return {}
 
-    def _format_request(self, context: Dict[str, Any]) -> str:
-         # Default implementation, subclasses should override if specific formatting is needed
-         # Safely convert context to string for basic use
+    def _format_request(self, data: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> str:
+         """
+         Format request with support for dynamic overrides.
+         
+         Args:
+             data: The data to format
+             context: Optional runtime context that may contain overrides
+             
+         Returns:
+             Formatted request string
+         """
          try:
-              # Use self.logger which should be initialized
-              self.logger.debug("_format_request: using default JSON dump")
-              return json.dumps(context, indent=2, default=str) # Safer conversion
+              # Check for a format template override in context
+              template = None
+              template_key = "user"  # Default template key
+              
+              # Check for overrides in context if provided
+              if context:
+                  overrides = context.get('agent_config_overrides', {}).get(self.unique_name, {})
+                  
+                  # Direct template override
+                  if 'template' in overrides:
+                      template = overrides['template']
+                      self.logger.debug("format_request.using_direct_template_override", 
+                                     agent_name=self.unique_name,
+                                     template_length=len(template) if template else 0)
+                  
+                  # Template key override
+                  elif 'template_key' in overrides:
+                      template_key = overrides['template_key']
+                      self.logger.debug("format_request.using_template_key_override", 
+                                     agent_name=self.unique_name,
+                                     template_key=template_key)
+              
+              # If no direct template override, get template from persona
+              if template is None:
+                  # Get template using updated _get_prompt method (which also handles overrides)
+                  template = self._get_prompt(template_key, context)
+              
+              # Format the template with data if it contains format placeholders
+              if isinstance(template, str) and '{' in template:
+                  try:
+                      return template.format(**data)
+                  except KeyError as e:
+                      self.logger.warning("format_request.missing_key_in_template", error=str(e))
+                      # Fall back to JSON format on template key error
+                      return json.dumps(data, indent=2, default=str)
+              elif template:
+                  # Template exists but doesn't need formatting
+                  return str(template)
+              else:
+                  # No template, use default JSON format
+                  self.logger.debug("format_request.using_default_json")
+                  return json.dumps(data, indent=2, default=str)
          except Exception as e:
-              # Use self.logger which should be initialized
-              self.logger.error("_format_request: failed to dump context to JSON", error=str(e))
-              return str(context) # Fallback
+              self.logger.error("format_request.failed", error=str(e))
+              return str(data) # Ultimate fallback
 
     # --- THIS IS THE OVERRIDDEN METHOD IN BaseAgent ---
     # --- Includes fix for nested 'response' and 'llm_output' ---
@@ -567,33 +617,102 @@ class BaseAgent(BaseConfig, BaseLLM):
              if name.endswith("_agent"): name = name[:-6]
              return name or "base_agent"
 
-    def _get_system_message(self) -> str:
-        """Get system message from persona config"""
-        # Get system prompt directly from persona
-        system_prompt = self.config_node.get_value(f"{self.persona_path}.prompts.system")
+    def _get_system_message(self, context: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Get system message with support for dynamic overrides.
+        
+        Args:
+            context: Optional runtime context that may contain overrides
+            
+        Returns:
+            System message string from context override or persona config
+        """
+        # Initialize system_prompt to None to track source
+        system_prompt = None
+        
+        # First check for override in context if provided
+        if context:
+            # Look for override in agent_config_overrides structure
+            overrides = context.get('agent_config_overrides', {}).get(self.unique_name, {})
+            
+            # Direct system_prompt override
+            if 'system_prompt' in overrides:
+                system_prompt = overrides['system_prompt']
+                self.logger.debug("system_prompt.from_context_override", 
+                                agent_name=self.unique_name,
+                                prompt_length=len(system_prompt) if system_prompt else 0)
                 
-        if not system_prompt:
-            self.logger.warning("system_prompt.not_found", 
-                              persona_key=self.persona_key,
-                              persona_path=f"{self.persona_path}.prompts.system")
+            # Or check for system_prompt_key override (key in persona.prompts)
+            elif 'system_prompt_key' in overrides:
+                prompt_key = overrides['system_prompt_key']
+                system_prompt = self.config_node.get_value(f"{self.persona_path}.prompts.{prompt_key}")
+                self.logger.debug("system_prompt.from_key_override", 
+                                agent_name=self.unique_name,
+                                key=prompt_key,
+                                found=system_prompt is not None)
+        
+        # If no override was found, use default from persona
+        if system_prompt is None:
+            system_prompt = self.config_node.get_value(f"{self.persona_path}.prompts.system")
+            
+            if not system_prompt:
+                self.logger.warning("system_prompt.not_found", 
+                                  persona_key=self.persona_key,
+                                  persona_path=f"{self.persona_path}.prompts.system")
                 
         return system_prompt or ""
 
 
-    def _get_prompt(self, prompt_type: str) -> str:
-        """Get a prompt template from persona"""
-        # Get prompt directly from persona configuration
-        persona_prompt_path = f"{self.persona_path}.prompts.{prompt_type}"
-        prompt = self.config_node.get_value(persona_prompt_path)
+    def _get_prompt(self, prompt_type: str, context: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Get a prompt template with support for dynamic overrides.
+        
+        Args:
+            prompt_type: Type of prompt to retrieve (e.g., 'user')
+            context: Optional runtime context that may contain overrides
             
+        Returns:
+            Prompt template string from context override or persona config
+        """
+        # Initialize variables
+        prompt = None
+        prompt_key = prompt_type
+        
+        # First check for override in context if provided
+        if context:
+            # Look for override in agent_config_overrides structure
+            overrides = context.get('agent_config_overrides', {}).get(self.unique_name, {})
+            
+            # Direct prompt override for this specific prompt_type
+            prompt_override_key = f"{prompt_type}_prompt"
+            if prompt_override_key in overrides:
+                prompt = overrides[prompt_override_key]
+                self.logger.debug("prompt.from_direct_override", 
+                                agent_name=self.unique_name,
+                                prompt_type=prompt_type,
+                                prompt_length=len(prompt) if prompt else 0)
+                
+            # Or check for prompt_key override
+            elif 'prompt_key' in overrides:
+                prompt_key = overrides['prompt_key']
+                self.logger.debug("prompt.using_key_override", 
+                                agent_name=self.unique_name,
+                                original_key=prompt_type,
+                                override_key=prompt_key)
+        
+        # If no direct prompt override was found, get from persona using prompt_key
         if prompt is None:
-            # Use self.logger which is initialized
-            agent_name = self._get_agent_name()
-            self.logger.error("prompt.template_not_found", 
-                           prompt_type=prompt_type, 
-                           agent=agent_name,
-                           persona_path=persona_prompt_path)
-            raise ValueError(f"No prompt template '{prompt_type}' found in persona '{self.persona_key}' for agent {agent_name}")
+            persona_prompt_path = f"{self.persona_path}.prompts.{prompt_key}"
+            prompt = self.config_node.get_value(persona_prompt_path)
+            
+            if prompt is None:
+                # Use self.logger which is initialized
+                agent_name = self._get_agent_name()
+                self.logger.error("prompt.template_not_found", 
+                               prompt_type=prompt_key, 
+                               agent=agent_name,
+                               persona_path=persona_prompt_path)
+                raise ValueError(f"No prompt template '{prompt_key}' found in persona '{self.persona_key}' for agent {agent_name}")
             
         # Ensure prompt is a string before returning
         return str(prompt) if prompt is not None else ""
@@ -641,3 +760,151 @@ class BaseAgent(BaseConfig, BaseLLM):
 
         # If lineage context fails, fall back to original context
         return skill_context
+        
+    def _invoke_skill(self, skill_identifier: str, skill_kwargs: Dict[str, Any]) -> SkillResult:
+        """
+        Dynamically invoke a skill by identifier.
+        
+        Args:
+            skill_identifier: String in format "module.Class.method" or "module.Class"
+            skill_kwargs: Arguments to pass to the skill execute method
+            
+        Returns:
+            SkillResult from the skill execution
+        """
+        logger_to_use = self.logger
+        try:
+            # Parse the skill identifier
+            parts = skill_identifier.split('.')
+            
+            # Need at least module and class
+            if len(parts) < 2:
+                logger_to_use.error("skill.invalid_identifier", identifier=skill_identifier)
+                return SkillResult(
+                    success=False, 
+                    error=f"Invalid skill identifier format: {skill_identifier}. Expected 'module.Class' or 'module.Class.method'"
+                )
+                
+            module_path = '.'.join(parts[:-1]) if len(parts) > 2 else parts[0]
+            class_name = parts[-1] if len(parts) <= 2 else parts[-2]
+            method_name = 'execute' if len(parts) <= 2 else parts[-1]
+            
+            logger_to_use.debug("skill.resolution", 
+                              module=module_path, 
+                              class_name=class_name, 
+                              method=method_name)
+            
+            # Import the module
+            try:
+                # Try relative to c4h_agents first
+                try:
+                    full_module_path = f"c4h_agents.{module_path}"
+                    module = __import__(full_module_path, fromlist=[class_name])
+                except (ImportError, ModuleNotFoundError):
+                    # If that fails, try the direct path
+                    module = __import__(module_path, fromlist=[class_name])
+                    
+                # Get the class
+                skill_class = getattr(module, class_name)
+                
+            except (ImportError, ModuleNotFoundError) as e:
+                logger_to_use.error("skill.module_import_failed", 
+                                  module=module_path, 
+                                  error=str(e))
+                return SkillResult(
+                    success=False, 
+                    error=f"Failed to import skill module '{module_path}': {str(e)}"
+                )
+            except AttributeError as e:
+                logger_to_use.error("skill.class_not_found", 
+                                  module=module_path, 
+                                  class_name=class_name, 
+                                  error=str(e))
+                return SkillResult(
+                    success=False, 
+                    error=f"Skill class '{class_name}' not found in module '{module_path}': {str(e)}"
+                )
+                
+            # Instantiate the skill with our config
+            try:
+                # Pass our effective config to the skill
+                skill_instance = skill_class(self.config, class_name)
+            except Exception as e:
+                logger_to_use.error("skill.instantiation_failed", 
+                                  class_name=class_name, 
+                                  error=str(e))
+                return SkillResult(
+                    success=False, 
+                    error=f"Failed to instantiate skill '{class_name}': {str(e)}"
+                )
+                
+            # Get the method
+            try:
+                skill_method = getattr(skill_instance, method_name)
+            except AttributeError as e:
+                logger_to_use.error("skill.method_not_found", 
+                                  class_name=class_name, 
+                                  method_name=method_name, 
+                                  error=str(e))
+                return SkillResult(
+                    success=False, 
+                    error=f"Method '{method_name}' not found in skill '{class_name}': {str(e)}"
+                )
+                
+            # Prepare lineage context for skill execution
+            try:
+                # Add lineage tracking context
+                skill_context = self.call_skill(class_name, skill_kwargs)
+                skill_kwargs.update(skill_context)
+            except Exception as e:
+                logger_to_use.warning("skill.lineage_preparation_failed", 
+                                   error=str(e), 
+                                   proceeding="without_lineage")
+                # Proceed without lineage tracking
+            
+            # Call the method
+            try:
+                result = skill_method(**skill_kwargs)
+                
+                # Make sure the result is a SkillResult
+                if not isinstance(result, SkillResult):
+                    logger_to_use.warning("skill.invalid_result_type", 
+                                       expected="SkillResult", 
+                                       actual=type(result).__name__)
+                    # Wrap in SkillResult if not already
+                    if hasattr(result, 'success'):
+                        # Has success attribute - likely compatible
+                        return SkillResult(
+                            success=getattr(result, 'success', False),
+                            value=result,
+                            error=getattr(result, 'error', None)
+                        )
+                    else:
+                        # No success attribute - treat as raw value
+                        return SkillResult(
+                            success=True,
+                            value=result
+                        )
+                        
+                return result
+                
+            except Exception as e:
+                logger_to_use.error("skill.execution_failed", 
+                                  class_name=class_name, 
+                                  method_name=method_name, 
+                                  error=str(e),
+                                  exc_info=True)
+                return SkillResult(
+                    success=False, 
+                    error=f"Skill execution failed: {str(e)}"
+                )
+                
+        except Exception as e:
+            logger_to_use.error("skill.invocation_failed", 
+                              identifier=skill_identifier, 
+                              error=str(e),
+                              exc_info=True)
+            return SkillResult(
+                success=False, 
+                error=f"Skill invocation failed: {str(e)}"
+            )

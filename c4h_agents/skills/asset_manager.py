@@ -4,40 +4,91 @@ Path: c4h_agents/skills/asset_manager.py
 """
 
 from pathlib import Path
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List
 from dataclasses import dataclass
 import shutil
 import os
+import json
 from datetime import datetime
 
-from c4h_agents.agents.base_agent import BaseAgent, AgentResponse 
+from c4h_agents.skills.base_skill import BaseSkill
+from c4h_agents.agents.types import SkillResult
 from c4h_agents.skills.semantic_merge import SemanticMerge
 from c4h_agents.utils.logging import get_logger
 
 logger = get_logger()
 
 @dataclass
-class AssetResult:
-    """Result of an asset operation"""
-    success: bool
+class AssetPath:
+    """Describes a file path with relevant metadata"""
     path: Path
+    exists: bool = False
+    is_file: bool = False
+    is_dir: bool = False
+    size: Optional[int] = None
+    modified: Optional[str] = None
+    
+    @classmethod
+    def from_path(cls, path: Path) -> 'AssetPath':
+        """Create AssetPath from a Path object with populated metadata"""
+        exists = path.exists()
+        is_file = path.is_file()
+        is_dir = path.is_dir()
+        size = path.stat().st_size if exists and is_file else None
+        modified = datetime.fromtimestamp(path.stat().st_mtime).isoformat() if exists else None
+        
+        return cls(
+            path=path,
+            exists=exists,
+            is_file=is_file,
+            is_dir=is_dir,
+            size=size,
+            modified=modified
+        )
+        
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization"""
+        return {
+            "path": str(self.path),
+            "exists": self.exists,
+            "is_file": self.is_file,
+            "is_dir": self.is_dir,
+            "size": self.size,
+            "modified": self.modified
+        }
+
+@dataclass
+class AssetOperationResult:
+    """Detailed result of an asset operation"""
+    operation: str
+    success: bool
+    source_path: Optional[Path] = None
+    target_path: Optional[Path] = None
     backup_path: Optional[Path] = None
     error: Optional[str] = None
-
-class AssetManager(BaseAgent):
-    """Manages file operations with simple backup support"""
     
-    def __init__(self, config: Dict[str, Any] = None, **kwargs):
-        """Initialize with basic config and backup settings"""
-        # Pass positional parameters to BaseAgent
-        super().__init__(config, "asset_manager")
-        
-        # The unique_name is now stored by BaseAgent
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization"""
+        return {
+            "operation": self.operation,
+            "success": self.success,
+            "source_path": str(self.source_path) if self.source_path else None,
+            "target_path": str(self.target_path) if self.target_path else None,
+            "backup_path": str(self.backup_path) if self.backup_path else None,
+            "error": self.error
+        }
+
+class AssetManager(BaseSkill):
+    """Manages file operations with improved backup support"""
+    
+    def __init__(self, config: Dict[str, Any], skill_name: str = "asset_manager"):
+        """Initialize with configuration and skill name"""
+        super().__init__(config, skill_name)
         
         # Get project path from config if available
         self.project_path = None
-        if isinstance(config, dict) and 'project' in config:
-            project_config = config['project']
+        if 'project' in self.config:
+            project_config = self.config['project']
             if isinstance(project_config, dict):
                 self.project_path = Path(project_config.get('path', '.')).resolve()
                 workspace_root = project_config.get('workspace_root', 'workspaces')
@@ -45,301 +96,304 @@ class AssetManager(BaseAgent):
                     workspace_root = str(self.project_path / workspace_root)
                 self.backup_dir = Path(workspace_root) / "backups"
             else:
-                # Handle Project instance
-                self.project_path = project_config.paths.root
-                self.backup_dir = project_config.paths.workspace / "backups"
+                # Handle Project instance if present
+                try:
+                    self.project_path = getattr(project_config, 'paths', {}).root
+                    self.backup_dir = getattr(project_config, 'paths', {}).workspace / "backups"
+                except (AttributeError, TypeError):
+                    self.logger.warning("asset_manager.project_config_invalid", 
+                                      type=type(project_config).__name__)
+                    self.project_path = Path('.').resolve()
+                    self.backup_dir = Path('workspaces/backups')
         else:
-            # Fallback for no project config
-            self.backup_dir = Path(kwargs.get('backup_dir', 'workspaces/backups')).resolve()
-
-        # Configure backup and create merger
-        self.backup_enabled = kwargs.get('backup_enabled', False)
-        if self.backup_enabled:
-            self.backup_dir.mkdir(parents=True, exist_ok=True)
-            logger.info("asset_manager.backup_enabled", backup_dir=str(self.backup_dir))
-        else:
-            logger.info("asset_manager.backup_disabled")
-        
-        # Get semantic merger
-        self.merger = kwargs.get('merger')
-        if not self.merger:
-            self.merger = SemanticMerge(config=config)
-
-        logger.info("asset_manager.initialized",
-                   backup_enabled=self.backup_enabled,
-                   backup_dir=str(self.backup_dir),
-                   project_path=str(self.project_path) if self.project_path else None,
-                   cwd=os.getcwd())
-
-    def _resolve_file_path(self, file_path: str) -> Path:
-        """
-        Single source of truth for resolving file paths.
-        Used consistently for all file operations (read/write/backup).
-        """
-        original_path = Path(file_path)
-        
-        # Absolute paths are used as-is
-        if original_path.is_absolute():
-            resolved_path = original_path
-            logger.debug("asset_manager.path_absolute", path=str(resolved_path))
-            return resolved_path
+            # Default paths if no project config
+            self.project_path = Path('.').resolve()
+            self.backup_dir = Path('workspaces/backups')
             
-        # We need a project path for relative resolution
-        if not self.project_path:
-            # No project path, use CWD
-            resolved_path = (Path.cwd() / original_path).resolve()
-            logger.debug("asset_manager.path_cwd_relative", 
-                        original=file_path, 
-                        resolved=str(resolved_path))
-            return resolved_path
-            
-        # Handle special case for tests/test_projects paths
-        if str(original_path).startswith('tests/test_projects/'):
-            # Extract relative part after tests/test_projects
-            path_parts = original_path.parts
-            if len(path_parts) > 2:
-                relative_path = Path(*path_parts[2:])
-                resolved_path = (self.project_path / relative_path).resolve()
-                logger.debug("asset_manager.path_special_case", 
-                           original=file_path, 
-                           relative=str(relative_path), 
-                           resolved=str(resolved_path))
-                return resolved_path
+        # Create backup directory if it doesn't exist
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
         
-        # Standard project-relative path
-        resolved_path = (self.project_path / original_path).resolve()
-        logger.debug("asset_manager.path_project_relative", 
-                   original=file_path, 
-                   project=str(self.project_path), 
-                   resolved=str(resolved_path))
-        return resolved_path
+        self.logger.debug("asset_manager.initialized", 
+                        project_path=str(self.project_path),
+                        backup_dir=str(self.backup_dir))
 
-    def _create_backup(self, file_path: Path) -> Optional[Path]:
+    def execute(self, **kwargs) -> SkillResult:
         """
-        Create a backup of a file if it exists and backups are enabled.
+        Execute the asset management operation.
         
         Args:
-            file_path: The resolved path to backup
+            action: The action to perform (read, write, backup, etc.)
+            path: Path to the file or directory
+            content: Content to write (for write operations)
+            **kwargs: Additional parameters for specific actions
             
         Returns:
-            Path to backup file or None if no backup was created
+            SkillResult with the operation outcome
         """
-        if not self.backup_enabled or not file_path.exists():
-            return None
+        # Extract parameters
+        action = kwargs.get('action', 'info')
+        path_str = kwargs.get('path')
+        content = kwargs.get('content')
+        
+        # Log request
+        self.logger.info("asset_manager.execute", 
+                       action=action, 
+                       path=path_str, 
+                       has_content=content is not None)
+                       
+        # Validate path
+        if not path_str:
+            return SkillResult(
+                success=False,
+                error="Path parameter is required"
+            )
+        
+        # Normalize path
+        path = Path(path_str)
+        if not path.is_absolute() and self.project_path:
+            path = self.project_path / path
+            
+        # Resolve path
+        try:
+            path = path.resolve()
+        except Exception as e:
+            return SkillResult(
+                success=False,
+                error=f"Failed to resolve path: {str(e)}"
+            )
+            
+        # Dispatch to appropriate method based on action
+        try:
+            if action == 'read':
+                return self._handle_errors(self._read_file, path)
+            elif action == 'write':
+                return self._handle_errors(self._write_file, path, content)
+            elif action == 'backup':
+                return self._handle_errors(self._backup_file, path)
+            elif action == 'delete':
+                return self._handle_errors(self._delete_file, path)
+            elif action == 'info':
+                return self._handle_errors(self._get_file_info, path)
+            elif action == 'list':
+                return self._handle_errors(self._list_directory, path)
+            else:
+                return SkillResult(
+                    success=False,
+                    error=f"Unsupported action: {action}"
+                )
+        except Exception as e:
+            self.logger.error("asset_manager.execute_failed", 
+                           action=action, 
+                           path=str(path), 
+                           error=str(e))
+            return SkillResult(
+                success=False,
+                error=f"Operation failed: {str(e)}"
+            )
+            
+    def _get_file_info(self, path: Path) -> SkillResult:
+        """Get information about a file or directory"""
+        asset_path = AssetPath.from_path(path)
+        return SkillResult(
+            success=True,
+            value=asset_path.to_dict()
+        )
+        
+    def _read_file(self, path: Path) -> SkillResult:
+        """Read a file and return its contents"""
+        if not path.exists():
+            return SkillResult(
+                success=False,
+                error=f"File not found: {path}"
+            )
+            
+        if not path.is_file():
+            return SkillResult(
+                success=False,
+                error=f"Not a file: {path}"
+            )
             
         try:
-            # Create timestamped backup directory
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_dir = self.backup_dir / timestamp
-            
-            # Determine relative structure for backup
-            if self.project_path and str(file_path).startswith(str(self.project_path)):
-                try:
-                    # Get path relative to project
-                    rel_path = file_path.relative_to(self.project_path)
-                    backup_path = backup_dir / rel_path
-                except ValueError:
-                    # Fallback if not relative to project
-                    backup_path = backup_dir / file_path.name
-            else:
-                # Not in project, just use filename
-                backup_path = backup_dir / file_path.name
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
                 
-            # Ensure backup directory exists
+            return SkillResult(
+                success=True,
+                value={
+                    "content": content,
+                    "path": str(path),
+                    "size": path.stat().st_size,
+                    "modified": datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+                }
+            )
+        except Exception as e:
+            return SkillResult(
+                success=False,
+                error=f"Failed to read file: {str(e)}"
+            )
+            
+    def _write_file(self, path: Path, content: str) -> SkillResult:
+        """Write content to a file with automatic backup"""
+        if path.exists() and path.is_file():
+            # Backup existing file
+            backup_result = self._backup_file(path)
+            if not backup_result.success:
+                return SkillResult(
+                    success=False,
+                    error=f"Failed to backup file before writing: {backup_result.error}",
+                    value=backup_result.value
+                )
+                
+        # Create parent directories if they don't exist
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return SkillResult(
+                success=False,
+                error=f"Failed to create directory structure: {str(e)}"
+            )
+            
+        # Write the file
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(content)
+                
+            return SkillResult(
+                success=True,
+                value={
+                    "path": str(path),
+                    "size": path.stat().st_size,
+                    "modified": datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+                }
+            )
+        except Exception as e:
+            return SkillResult(
+                success=False,
+                error=f"Failed to write file: {str(e)}"
+            )
+            
+    def _backup_file(self, path: Path) -> SkillResult:
+        """Create a backup of a file"""
+        if not path.exists():
+            return SkillResult(
+                success=False,
+                error=f"File not found: {path}"
+            )
+            
+        if not path.is_file():
+            return SkillResult(
+                success=False,
+                error=f"Not a file: {path}"
+            )
+            
+        try:
+            # Create timestamped backup name
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            relative_path = path.relative_to(self.project_path) if self.project_path and str(path).startswith(str(self.project_path)) else path.name
+            backup_path = self.backup_dir / f"{timestamp}_{relative_path}"
+            
+            # Create parent directories
             backup_path.parent.mkdir(parents=True, exist_ok=True)
             
-            # Copy the file
-            shutil.copy2(file_path, backup_path)
-            logger.info("asset_manager.backup_created",
-                       original=str(file_path),
-                       backup=str(backup_path))
-                       
-            return backup_path
+            # Copy file
+            shutil.copy2(path, backup_path)
             
+            return SkillResult(
+                success=True,
+                value={
+                    "original_path": str(path),
+                    "backup_path": str(backup_path),
+                    "timestamp": timestamp
+                }
+            )
         except Exception as e:
-            logger.error("asset_manager.backup_failed", 
-                       file=str(file_path), 
-                       error=str(e))
-            return None
-
-    def _ensure_directory_exists(self, path: Path) -> bool:
+            return SkillResult(
+                success=False,
+                error=f"Failed to create backup: {str(e)}"
+            )
+            
+    def _delete_file(self, path: Path) -> SkillResult:
+        """Delete a file with automatic backup"""
+        if not path.exists():
+            return SkillResult(
+                success=False,
+                error=f"File not found: {path}"
+            )
+            
+        if not path.is_file():
+            return SkillResult(
+                success=False,
+                error=f"Not a file: {path}"
+            )
+            
+        # Backup before deletion
+        backup_result = self._backup_file(path)
+        if not backup_result.success:
+            return SkillResult(
+                success=False,
+                error=f"Failed to backup file before deletion: {backup_result.error}",
+                value=backup_result.value
+            )
+            
+        try:
+            # Delete the file
+            path.unlink()
+            
+            return SkillResult(
+                success=True,
+                value={
+                    "deleted_path": str(path),
+                    "backup_info": backup_result.value
+                }
+            )
+        except Exception as e:
+            return SkillResult(
+                success=False,
+                error=f"Failed to delete file: {str(e)}",
+                value={"backup_info": backup_result.value}
+            )
+            
+    def _list_directory(self, path: Path) -> SkillResult:
+        """List contents of a directory"""
+        if not path.exists():
+            return SkillResult(
+                success=False,
+                error=f"Directory not found: {path}"
+            )
+            
+        if not path.is_dir():
+            return SkillResult(
+                success=False,
+                error=f"Not a directory: {path}"
+            )
+            
+        try:
+            items = []
+            for item in path.iterdir():
+                items.append(AssetPath.from_path(item).to_dict())
+                
+            return SkillResult(
+                success=True,
+                value={
+                    "path": str(path),
+                    "items": items,
+                    "count": len(items)
+                }
+            )
+        except Exception as e:
+            return SkillResult(
+                success=False,
+                error=f"Failed to list directory: {str(e)}"
+            )
+            
+    def process_action(self, action_data: Dict[str, Any]) -> SkillResult:
         """
-        Ensure the directory for a file exists, creating it if necessary.
+        Process an asset management action (legacy compatibility method)
         
         Args:
-            path: The file path whose parent directories should exist
+            action_data: Dictionary with action parameters
             
         Returns:
-            True if successful, False if failed
+            SkillResult with the operation outcome
         """
-        try:
-            # Create parent directories if they don't exist
-            directory = path.parent
-            if not directory.exists():
-                logger.info("asset_manager.creating_directory", 
-                           directory=str(directory))
-                directory.mkdir(parents=True, exist_ok=True)
-                
-                # Verify directory was created
-                if not directory.exists():
-                    logger.error("asset_manager.directory_creation_failed")
-                    return False
-                    
-                logger.info("asset_manager.directory_created", 
-                           directory=str(directory))
-            return True
-        except Exception as e:
-            logger.error("asset_manager.directory_creation_failed", 
-                       directory=str(path.parent),
-                       error=str(e))
-            return False
-
-    def process_action(self, action: Union[str, Dict[str, Any]]) -> AssetResult:
-        """Process single file action focusing on path handling and backup"""
-        try:
-            # Find file path in action using semantic extractor pattern
-            file_path = None
-            if isinstance(action, dict):
-                # Check common path keys
-                for key in ['file_path', 'path', 'file', 'filename']:
-                    if key in action and action[key]:
-                        file_path = action[key]
-                        break
-                    
-            if not file_path:
-                raise ValueError("No file path found in action")
-
-            # Resolve file path using consistent resolution logic
-            resolved_path = self._resolve_file_path(file_path)
-            exists = resolved_path.exists()
-            
-            logger.info("asset_manager.file_resolved",
-                       original=file_path,
-                       resolved=str(resolved_path),
-                       exists=exists)
-
-            # Create a backup if the file exists
-            backup_path = None
-            if exists:
-                backup_path = self._create_backup(resolved_path)
-                # Get original content for the file and add to action context
-                try:
-                    original_content = resolved_path.read_text()
-                    if isinstance(action, dict) and 'original' not in action:
-                        action_copy = dict(action)
-                        action_copy['original'] = original_content
-                    else:
-                        action_copy = action
-                except Exception as e:
-                    logger.error("asset_manager.read_original_failed", 
-                               file=str(resolved_path), 
-                               error=str(e))
-                    action_copy = action
-            else:
-                # For new files, explicitly mark as create operation
-                if isinstance(action, dict):
-                    action_copy = dict(action)
-                    action_copy['type'] = 'create'
-                    # Use special marker for new files to help the merger
-                    action_copy['original'] = "New file - no original content"
-                else:
-                    action_copy = action
-            
-            # Enhance the context with the file path
-            if isinstance(action_copy, dict):
-                action_copy['file_path'] = str(resolved_path)
-            
-            # Ensure directory exists before attempting merge
-            if not self._ensure_directory_exists(resolved_path):
-                return AssetResult(
-                    success=False,
-                    path=resolved_path,
-                    backup_path=backup_path,
-                    error=f"Failed to create directory: {resolved_path.parent}"
-                )
-            
-            # Let merger handle content merging/creation
-            merge_result = self.merger.process(action_copy)
-            
-            if not merge_result.success:
-                logger.error("asset_manager.merge_failed", error=merge_result.error)
-                return AssetResult(
-                    success=False,
-                    path=resolved_path,
-                    backup_path=backup_path,
-                    error=merge_result.error
-                )
-                
-            # Get merged content
-            content = merge_result.data.get('response')
-            if not content:
-                logger.error("asset_manager.no_content")
-                return AssetResult(
-                    success=False,
-                    path=resolved_path,
-                    backup_path=backup_path,
-                    error="No content after merge"
-                )
-
-            # Write final content to the resolved path
-            try:
-                resolved_path.write_text(content)
-                logger.info("asset_manager.content_written", path=str(resolved_path))
-                
-                # Verify file was written correctly
-                if not resolved_path.exists():
-                    raise FileNotFoundError(f"File was not created: {resolved_path}")
-                    
-                actual_size = resolved_path.stat().st_size
-                expected_size = len(content.encode('utf-8'))
-                if actual_size == 0 or abs(actual_size - expected_size) > 10:  # Allow small difference due to encoding
-                    logger.warning("asset_manager.file_size_mismatch",
-                                  path=str(resolved_path),
-                                  expected=expected_size,
-                                  actual=actual_size)
-            except Exception as e:
-                logger.error("asset_manager.write_failed",
-                           path=str(resolved_path),
-                           error=str(e))
-                return AssetResult(
-                    success=False,
-                    path=resolved_path,
-                    backup_path=backup_path,
-                    error=f"Failed to write file: {str(e)}"
-                )
-            
-            return AssetResult(
-                success=True, 
-                path=resolved_path, 
-                backup_path=backup_path
-            )
-
-        except Exception as e:
-            logger.error("asset.process_failed", 
-                error=str(e),
-                path=str(resolved_path) if 'resolved_path' in locals() else None,
-                file_path=file_path if 'file_path' in locals() else None,
-                project=str(self.project_path) if self.project_path else None
-            )
-            return AssetResult(
-                success=False,
-                path=resolved_path if 'resolved_path' in locals() else Path('.'),
-                backup_path=None,
-                error=str(e)
-            )
-
-    def process(self, context: Dict[str, Any]) -> AgentResponse:
-        """Process asset operations with standard agent interface"""
-        try:
-            result = self.process_action(context)
-            return AgentResponse(
-                success=result.success, 
-                data={
-                    "path": str(result.path),
-                    "backup_path": str(result.backup_path) if result.backup_path else None
-                },
-                error=result.error
-            )
-        except Exception as e:
-            logger.error("asset_manager.process_failed", error=str(e))
-            return AgentResponse(success=False, data={}, error=str(e))
+        return self.execute(**action_data)

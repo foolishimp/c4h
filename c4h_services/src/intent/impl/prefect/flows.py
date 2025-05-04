@@ -1,36 +1,23 @@
 # File: /Users/jim/src/apps/c4h_ai_dev/c4h_services/src/intent/impl/prefect/flows.py
-# Correction: Remove legacy run_intent_workflow which uses deleted factories
+"""
+Flow implementations for prefect-based workflow orchestration.
+This module contains the recovery workflow implementation.
+The primary workflows have been moved to workflows.py.
+"""
 
 from prefect import flow, task, get_run_logger
 from prefect.states import Completed, Failed, Pending
-from prefect.context import get_flow_context, FlowRunContext # Keep FlowRunContext if used elsewhere
+from prefect.context import get_flow_context, FlowRunContext
 from prefect.utilities.annotations import unmapped
 from typing import Dict, Any, Optional
-# Import get_logger from the shared utility path
 from c4h_services.src.utils.logging import get_logger
 from pathlib import Path
 import json
 
-# Remove imports for deleted factory functions:
-# from .tasks import (
-#     create_discovery_task,
-#     create_solution_task,
-#     create_coder_task,
-#     create_assurance_task
-# )
-# Import run_agent_task if it's still needed by other flows in this file (e.g., recovery)
 from .tasks import run_agent_task
 
 # Use the imported get_logger
 logger = get_logger()
-
-# --- REMOVE the entire run_intent_workflow function ---
-# The declarative workflow (`run_declarative_workflow` in workflows.py)
-# replaces this legacy approach.
-
-# @flow(name="intent_refactoring", ...)
-# def run_intent_workflow(...):
-#    ... (entire function body deleted) ...
 
 
 @flow(name="intent_recovery")

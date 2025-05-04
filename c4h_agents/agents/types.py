@@ -3,11 +3,65 @@ Core type definitions for agent system.
 Path: c4h_agents/agents/types.py
 """
 
-from typing import Dict, Any, Optional, List, Literal, Union
-from enum import Enum
+from typing import Dict, Any, Optional, List, Literal, Union, TypeVar, Generic
+from enum import Enum, auto
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+# Type variable for generic value in SkillResult
+T = TypeVar('T')
+
+class AgentType(str, Enum):
+    """
+    Standardized agent type identifiers for the type-based agent architecture
+    
+    These types define the primary role and behavior of the agent:
+    - GENERIC_LLM: For general single-shot LLM interactions (replacing GenericSingleShotAgent)
+    - GENERIC_ORCHESTRATOR: For coordinating multi-step processes with execution plans
+    - GENERIC_SKILL: For specialized processing tasks with minimal LLM interaction
+    - GENERIC_FALLBACK: For handling failures and error cases with conservative parameters
+    """
+    GENERIC_LLM = "GenericLLMAgent"
+    GENERIC_ORCHESTRATOR = "GenericOrchestratorAgent"  
+    GENERIC_SKILL = "GenericSkillAgent"
+    GENERIC_FALLBACK = "GenericFallbackAgent"
+    
+    # Legacy type for backward compatibility
+    GENERIC_SINGLE_SHOT = "GenericSingleShotAgent"
+    
+    @classmethod
+    def from_str(cls, type_str: str) -> 'AgentType':
+        """
+        Convert a string to an AgentType with fallback to GENERIC_LLM
+        
+        Args:
+            type_str: String representation of agent type
+            
+        Returns:
+            Corresponding AgentType enum value, or GENERIC_LLM if not found
+        """
+        try:
+            return cls(type_str)
+        except ValueError:
+            # Try with case-insensitive matching
+            for t in cls:
+                if t.value.lower() == type_str.lower():
+                    return t
+            # Default to GENERIC_LLM as fallback
+            return cls.GENERIC_LLM
+            
+    def is_orchestrator(self) -> bool:
+        """Check if this agent type is an orchestrator"""
+        return self in (self.GENERIC_ORCHESTRATOR,)
+        
+    def is_skill_based(self) -> bool:
+        """Check if this agent type is skill-based"""
+        return self in (self.GENERIC_SKILL,)
+        
+    def is_fallback(self) -> bool:
+        """Check if this agent type is a fallback type"""
+        return self in (self.GENERIC_FALLBACK,)
 
 class LogDetail(str, Enum):
     """Log detail levels for agent operations"""
@@ -135,3 +189,31 @@ class AgentConfig:
     max_retries: int = 3
     retry_delay: int = 30
     log_level: LogDetail = LogDetail.BASIC
+    
+@dataclass
+class SkillResult(Generic[T]):
+    """Standardized result type for all skill operations"""
+    success: bool
+    value: Optional[T] = None
+    error: Optional[str] = None
+    metrics: Optional[Dict[str, Any]] = None
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization"""
+        return {
+            "success": self.success,
+            "value": self.value,
+            "error": self.error,
+            "metrics": self.metrics,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None
+        }
+        
+    def to_agent_response(self) -> AgentResponse:
+        """Convert to AgentResponse for compatibility with agent interfaces"""
+        return AgentResponse(
+            success=self.success,
+            data={"skill_result": self.value} if self.value is not None else {},
+            error=self.error,
+            metrics=self.metrics
+        )

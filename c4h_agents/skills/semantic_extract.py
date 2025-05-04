@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime
 from c4h_agents.agents.base_agent import BaseAgent, AgentResponse 
-from skills.shared.markdown_utils import extract_code_block, is_code_block
+from c4h_agents.skills.shared.markdown_utils import extract_code_block, is_code_block
 from c4h_agents.utils.logging import get_logger
 
 logger = get_logger()

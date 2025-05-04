@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Optional, Iterator, Union
 import json
 import re
 from c4h_agents.agents.base_agent import BaseAgent, AgentResponse
-from skills.shared.types import ExtractConfig
+from c4h_agents.skills.shared.types import ExtractConfig
 from c4h_agents.utils.logging import get_logger
 
 logger = get_logger()

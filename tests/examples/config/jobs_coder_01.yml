@@ -13,4 +13,24 @@ workorder:
       - Add logging configuration
       - Enable lineage tracking for observability
 
+# Orchestration section - for compatibility with server mode
+orchestration:
+  enabled: true
+  entry_team: "discovery"
+  teams:
+    discovery:
+      tasks:
+        - name: "discovery_phase"
+          agent_type: "GenericLLMAgent"
+          persona_key: "discovery"
+    solution:
+      tasks:
+        - name: "solution_design_phase"
+          agent_type: "GenericLLMAgent" 
+          persona_key: "solution_designer"
+    coder:
+      tasks:
+        - name: "coding_phase"
+          agent_type: "GenericOrchestratorAgent"
+          persona_key: "coder"
 

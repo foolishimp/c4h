@@ -42,7 +42,7 @@ class ContinuationHandler:
         self.logger.debug("ContinuationHandler initialized", parent_agent_type=type(parent_agent).__name__)
 
     def get_completion_with_continuation(
-            self, messages: List[Dict[str, str]], max_attempts: Optional[int] = None
+            self, messages: List[Dict[str, str]], max_attempts: Optional[int] = None, context: Optional[Dict[str, Any]] = None
     ) -> Tuple[str, Any]:
         """Get completion with automatic continuation using window-based approach with explicit overlaps."""
         attempt = 0

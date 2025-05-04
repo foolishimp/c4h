@@ -1,6 +1,6 @@
 # C4H Agent System Refactoring: Factory Model & Enhanced Orchestration
-**Version: 1.3**
-**Date: 2025-05-01**
+**Version: 1.4**
+**Date: 2025-05-02**
 
 ## 1. Introduction
 
@@ -38,9 +38,11 @@ This refactoring removes all backward compatibility, eliminates technical debt, 
 
 **R11: Recursion Safety Controls:** Implement mechanisms within the Prefect orchestration flow to prevent infinite recursion, including Maximum Total Team Executions and Maximum Team Recursion Depth per team instance. (See Section 3.4.4)
 
-**R12: Effective Configuration Snapshots (New):** For every job run, the system *must* generate and persist an immutable snapshot of the effective configuration *after* all merging, persona injection, and environment variable expansion. Agent execution *must* be based solely on this snapshot. The snapshot path must be recorded in the run's lineage/metadata. (See Section 3.4.3)
+**R12: Effective Configuration Snapshots (New):** For every job run, the system *must* generate and persist an immutable snapshot of the effective configuration *after* all merging, persona injection, and environment variable expansion. Agent execution *must* be based solely on this snapshot. The snapshot path must be recorded in the run's lineage/metadata. (See Section 3.4.4)
 
-**R13: Configuration Schema Validation (New):** Before merging configuration fragments, each fragment *must* be validated against a predefined JSON Schema to ensure structural correctness and presence of required fields. (See Section 3.4.3)
+**R13: Configuration Schema Validation (New):** Before merging configuration fragments, each fragment *must* be validated against a predefined JSON Schema to ensure structural correctness and presence of required fields. (See Section 3.4.4)
+
+**R14: Loop-Based Orchestration (New):** Implement support for loop-based iteration over collections within the orchestration framework. Teams marked with `type: "loop"` must iterate over a specified collection and execute defined tasks or teams for each item, with proper context propagation and aggregated result handling. (See Section 3.4.3)
 
 ## 3. Design
 
@@ -146,7 +148,53 @@ Enhance the `orchestration.teams.<team_id>.routing.rules.condition` syntax. A st
 
 (Unchanged from v1.2 - routing task returns `next_team_id` and `context_updates`, main flow merges updates before next team execution).
 
-#### 3.4.3. Prefect Implementation Refactoring (`c4h_services` - Updated)
+#### 3.4.3. Loop Orchestration (NEW)
+
+The orchestration framework now supports loop-based iteration over collections through a declarative configuration. This enables complex data processing workflows where the same operations need to be applied to multiple items.
+
+Key characteristics of loop teams:
+* **Loop Configuration:** A team can be designated as a loop by setting `type: "loop"` in its configuration
+* **Collection Iteration:** The loop iterates over items in a collection specified by the `iterate_on` path
+* **Item Variable:** Each item is assigned to a variable name specified by `loop_variable` (defaults to "item")
+* **Loop Body:** The `body` parameter defines tasks or teams to execute for each iteration
+* **Failure Handling:** `break_on_failure` and `stop_on_failure` control behavior when iterations fail
+* **Context Propagation:** Loop variable and iteration metadata are added to the context for each iteration
+
+**Example Loop Team Configuration:**
+```yaml
+batch_processor:
+  name: "Batch Processing Loop"
+  type: "loop"
+  iterate_on: "context.batches"  # Path to collection in context
+  loop_variable: "batch"         # Variable name for current item
+  break_on_failure: false        # Whether to stop entire loop on iteration failure
+  stop_on_failure: true          # Whether to stop current iteration on task failure
+  body:                          # Tasks or teams to execute per iteration
+    - name: "process_batch"
+      agent_type: "generic_single_shot"
+      persona_key: "processor"
+    - "validation_team"         # Reference to another team
+  routing:
+    default: "summarizer"        # Team to execute after loop completion
+```
+
+The loop body can contain either:
+1. Task definitions - similar to regular team tasks
+2. Team references - strings that reference other team IDs to execute
+
+For each iteration, a new context is created that includes:
+* The original context
+* The current item assigned to the loop variable
+* `loop_index` - the current zero-based iteration index
+* `loop_count` - the total number of items in the collection
+
+This mechanism enables complex workflows such as:
+* Processing each file in a collection of files
+* Transforming each item in a batch of data
+* Executing analysis on each entity in a dataset
+* Running validation steps on each component
+
+#### 3.4.4. Prefect Implementation Refactoring (`c4h_services` - Updated)
 
 * **`render_config` Utility (New):**
     * A utility function (e.g., in `utils/config.py`) responsible for:
@@ -178,10 +226,22 @@ Enhance the `orchestration.teams.<team_id>.routing.rules.condition` syntax. A st
     * Handles termination.
 * **`execute_team_subflow (@flow)`:**
     * Takes `team_id`, loaded `effective_config`, `current_context`.
-    * Looks up team tasks in `effective_config`.
-    * Iterates through tasks, calling `run_agent_task`, passing the `effective_config` and `current_context`.
-    * Collects results.
-    * Returns results.
+    * Checks if team has `type: "loop"` and calls `execute_loop_team` if it does.
+    * For standard teams:
+        * Looks up team tasks in `effective_config`.
+        * Iterates through tasks, calling `run_agent_task`, passing the `effective_config` and `current_context`.
+        * Collects results.
+        * Returns results.
+* **`execute_loop_team (@flow)`:**
+    * Takes `team_id`, `team_config`, loaded `effective_config`, `current_context`.
+    * Gets collection from context using `iterate_on` path.
+    * Iterates over collection items, creating a new context for each iteration.
+    * For each item:
+        * Adds loop variable and metadata to iteration context.
+        * Executes body tasks/teams with the iteration context.
+        * Handles iteration failures according to `stop_on_failure` settings.
+        * Aggregates results from all iterations.
+    * Returns aggregated results with iteration details.
 * **`run_agent_task (@task)`:**
     * Takes `task_config` (from effective config), loaded `effective_config`, `current_context`.
     * Instantiates the `AgentFactory` with the loaded `effective_config` dictionary.
@@ -193,7 +253,7 @@ Enhance the `orchestration.teams.<team_id>.routing.rules.condition` syntax. A st
     * Evaluates conditions against results and context (potentially reading from the effective config if needed).
     * Returns `{'next_team_id': '...', 'context_updates': {...}}`.
 
-#### 3.4.4. Recursion Safety Controls (New Section)
+#### 3.4.5. Recursion Safety Controls (New Section)
 
 (Unchanged from v1.2 - implement `max_total_teams` and `max_recursion_depth` checks in `run_declarative_workflow`).
 

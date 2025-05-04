@@ -138,17 +138,45 @@ def run_declarative_workflow(
     config_info = None # Initialize for potential error handling
 
     try:
-        # Step 1: Generate the effective configuration snapshot
+        # Step 1: Generate the effective configuration snapshot with schema validation
         config_info = materialise_config(
             context=initial_context,
             system_config_path=system_config_path,
-            workspace_dir=None  # Use default workspace dir based on run ID
+            workspace_dir=None,  # Use default workspace dir based on run ID
+            strict_validation=False  # Continue even with validation errors, just log them
         )
+
+        # Log validation results
+        if config_info.schema_validated:
+            run_logger.info("Configuration validation succeeded for all fragments")
+        else:
+            run_logger.warning("Configuration validation had failures, using snapshot anyway")
+            
+        # Log metadata about fragments for lineage tracking
+        if config_info.fragment_metadata:
+            run_logger.info("Configuration fragment information", 
+                          fragments_count=len(config_info.fragment_metadata),
+                          metadata=config_info.fragment_metadata)
 
         # Load the effective configuration FROM THE SNAPSHOT
         run_logger.info(f"Loading effective configuration from: {config_info.snapshot_path}")
         with open(config_info.snapshot_path, 'r') as f:
             effective_config = yaml.safe_load(f) or {} # Ensure it's a dict
+
+        # Store config metadata in the config itself for lineage tracking
+        if 'runtime' not in effective_config:
+            effective_config['runtime'] = {}
+        if 'config_metadata' not in effective_config['runtime']:
+            effective_config['runtime']['config_metadata'] = {}
+            
+        # Store config snapshot info in runtime metadata
+        effective_config['runtime']['config_metadata'] = {
+            'snapshot_path': str(config_info.snapshot_path),
+            'config_hash': config_info.config_hash,
+            'schema_validated': config_info.schema_validated,
+            'fragments_count': config_info.fragments_count,
+            'timestamp': config_info.timestamp
+        }
 
         # Create config node for path-based access
         config_node = create_config_node(effective_config)
@@ -260,14 +288,120 @@ def run_declarative_workflow(
                 context_updates = routing_result["context_updates"]
                 if isinstance(context_updates, dict): # Ensure it's a dict
                      run_logger.info(f"Applying context updates from routing: {list(context_updates.keys())}")
+                     
+                     # Check if config_fragments were supplied for a new snapshot
+                     create_new_snapshot = False
+                     new_config_fragments = None
+                     
+                     if "config_fragments" in context_updates:
+                         new_config_fragments = context_updates.pop("config_fragments")
+                         if isinstance(new_config_fragments, list) and len(new_config_fragments) > 0:
+                             create_new_snapshot = True
+                             run_logger.info(f"Found config fragments for new snapshot: {len(new_config_fragments)} fragments")
+                             
+                     # Check for special recursion flags
+                     force_new_snapshot = context_updates.pop("force_new_snapshot", False)
+                     if force_new_snapshot and not create_new_snapshot:
+                         # Force a new snapshot with current context as a fragment
+                         new_config_fragments = [effective_config, {"context_override": current_context}]
+                         create_new_snapshot = True
+                         run_logger.info("Forcing new snapshot creation based on force_new_snapshot flag")
+                     
+                     # Generate a new snapshot if requested
+                     if create_new_snapshot:
+                         run_logger.info("Creating new effective configuration snapshot for recursion")
+                         
+                         # Create a new snapshot
+                         new_config_info = materialise_config(
+                             context={"config_fragments": new_config_fragments},
+                             system_config_path=system_config_path,
+                             workspace_dir=None  # Use default based on run ID
+                         )
+                         
+                         # Load the new effective configuration
+                         with open(new_config_info.snapshot_path, 'r') as f:
+                             new_effective_config = yaml.safe_load(f) or {}
+                         
+                         # Update our effective configuration
+                         effective_config = new_effective_config
+                         
+                         # Create a new config node
+                         config_node = create_config_node(effective_config)
+                         
+                         # Add snapshot metadata to context
+                         context_updates["config_snapshot"] = {
+                             "path": str(new_config_info.snapshot_path),
+                             "hash": new_config_info.config_hash,
+                             "timestamp": new_config_info.timestamp,
+                             "schema_validated": new_config_info.schema_validated
+                         }
+                         
+                         run_logger.info(f"Created new snapshot at: {new_config_info.snapshot_path}")
+                     
                      # Perform immutable merge of context updates
                      current_context = {**current_context, **context_updates}
                 else:
                      run_logger.warning("Routing returned non-dict context_updates, ignoring.", updates=context_updates)
 
-
             # Get next team ID
             current_team_id = routing_result.get("next_team_id")
+            
+            # Check if there's a recursion strategy specified
+            recursion_strategy = routing_result.get("recursion_strategy", "default")
+            if recursion_strategy != "default" and current_team_id:
+                run_logger.info(f"Using recursion strategy: {recursion_strategy}")
+                
+                # Handle different recursion strategies
+                if recursion_strategy == "restart_with_context":
+                    # The execution continues but with awareness that this is a recursive call
+                    current_context["recursion"] = {
+                        "parent_team": current_team_id,
+                        "depth": current_team_count + 1,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                    run_logger.info(f"Recursion strategy 'restart_with_context' applied for team: {current_team_id}")
+                
+                elif recursion_strategy == "recursive_snapshot":
+                    # Force a new snapshot for the next team execution
+                    if "config_snapshot" not in current_context:
+                        # Generate a new snapshot with current context
+                        run_logger.info("Creating recursive snapshot with current context")
+                        
+                        # We'll create a new fragment from the current context
+                        context_fragment = {"context_override": current_context}
+                        
+                        # Generate a new snapshot
+                        new_config_info = materialise_config(
+                            context={"config": context_fragment},
+                            system_config_path=system_config_path,
+                            workspace_dir=None
+                        )
+                        
+                        # Load the new effective configuration
+                        with open(new_config_info.snapshot_path, 'r') as f:
+                            new_effective_config = yaml.safe_load(f) or {}
+                        
+                        # Update our effective configuration
+                        effective_config = new_effective_config
+                        
+                        # Create a new config node
+                        config_node = create_config_node(effective_config)
+                        
+                        # Add snapshot metadata to context
+                        current_context["config_snapshot"] = {
+                            "path": str(new_config_info.snapshot_path),
+                            "hash": new_config_info.config_hash,
+                            "timestamp": new_config_info.timestamp,
+                            "schema_validated": new_config_info.schema_validated
+                        }
+                        
+                        run_logger.info(f"Created recursive snapshot at: {new_config_info.snapshot_path}")
+            
+            # Log next team for visibility
+            if current_team_id:
+                run_logger.info(f"Next team: {current_team_id}")
+            else:
+                run_logger.info("No next team, workflow will terminate")
 
             # Check if we've reached the end
             if not current_team_id:
@@ -281,7 +415,7 @@ def run_declarative_workflow(
             "max_team_recursion": max(team_execution_counts.values()) if team_execution_counts else 0
         }
 
-        # Return comprehensive workflow results
+        # Return comprehensive workflow results with enhanced config metadata
         final_result_data = {
             "status": final_workflow_status,
             "workflow_run_id": workflow_id,
@@ -290,7 +424,11 @@ def run_declarative_workflow(
             "team_results": team_results,
             "config_metadata": {
                 "snapshot_path": str(config_info.snapshot_path),
-                "schema_validated": config_info.schema_validated
+                "schema_validated": config_info.schema_validated,
+                "config_hash": config_info.config_hash,
+                "fragments_count": config_info.fragments_count,
+                "timestamp": config_info.timestamp,
+                "fragment_sources": [item.get("source") for item in config_info.fragment_metadata] if config_info.fragment_metadata else []
             }
         }
         if final_workflow_error:
@@ -308,14 +446,21 @@ def run_declarative_workflow(
         elif 'initial_context' in locals() and isinstance(initial_context, dict):
              run_id_for_error = initial_context.get('workflow_run_id', run_id_for_error)
 
-        return {
+        # Create error result with as much config metadata as we have
+        error_result = {
             "status": "error",
             "error": error_msg,
             "workflow_run_id": run_id_for_error,
             "config_metadata": {
-                "snapshot_path": str(getattr(config_info, "snapshot_path", "unknown")) if config_info else "unknown"
+                "snapshot_path": str(getattr(config_info, "snapshot_path", "unknown")) if config_info else "unknown",
+                "schema_validated": getattr(config_info, "schema_validated", False) if config_info else False,
+                "config_hash": getattr(config_info, "config_hash", None) if config_info else None,
+                "fragments_count": getattr(config_info, "fragments_count", 0) if config_info else 0,
+                "timestamp": getattr(config_info, "timestamp", None) if config_info else None
             }
         }
+        
+        return error_result
 
 # --- execute_team_subflow function ---
 @flow(name="execute_team")
@@ -326,6 +471,7 @@ def execute_team_subflow(
 ) -> Dict[str, Any]:
     """
     Execute a team's tasks as defined in the effective configuration.
+    Supports regular team execution and loop-based iteration.
 
     Args:
         team_id: ID of the team to execute
@@ -353,13 +499,23 @@ def execute_team_subflow(
                 "results": []
             }
 
-        # Get the team's tasks list
+        # Check if this is a loop team
+        team_type = team_config.get("type", "standard")
+        if team_type == "loop":
+            # Execute as a loop team
+            return execute_loop_team(
+                team_id=team_id,
+                team_config=team_config,
+                effective_config=effective_config,
+                current_context=current_context
+            )
+
+        # Standard team execution flow - get the team's tasks list
         tasks = team_config.get("tasks", [])
         if not tasks:
             run_logger.warning(f"No tasks defined for team: {team_id}")
             # Return success if no tasks, as the team technically completed
             return { "success": True, "team_id": team_id, "results": [], "task_count": 0 }
-
 
         # Execute each task in sequence
         for i, task_config_def in enumerate(tasks):
@@ -411,4 +567,191 @@ def execute_team_subflow(
             "error": f"Unexpected error in team {team_id}: {str(e)}",
             "team_id": team_id,
             "results": task_results # Include results up to the point of failure
+        }
+
+@flow(name="execute_loop_team")
+def execute_loop_team(
+    team_id: str,
+    team_config: Dict[str, Any],
+    effective_config: Dict[str, Any],
+    current_context: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Execute a team's tasks in a loop over items in a collection.
+
+    Args:
+        team_id: ID of the loop team
+        team_config: Configuration for the specific team
+        effective_config: The complete effective configuration
+        current_context: Current workflow context
+
+    Returns:
+        Dict with aggregated loop execution results
+    """
+    run_logger = get_run_logger()
+    iteration_results = []  # Track results for each iteration
+    
+    try:
+        # Validate and extract required loop configuration
+        iterate_on = team_config.get("iterate_on")
+        if not iterate_on:
+            error_msg = f"Missing required 'iterate_on' parameter for loop team: {team_id}"
+            run_logger.error(error_msg)
+            return {
+                "success": False,
+                "error": error_msg,
+                "team_id": team_id,
+                "results": []
+            }
+        
+        # Get iteration collection using path notation
+        context_node = create_config_node(current_context)
+        collection = context_node.get_value(iterate_on)
+        
+        # Validate collection
+        if not collection or not isinstance(collection, (list, dict)):
+            error_msg = f"Invalid or empty collection at path '{iterate_on}' for loop team: {team_id}"
+            run_logger.error(error_msg)
+            return {
+                "success": False,
+                "error": error_msg,
+                "team_id": team_id,
+                "results": []
+            }
+        
+        # Get loop variable name (default to "item")
+        loop_variable = team_config.get("loop_variable", "item")
+        
+        # Get loop body teams or tasks
+        body = team_config.get("body", [])
+        if not body:
+            error_msg = f"Empty loop body for loop team: {team_id}"
+            run_logger.error(error_msg)
+            return {
+                "success": False,
+                "error": error_msg,
+                "team_id": team_id,
+                "results": []
+            }
+        
+        # Get stop_on_failure config (default to True)
+        stop_on_fail = team_config.get("stop_on_failure", True)
+        
+        # Convert body to list if it's not
+        if not isinstance(body, list):
+            body = [body]
+        
+        # Log loop execution start
+        run_logger.info(f"Executing loop team: {team_id} over {len(collection)} items")
+        
+        # Track index for debugging
+        for idx, item in enumerate(collection):
+            # Create iteration context with loop variable
+            iter_context = {
+                **current_context,
+                loop_variable: item,
+                "loop_index": idx,
+                "loop_count": len(collection)
+            }
+            
+            run_logger.info(f"Loop {team_id}: iteration {idx+1}/{len(collection)}")
+            
+            # Initialize iteration result
+            iter_result = {
+                "index": idx,
+                "success": True,
+                "results": []
+            }
+            
+            # Execute each body item (task or embedded team)
+            for body_item in body:
+                # Check if this is a task or a team reference
+                if isinstance(body_item, dict) and "agent_type" in body_item:
+                    # This is a task configuration
+                    task_name = body_item.get("name", f"loop_task_{idx}")
+                    run_logger.info(f"Executing loop task: {task_name} (iteration {idx+1})")
+                    
+                    # Create task context
+                    task_context = {**iter_context, "task_config": body_item}
+                    
+                    # Execute task
+                    result = run_agent_task(
+                        task_config=body_item,
+                        context=task_context,
+                        effective_config=effective_config
+                    )
+                    
+                    # Add to iteration results
+                    iter_result["results"].append(result)
+                    
+                    # Check for failure
+                    if not result.get("success", False) and stop_on_fail:
+                        iter_result["success"] = False
+                        iter_result["error"] = f"Task {task_name} failed in iteration {idx}"
+                        run_logger.warning(f"Loop {team_id}: task {task_name} failed in iteration {idx+1}, stopping iteration.")
+                        break
+                    
+                elif isinstance(body_item, str):
+                    # This is a reference to another team
+                    embedded_team_id = body_item
+                    run_logger.info(f"Executing embedded team: {embedded_team_id} (iteration {idx+1})")
+                    
+                    # Execute the referenced team (recursive)
+                    team_result = execute_team_subflow(
+                        team_id=embedded_team_id,
+                        effective_config=effective_config,
+                        current_context=iter_context
+                    )
+                    
+                    # Add to iteration results
+                    iter_result["results"].append(team_result)
+                    
+                    # Check for failure
+                    if not team_result.get("success", False) and stop_on_fail:
+                        iter_result["success"] = False
+                        iter_result["error"] = f"Team {embedded_team_id} failed in iteration {idx}"
+                        run_logger.warning(f"Loop {team_id}: embedded team {embedded_team_id} failed in iteration {idx+1}, stopping iteration.")
+                        break
+                    
+                else:
+                    # Invalid body item
+                    error_msg = f"Invalid body item in loop team {team_id}: {body_item}"
+                    run_logger.error(error_msg)
+                    iter_result["success"] = False
+                    iter_result["error"] = error_msg
+                    if stop_on_fail:
+                        break
+            
+            # Add iteration result to overall results
+            iteration_results.append(iter_result)
+            
+            # Check if we should stop the entire loop
+            if not iter_result.get("success", False) and team_config.get("break_on_failure", False):
+                run_logger.warning(f"Loop {team_id}: iteration {idx+1} failed, breaking loop due to break_on_failure=True.")
+                break
+        
+        # Determine overall success
+        all_succeeded = all(r.get("success", True) for r in iteration_results)
+        loop_success = all_succeeded or not team_config.get("stop_on_failure", True)
+        
+        # Return aggregated results
+        return {
+            "success": loop_success,
+            "team_id": team_id,
+            "type": "loop",
+            "iterations_count": len(iteration_results),
+            "iterations": iteration_results,
+            "collection_path": iterate_on,
+            "collection_size": len(collection)
+        }
+        
+    except Exception as e:
+        error_msg = str(e)
+        run_logger.error(f"Loop team execution failed unexpectedly: {error_msg}", exc_info=True)
+        return {
+            "success": False,
+            "error": error_msg,
+            "team_id": team_id,
+            "type": "loop",
+            "iterations": iteration_results
         }

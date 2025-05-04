@@ -176,7 +176,8 @@ class BaseLLM:
     def _get_completion_with_continuation(
             self,
             messages: List[Dict[str, str]],
-            max_attempts: Optional[int] = None
+            max_attempts: Optional[int] = None,
+            context: Optional[Dict[str, Any]] = None
         ) -> Tuple[str, Any]:
         """
         Get completion with automatic continuation handling.
@@ -184,16 +185,40 @@ class BaseLLM:
         """
         logger_to_use = getattr(self, 'logger', logger)
         try:
+            # Check for temperature override in context
+            temperature = self.temperature
+            
+            # Apply overrides from context if available
+            if context:
+                # Get the agent's unique name for context lookup
+                agent_name = getattr(self, 'unique_name', '') or getattr(self, '_get_agent_name', lambda: '')()
+                overrides = context.get('agent_config_overrides', {}).get(agent_name, {})
+                
+                # Temperature override
+                if 'temperature' in overrides:
+                    # Get override value (ensure it's a float)
+                    temp_override = overrides['temperature']
+                    if isinstance(temp_override, (int, float, str)):
+                        try:
+                            temperature = float(temp_override)
+                            logger_to_use.debug("llm.using_temperature_override", 
+                                           agent_name=agent_name,
+                                           original=self.temperature,
+                                           override=temperature)
+                        except (ValueError, TypeError):
+                            logger_to_use.warning("llm.invalid_temperature_override", 
+                                              value=temp_override)
+            
             # Special handling for Gemini 2.5 models - use direct API call
             if hasattr(self, 'provider') and self.provider and self.provider.value == "gemini" and "gemini-2.5" in self.model:
                 logger_to_use.info("Using direct Gemini API call for Gemini 2.5", model=self.model)
-                return self._call_gemini_directly(messages, temperature=self.temperature)
+                return self._call_gemini_directly(messages, temperature=temperature)
             
             # Initialize continuation handler for normal path
             if not hasattr(self, '_continuation_handler') or self._continuation_handler is None:
                 self._continuation_handler = ContinuationHandler(self)
-            # Use the handler for normal models
-            return self._continuation_handler.get_completion_with_continuation(messages, max_attempts)
+            # Use the handler for normal models and pass context
+            return self._continuation_handler.get_completion_with_continuation(messages, max_attempts, context)
 
         except AttributeError as e:
             # Log the specific error and agent type if possible

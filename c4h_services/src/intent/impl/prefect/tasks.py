@@ -13,14 +13,17 @@ import importlib
 import yaml
 import operator
 import os
+import json
+import re
 from pathlib import Path
+from datetime import datetime, timezone
 
 from c4h_services.src.orchestration.factory import AgentFactory
 from c4h_agents.agents.base_agent import BaseAgent
 from c4h_agents.skills.semantic_iterator import SemanticIterator
 from c4h_agents.skills.shared.types import ExtractConfig
-from c4h_agents.config import create_config_node, deep_merge, load_config, load_persona_config, render_config
-from c4h_services.src.utils.config_utils import validate_config_fragment, ConfigValidationError
+from c4h_agents.config import create_config_node, deep_merge, load_config, load_persona_config, render_config, get_available_personas
+from c4h_services.src.utils.config_utils import validate_config_fragment, validate_config_fragments, ConfigValidationError
 from .models import AgentTaskConfig, EffectiveConfigInfo
 
 logger = get_logger()
@@ -88,13 +91,23 @@ def run_agent_task(
         # Only pass the necessary fields needed by the factory
         agent = factory.create_agent(task_config)
             
-        # Enhance context with task metadata and ensure run ID is set
+        # Enhance context with task metadata, run ID, and configuration snapshot info
         enhanced_context = {
             **context,
             'workflow_run_id': run_id,
             'system': {'runid': run_id},  # Explicitly include system namespace
             'task_name': task_name,
         }
+        
+        # Add configuration snapshot information if available in effective_config
+        if "runtime" in effective_config and "config_metadata" in effective_config["runtime"]:
+            config_metadata = effective_config["runtime"]["config_metadata"]
+            if isinstance(config_metadata, dict):
+                enhanced_context["config_metadata"] = config_metadata
+                
+                # Also add top-level snapshot path for backward compatibility
+                if "snapshot_path" in config_metadata:
+                    enhanced_context["config_snapshot_path"] = config_metadata["snapshot_path"]
         
         # Special handling for iterator
         if isinstance(agent, SemanticIterator):
@@ -151,15 +164,19 @@ def run_agent_task(
 def materialise_config(
     context: Dict[str, Any],
     system_config_path: Path,
-    workspace_dir: Optional[Path] = None
+    workspace_dir: Optional[Path] = None,
+    strict_validation: bool = False
 ) -> EffectiveConfigInfo:
     """
     Generate and persist an effective configuration snapshot after merging all fragments.
+    Validates each configuration fragment against its corresponding schema.
     
     Args:
         context: Job context that may contain config fragments and persona keys
         system_config_path: Path to base system configuration
         workspace_dir: Optional directory to store the snapshot (defaults to workspaces/{run_id})
+        strict_validation: If True, validation errors will halt processing; 
+                          if False, validation errors will be logged but processing will continue
     
     Returns:
         Information about the effective configuration including snapshot path
@@ -193,41 +210,113 @@ def materialise_config(
             
         # Extract all config fragments including job-specific ones
         config_fragments = [system_config]
+        fragment_sources = ["system"]
         
-        # If tasks are defined with persona_key, load and inject those configs
+        # Scan for all available personas first to enable reporting on what's available
+        available_personas = get_available_personas(personas_base_path)
+        prefect_logger.info(f"Found {len(available_personas)} personas available", 
+                          persona_keys=list(available_personas.keys()))
+        
+        # Create a set to track loaded personas (avoid duplicate loading)
+        loaded_personas = set()
+        persona_configs = {}
+        
+        # Check for team-level persona specifications (one level up from tasks)
+        if "teams" in context:
+            for team_id, team_config in context.get("teams", {}).items():
+                if isinstance(team_config, dict):
+                    # Check for team-level persona_key
+                    if "persona_key" in team_config:
+                        persona_key = team_config["persona_key"]
+                        prefect_logger.info(f"Loading team-level persona config for team {team_id}: {persona_key}")
+                        
+                        if persona_key not in loaded_personas:
+                            persona_config = load_persona_config(persona_key, personas_base_path)
+                            if persona_config:
+                                persona_configs[persona_key] = persona_config
+                                loaded_personas.add(persona_key)
+                    
+                    # Look for task-level persona_keys in this team
+                    if "tasks" in team_config and isinstance(team_config["tasks"], list):
+                        for task in team_config["tasks"]:
+                            if isinstance(task, dict) and "persona_key" in task:
+                                persona_key = task["persona_key"]
+                                prefect_logger.info(f"Loading task-level persona config for task in team {team_id}: {persona_key}")
+                                
+                                if persona_key not in loaded_personas:
+                                    persona_config = load_persona_config(persona_key, personas_base_path)
+                                    if persona_config:
+                                        persona_configs[persona_key] = persona_config
+                                        loaded_personas.add(persona_key)
+        
+        # Check task-level persona_keys in the context (flat list)
         if "tasks" in context:
             for task in context.get("tasks", []):
-                if "persona_key" in task:
+                if isinstance(task, dict) and "persona_key" in task:
                     persona_key = task["persona_key"]
-                    prefect_logger.info(f"Loading persona config for: {persona_key}")
-                    persona_config = load_persona_config(persona_key, personas_base_path)
+                    prefect_logger.info(f"Loading persona config for task: {persona_key}")
                     
-                    if persona_config:
-                        # Add persona config as a fragment before any task-specific overrides
-                        config_fragments.append(persona_config)
+                    if persona_key not in loaded_personas:
+                        persona_config = load_persona_config(persona_key, personas_base_path)
+                        if persona_config:
+                            persona_configs[persona_key] = persona_config
+                            loaded_personas.add(persona_key)
+                            
+        # Check for explicit persona override in the context
+        if "persona_key" in context:
+            persona_key = context["persona_key"]
+            prefect_logger.info(f"Loading explicit persona config from context: {persona_key}")
+            
+            if persona_key not in loaded_personas:
+                persona_config = load_persona_config(persona_key, personas_base_path)
+                if persona_config:
+                    persona_configs[persona_key] = persona_config
+                    loaded_personas.add(persona_key)
+                    
+        # Add all loaded personas to the fragments list
+        for persona_key, persona_config in persona_configs.items():
+            config_fragments.append(persona_config)
+            fragment_sources.append(f"persona_{persona_key}")
+            prefect_logger.info(f"Added persona {persona_key} to configuration fragments", 
+                              persona_keys=list(persona_config.keys()))
         
         # Add job-specific config as final override
         if "config" in context:
             config_fragments.append(context["config"])
+            fragment_sources.append("job")
         
-        # Validate config fragments against schemas
-        schema_validated = True
-        try:
-            # Validate system config
-            validate_config_fragment(system_config, "system")
+        # Create schema mapping for validation
+        schema_map = {}
+        for i, source in enumerate(fragment_sources):
+            if source == "system":
+                schema_map[i] = "system"
+            elif source.startswith("persona_"):
+                schema_map[i] = "persona"
+            elif source == "job":
+                schema_map[i] = "job"
+        
+        # Validate all config fragments against their respective schemas
+        prefect_logger.info(f"Validating {len(config_fragments)} configuration fragments")
+        validation_results = validate_config_fragments(
+            config_fragments, 
+            schema_map,
+            strict=strict_validation
+        )
+        
+        # Determine overall validation success
+        schema_validated = all(success for success, _ in validation_results.values())
+        if not schema_validated:
+            # Log all validation errors
+            error_count = sum(1 for success, _ in validation_results.values() if not success)
+            failures = [(idx, error) for idx, (success, error) in validation_results.items() if not success]
+            prefect_logger.warning(f"Configuration validation had {error_count} failures", failures=failures)
             
-            # Validate persona fragments
-            for i, fragment in enumerate(config_fragments[1:-1]):
-                validate_config_fragment(fragment, "persona")
+            # In strict mode, this would have already raised an exception
+            if strict_validation:
+                raise RuntimeError("Configuration validation failed in strict mode")
                 
-            # Validate job config if present
-            if "config" in context:
-                validate_config_fragment(context["config"], "job")
-                
-        except ConfigValidationError as e:
-            schema_validated = False
-            prefect_logger.error(f"Configuration validation failed: {str(e)}")
-            # Continue with snapshot generation despite validation errors
+            # In non-strict mode, we continue despite validation errors
+            prefect_logger.info("Continuing with snapshot generation despite validation errors")
         
         # Get Prefect run ID for snapshot path
         run_id = str(flow_run.get_id())
@@ -242,12 +331,24 @@ def materialise_config(
         
         prefect_logger.info(f"Effective configuration snapshot saved to: {snapshot_path}")
         
-        # Return information about the effective configuration
+        # Create fragment metadata for lineage tracking
+        fragment_metadata = [
+            {
+                "source": source,
+                "schema": schema_map.get(i),
+                "validated": validation_results.get(i, (False, "Not validated"))[0] if i in validation_results else False,
+                "size": len(json.dumps(fragment)) if fragment else 0
+            }
+            for i, (source, fragment) in enumerate(zip(fragment_sources, config_fragments))
+        ]
+        
+        # Return detailed information about the effective configuration
         return EffectiveConfigInfo(
             snapshot_path=snapshot_path,
             fragments_count=len(config_fragments),
             run_id=run_id,
-            schema_validated=schema_validated
+            schema_validated=schema_validated,
+            fragment_metadata=fragment_metadata
         )
         
     except Exception as e:
@@ -289,19 +390,121 @@ def evaluate_routing_task(
         # Get rules list
         rules = routing_config.get("rules", [])
         
-        # Define operator functions
+        # Define operator functions with enhanced capabilities
         ops = {
+            # Basic comparison operators
             "equals": operator.eq,
+            "eq": operator.eq,  # Alias for equals
             "not_equals": operator.ne,
-            "contains": lambda a, b: b in a,
+            "ne": operator.ne,  # Alias for not_equals
+            "contains": lambda a, b: b in a if a is not None else False,
+            "contains_any": lambda a, b: any(item in a for item in b) if a is not None and isinstance(b, (list, tuple)) else False,
+            "contains_all": lambda a, b: all(item in a for item in b) if a is not None and isinstance(b, (list, tuple)) else False,
             "greater_than": operator.gt,
-            "less_than": operator.lt,
+            "gt": operator.gt,  # Alias
+            "less_than": operator.lt, 
+            "lt": operator.lt,  # Alias
+            "greater_equal": operator.ge,
+            "ge": operator.ge,  # Alias
+            "less_equal": operator.le,
+            "le": operator.le,  # Alias
+            
+            # Existence checks
             "exists": lambda a, b: a is not None,
-            "is_empty": lambda a, b: not a
+            "is_empty": lambda a, b: not a if a is not None else True,
+            "is_null": lambda a, b: a is None,
+            "not_null": lambda a, b: a is not None,
+            
+            # Type check operators
+            "is_type": lambda a, b: isinstance(a, eval(b)) if isinstance(b, str) else False,
+            "has_length": lambda a, b: len(a) == b if hasattr(a, '__len__') else False,
+            "min_length": lambda a, b: len(a) >= b if hasattr(a, '__len__') else False,
+            "max_length": lambda a, b: len(a) <= b if hasattr(a, '__len__') else False,
+            
+            # String operators
+            "starts_with": lambda a, b: a.startswith(b) if isinstance(a, str) else False,
+            "ends_with": lambda a, b: a.endswith(b) if isinstance(a, str) else False,
+            "matches": lambda a, b: bool(re.search(b, a)) if isinstance(a, str) and isinstance(b, str) else False,
+            
+            # Numeric operators
+            "in_range": lambda a, b: b[0] <= a <= b[1] if isinstance(b, (list, tuple)) and len(b) == 2 else False,
         }
         
-        # Helper function to evaluate a single condition
+        # Helper function to get value from dotted path
+        def get_value_by_path(data, path):
+            """Extract value from nested dictionary using dot notation"""
+            if not data or not path:
+                return None
+            
+            if isinstance(path, str):
+                parts = path.split('.')
+            else:
+                parts = path  # Assume it's already a list
+                
+            current = data
+            for part in parts:
+                if isinstance(current, dict) and part in current:
+                    current = current[part]
+                elif isinstance(current, (list, tuple)) and part.isdigit():
+                    index = int(part)
+                    if 0 <= index < len(current):
+                        current = current[index]
+                    else:
+                        return None
+                else:
+                    return None
+            return current
+            
+        # Enhanced function to evaluate a single condition with support for complex nested conditions
         def evaluate_condition(condition):
+            """
+            Evaluate a condition structure against the current state.
+            Supports nested logical operators (AND, OR, NOT) and field references.
+            """
+            # Handle logical operators first
+            if "type" in condition:
+                condition_type = condition["type"].lower()
+                
+                # AND condition - all subconditions must be true
+                if condition_type == "and":
+                    subconditions = condition.get("conditions", [])
+                    return all(evaluate_condition(c) for c in subconditions)
+                    
+                # OR condition - any subcondition must be true
+                elif condition_type == "or":
+                    subconditions = condition.get("conditions", [])
+                    return any(evaluate_condition(c) for c in subconditions)
+                    
+                # NOT condition - negate the subcondition
+                elif condition_type == "not":
+                    subcondition = condition.get("condition", {})
+                    return not evaluate_condition(subcondition)
+                    
+                # ALL_OF condition - same as AND but different syntax 
+                elif condition_type == "all_of":
+                    subconditions = condition.get("conditions", [])
+                    return all(evaluate_condition(c) for c in subconditions)
+                    
+                # ANY_OF condition - same as OR but different syntax
+                elif condition_type == "any_of":
+                    subconditions = condition.get("conditions", [])
+                    return any(evaluate_condition(c) for c in subconditions)
+                
+                # Legacy syntax support
+                elif condition_type == "simple" and "field" in condition:
+                    # Legacy simple field comparison
+                    field = condition.get("field")
+                    operator_name = condition.get("operator", "equals")
+                    expected_value = condition.get("value")
+                    
+                    # Extract actual value
+                    actual_value = get_value_by_path(current_context, field)
+                    
+                    # Apply operator
+                    op_func = ops.get(operator_name, operator.eq)
+                    return op_func(actual_value, expected_value)
+                
+            # Handle task output conditions
             if "task" in condition:
                 # Find task result by name
                 task_name = condition["task"]
@@ -309,57 +512,180 @@ def evaluate_routing_task(
                                    if r.get("task_name") == task_name), None)
                 
                 if not task_result:
+                    prefect_logger.warning(f"Task '{task_name}' not found in team results")
                     return False
                 
                 # Check status condition
                 if "status" in condition:
-                    return task_result.get("success") == (condition["status"] == "success")
+                    status_match = task_result.get("success") == (condition["status"] == "success")
+                    prefect_logger.debug(f"Status condition for task '{task_name}': {status_match}")
+                    return status_match
                 
                 # Check output field condition
                 if "output_field" in condition:
-                    field_value = task_result.get("result_data", {})
-                    for part in condition["output_field"].split("."):
-                        field_value = field_value.get(part, {})
+                    field_path = condition["output_field"]
+                    field_value = get_value_by_path(task_result.get("result_data", {}), field_path)
                     
-                    op = ops.get(condition.get("operator", "equals"), operator.eq)
-                    return op(field_value, condition.get("value"))
+                    operator_name = condition.get("operator", "equals")
+                    expected_value = condition.get("value")
+                    
+                    op_func = ops.get(operator_name, operator.eq)
+                    result = op_func(field_value, expected_value)
+                    
+                    prefect_logger.debug(f"Field condition for task '{task_name}', field '{field_path}': {result}, "
+                                       f"actual value: {field_value}, expected: {expected_value}, operator: {operator_name}")
+                    return result
             
+            # Handle context field conditions
             elif "context_field" in condition:
-                # Evaluate against context
                 field_path = condition["context_field"]
-                field_value = current_context
-                for part in field_path.split("."):
-                    field_value = field_value.get(part, {})
+                field_value = get_value_by_path(current_context, field_path)
                 
-                op = ops.get(condition.get("operator", "equals"), operator.eq)
-                return op(field_value, condition.get("value"))
-            
+                operator_name = condition.get("operator", "equals")
+                expected_value = condition.get("value")
+                
+                op_func = ops.get(operator_name, operator.eq)
+                result = op_func(field_value, expected_value)
+                
+                prefect_logger.debug(f"Context field condition for '{field_path}': {result}, "
+                                   f"actual value: {field_value}, expected: {expected_value}, operator: {operator_name}")
+                return result
+                
+            # Handle config field conditions
+            elif "config_field" in condition:
+                field_path = condition["config_field"]
+                field_value = get_value_by_path(effective_config, field_path)
+                
+                operator_name = condition.get("operator", "equals")
+                expected_value = condition.get("value")
+                
+                op_func = ops.get(operator_name, operator.eq)
+                result = op_func(field_value, expected_value)
+                
+                prefect_logger.debug(f"Config field condition for '{field_path}': {result}, "
+                                   f"actual value: {field_value}, expected: {expected_value}, operator: {operator_name}")
+                return result
+                
+            # Legacy support for simplified conditions as direct field=value checks
+            elif isinstance(condition, dict) and not any(k in ("type", "task", "context_field", "config_field") for k in condition.keys()):
+                # Simple comparison of context fields
+                # Example: {"status": "success", "complete": true}
+                return all(current_context.get(k) == v for k, v in condition.items())
+                
+            # Default for unrecognized condition format
+            prefect_logger.warning(f"Unrecognized condition format: {condition}")
             return False
         
-        # Process routing rules in order
-        for rule in rules:
+        # Process routing rules in order with enhanced logging
+        for i, rule in enumerate(rules):
             condition = rule.get("condition", {})
             
-            # Handle list of conditions (AND logic)
-            if isinstance(condition, list):
-                if all(evaluate_condition(c) for c in condition):
-                    return {
-                        "next_team_id": rule.get("next_team"),
-                        "context_updates": rule.get("context_updates", {})
-                    }
-            # Handle single condition
-            elif evaluate_condition(condition):
-                return {
-                    "next_team_id": rule.get("next_team"),
-                    "context_updates": rule.get("context_updates", {})
-                }
+            # Log rule we're evaluating
+            prefect_logger.debug(f"Evaluating routing rule #{i+1}/{len(rules)} for team: {team_id}")
+            
+            try:
+                # Handle list of conditions (AND logic) - legacy support
+                if isinstance(condition, list):
+                    all_true = all(evaluate_condition(c) for c in condition)
+                    if all_true:
+                        prefect_logger.info(f"Rule #{i+1} matched (list conditions): {rule.get('next_team')}")
+                        # Include recursion strategy for legacy conditions as well
+                        recursion_strategy = rule.get("recursion_strategy", "default")
+                        
+                        return {
+                            "next_team_id": rule.get("next_team"),
+                            "context_updates": rule.get("context_updates", {}),
+                            "matched_rule": i+1,
+                            "recursion_strategy": recursion_strategy
+                        }
+                    else:
+                        prefect_logger.debug(f"Rule #{i+1} did not match (list conditions)")
+                        
+                # Handle structured condition (enhanced DSL)
+                elif isinstance(condition, dict):
+                    # Enhanced condition evaluation
+                    result = evaluate_condition(condition)
+                    if result:
+                        prefect_logger.info(f"Rule #{i+1} matched: navigating to {rule.get('next_team')}")
+                        
+                        # Get context updates with metadata for tracking
+                        context_updates = rule.get("context_updates", {})
+                        
+                        # Add routing metadata to context updates for lineage tracking
+                        if "routing_info" not in context_updates:
+                            context_updates["routing_info"] = {}
+                            
+                        context_updates["routing_info"] = {
+                            "team_id": team_id,
+                            "rule_index": i,
+                            "next_team": rule.get("next_team"),
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "condition_type": "structured" if "type" in condition else "simple"
+                        }
+                        
+                        # Check for recursion_strategy in the rule
+                        recursion_strategy = rule.get("recursion_strategy", "default")
+                        
+                        # Enhanced return value with recursion support
+                        return {
+                            "next_team_id": rule.get("next_team"),
+                            "context_updates": context_updates,
+                            "matched_rule": i+1,
+                            "matched_condition": condition,
+                            "recursion_strategy": recursion_strategy
+                        }
+                    else:
+                        prefect_logger.debug(f"Rule #{i+1} did not match")
+                        
+                # Handle string conditions (legacy support)
+                elif isinstance(condition, str):
+                    prefect_logger.warning(f"String conditions deprecated but attempting to evaluate: {condition}")
+                    # Support minimal legacy behavior
+                    if condition == "all_success" and all(r.get("success", False) for r in team_results.get("results", [])):
+                        prefect_logger.info(f"Rule #{i+1} matched (all_success): {rule.get('next_team')}")
+                        # Include recursion strategy for legacy conditions as well
+                        recursion_strategy = rule.get("recursion_strategy", "default")
+                        
+                        return {
+                            "next_team_id": rule.get("next_team"),
+                            "context_updates": rule.get("context_updates", {}),
+                            "matched_rule": i+1,
+                            "recursion_strategy": recursion_strategy
+                        }
+                    elif condition == "any_failure" and any(not r.get("success", True) for r in team_results.get("results", [])):
+                        prefect_logger.info(f"Rule #{i+1} matched (any_failure): {rule.get('next_team')}")
+                        # Include recursion strategy for legacy conditions as well
+                        recursion_strategy = rule.get("recursion_strategy", "default")
+                        
+                        return {
+                            "next_team_id": rule.get("next_team"),
+                            "context_updates": rule.get("context_updates", {}),
+                            "matched_rule": i+1,
+                            "recursion_strategy": recursion_strategy
+                        }
+                
+            except Exception as e:
+                # Log error but continue to next rule
+                prefect_logger.error(f"Error evaluating rule #{i+1}: {str(e)}")
         
         # No rules matched, use default
+        prefect_logger.info(f"No rules matched, using default: {routing_config.get('default')}")
+        
+        # Check for default recursion strategy
+        default_recursion_strategy = routing_config.get("default_recursion_strategy", "default")
+        
         return {
             "next_team_id": routing_config.get("default"),
-            "context_updates": {}
+            "context_updates": routing_config.get("default_context_updates", {}),
+            "matched_rule": "default",
+            "recursion_strategy": default_recursion_strategy
         }
         
     except Exception as e:
         prefect_logger.error(f"Routing evaluation failed: {str(e)}")
-        return {"next_team_id": None, "context_updates": {}}
+        return {
+            "next_team_id": None, 
+            "context_updates": {},
+            "recursion_strategy": "default",
+            "error": str(e)
+        }

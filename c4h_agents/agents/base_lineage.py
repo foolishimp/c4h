@@ -45,6 +45,8 @@ class LineageEvent:
     execution_path: Optional[List[str]] = None
     input_hash: Optional[str] = None
     output_hash: Optional[str] = None
+    config_snapshot_path: Optional[str] = None
+    config_hash: Optional[str] = None
 
 class BaseLineage:
     """OpenLineage tracking implementation"""
@@ -341,6 +343,11 @@ class BaseLineage:
                     "step": event.step,
                     "execution_path": event.execution_path
                 },
+                "configuration": {
+                    "snapshot_path": event.config_snapshot_path,
+                    "config_hash": event.config_hash,
+                    "timestamp": event.timestamp.isoformat()
+                },
                 "llm_input": {
                     "system_message": event.messages.system if hasattr(event.messages, "system") else None,
                     "user_message": event.messages.user if hasattr(event.messages, "user") else None,
@@ -394,6 +401,14 @@ class BaseLineage:
                     "runId": event.parent_id
                 })
             facets["documentation"] = DocumentationJobFacet(description=f"Agent: {event.agent_name}")
+            
+            # Add configuration facets if available
+            if event.config_snapshot_path or event.config_hash:
+                facets["configuration"] = {
+                    "snapshot_path": event.config_snapshot_path,
+                    "config_hash": event.config_hash,
+                    "timestamp": event.timestamp.isoformat()
+                }
             
             # Create the event with producer explicitly set
             ol_event = RunEvent(
@@ -455,7 +470,30 @@ class BaseLineage:
             # Extract lineage metadata
             event_id, parent_id, step, execution_path = self._extract_lineage_metadata(context)
             
-            # Create the lineage event
+            # Extract configuration snapshot information if available in context
+            config_snapshot_path = None
+            config_hash = None
+            
+            if "config_snapshot_path" in context:
+                config_snapshot_path = context["config_snapshot_path"]
+            elif "config_metadata" in context and isinstance(context["config_metadata"], dict):
+                if "snapshot_path" in context["config_metadata"]:
+                    config_snapshot_path = context["config_metadata"]["snapshot_path"]
+                if "config_hash" in context["config_metadata"]:
+                    config_hash = context["config_metadata"]["config_hash"]
+            
+            # Also check runtime section
+            if not config_snapshot_path and "runtime" in context:
+                runtime = context.get("runtime", {})
+                if isinstance(runtime, dict) and "config_metadata" in runtime:
+                    config_metadata = runtime["config_metadata"]
+                    if isinstance(config_metadata, dict):
+                        if "snapshot_path" in config_metadata:
+                            config_snapshot_path = config_metadata["snapshot_path"]
+                        if "config_hash" in config_metadata:
+                            config_hash = config_metadata["config_hash"]
+            
+            # Create the lineage event with snapshot information
             event = LineageEvent(
                 event_id=event_id,
                 agent_name=self.agent_name,
@@ -467,7 +505,9 @@ class BaseLineage:
                 raw_output=response,
                 metrics=metrics,
                 step=step,
-                execution_path=execution_path
+                execution_path=execution_path,
+                config_snapshot_path=config_snapshot_path,
+                config_hash=config_hash
             )
             
             # Track to file backend

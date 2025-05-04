@@ -419,11 +419,74 @@ def load_persona_config(persona_key: str, personas_base_path: Path) -> Dict[str,
                 logger.info("config.persona.loading", persona_key=persona_key, path=str(persona_path))
                 return load_config(persona_path)
         
+        # Fallback: Try in subdirectories
+        for subdir in personas_base_path.glob('*/'):
+            if subdir.is_dir():
+                for ext in ['.yml', '.yaml']:
+                    persona_path = subdir / f"{persona_key}{ext}"
+                    if persona_path.exists():
+                        logger.info("config.persona.loading_from_subdir", 
+                                  persona_key=persona_key, 
+                                  path=str(persona_path),
+                                  subdir=subdir.name)
+                        return load_config(persona_path)
+        
         logger.warning("config.persona.not_found", persona_key=persona_key, searched_base_path=str(personas_base_path))
         return {}
     except Exception as e:
         logger.error("config.persona.load_failed", persona_key=persona_key, base_path=str(personas_base_path),
                    error=str(e), error_type=type(e).__name__)
+        return {}
+
+def get_available_personas(personas_base_path: Path) -> Dict[str, Path]:
+    """
+    Get all available persona configurations in the personas directory and subdirectories.
+    
+    Args:
+        personas_base_path: Base path to the personas directory
+        
+    Returns:
+        Dictionary mapping persona keys to their file paths
+    """
+    try:
+        personas = {}
+        
+        # Check if the base path exists
+        if not personas_base_path.exists():
+            logger.warning("config.personas.base_path_not_found", base_path=str(personas_base_path))
+            return personas
+            
+        # Load from base directory
+        for ext in ['.yml', '.yaml']:
+            for persona_path in personas_base_path.glob(f'*{ext}'):
+                persona_key = persona_path.stem
+                personas[persona_key] = persona_path
+                logger.debug("config.personas.found", persona_key=persona_key, path=str(persona_path))
+                
+        # Load from subdirectories
+        for subdir in personas_base_path.glob('*/'):
+            if subdir.is_dir():
+                for ext in ['.yml', '.yaml']:
+                    for persona_path in subdir.glob(f'*{ext}'):
+                        persona_key = persona_path.stem
+                        personas[persona_key] = persona_path
+                        logger.debug("config.personas.found_in_subdir", 
+                                   persona_key=persona_key, 
+                                   path=str(persona_path),
+                                   subdir=subdir.name)
+        
+        logger.info("config.personas.available", 
+                  count=len(personas), 
+                  persona_keys=list(personas.keys()),
+                  base_path=str(personas_base_path))
+                  
+        return personas
+        
+    except Exception as e:
+        logger.error("config.personas.scan_failed", 
+                   base_path=str(personas_base_path),
+                   error=str(e), 
+                   error_type=type(e).__name__)
         return {}
 
 def load_with_app_config(system_path: Path, app_path: Path) -> Dict[str, Any]:

@@ -11,9 +11,9 @@ import re
 # Ensure locate_config is imported if needed, or rely on BaseAgent's config handling
 from c4h_agents.config import locate_config 
 from c4h_agents.agents.base_agent import BaseAgent, AgentResponse 
-from skills.shared.types import ExtractConfig
-from skills._semantic_fast import FastExtractor, FastItemIterator
-from skills._semantic_slow import SlowExtractor, SlowItemIterator
+from c4h_agents.skills.shared.types import ExtractConfig
+from c4h_agents.skills._semantic_fast import FastExtractor, FastItemIterator
+from c4h_agents.skills._semantic_slow import SlowExtractor, SlowItemIterator
 from enum import Enum
 from c4h_agents.utils.logging import get_logger
 
@@ -387,28 +387,5 @@ class SemanticIterator(BaseAgent):
         
         return estimate
         
-    def configure(self, content: Any, config: ExtractConfig) -> 'SemanticIterator':
-        """
-        Legacy configuration method for prefect compatibility.
-        Sets up iterator state using configuration.
-        """
-        # Use self.logger inherited from BaseAgent
-        logger_to_use = self.logger
-        logger_to_use.warning("semantic_iterator.using_deprecated_configure")
-        
-        # Apply preprocessing before setting up state
-        preprocessed_content = self._preprocess_content(content)
-        
-        # Reset state using provided config
-        self._state = ExtractorState(
-            mode=self._state.mode, # Keep existing mode preference
-            content=preprocessed_content,
-            config=config, # Use the provided ExtractConfig object
-            position=0 # Reset position
-        )
-        
-        logger_to_use.debug("iterator.configured",
-                    mode=self._state.mode,
-                    content_type=type(preprocessed_content).__name__)
-                    
-        return self
+    # The deprecated 'configure' method has been removed.
+    # Use 'process' with appropriate context instead.
