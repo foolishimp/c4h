@@ -440,11 +440,11 @@ class BaseLLM:
 
             # Configure extended thinking support
             # Get provider and model from parent BaseAgent if available
-            provider = getattr(self.parent, 'provider', None)
-            agent_config_path = getattr(self.parent, 'config_path', '')
+            provider = getattr(self.parent, 'provider', None) if hasattr(self, 'parent') else None
+            agent_config_path = getattr(self.parent, 'config_path', '') if hasattr(self, 'parent') else ''
 
             if provider and self.model and provider.value == "anthropic" and "claude-3-7-sonnet" in self.model:
-                config_node_to_use = getattr(self.parent, 'config_node', None)
+                config_node_to_use = getattr(self.parent, 'config_node', None) if hasattr(self, 'parent') else None
                 agent_thinking_config = config_node_to_use.get_value(f"{agent_config_path}.extended_thinking") if config_node_to_use else None
 
                 if not agent_thinking_config:

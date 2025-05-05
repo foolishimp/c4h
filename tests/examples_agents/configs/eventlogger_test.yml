@@ -1,0 +1,237 @@
+# eventlogger_test.yml
+# Comprehensive test configuration for the EventLogger implementation
+
+# LLM configuration
+llm_config:
+  default_provider: "anthropic"
+  default_model: "claude-3-opus-20240229"
+  temperature: 0
+  
+  # Agent-specific configuration
+  agents:
+    semantic_iterator:
+      provider: "anthropic"
+      model: "claude-3-opus-20240229"
+      temperature: 0
+      persona_key: "semantic_iterator_v1"
+    
+    asset_manager:
+      provider: "anthropic"
+      model: "claude-3-opus-20240229"
+      temperature: 0
+      persona_key: "asset_manager_v1"
+    
+    coder:
+      provider: "anthropic"
+      model: "claude-3-opus-20240229"
+      temperature: 0
+      persona_key: "coder_v1"
+  
+  # Define personas
+  personas:
+    semantic_iterator_v1:
+      provider: "anthropic"
+      model: "claude-3-opus-20240229"
+      temperature: 0
+      prompts:
+        system: |
+          You are a code analysis expert specializing in iterative processing of source code.
+          Your task is to analyze provided code and extract specific information or patterns.
+        user: |
+          Analyze the provided code and extract the following information:
+          {task_description}
+
+          Code to analyze:
+          ```
+          {code}
+          ```
+
+          Return the extracted information in the requested format.
+    
+    asset_manager_v1:
+      provider: "anthropic"
+      model: "claude-3-opus-20240229"
+      temperature: 0
+      prompts:
+        system: |
+          You are a file management assistant specialized in handling code assets safely.
+          Your responsibility is to process file modification requests carefully.
+        user: |
+          Process the following file modification request:
+          
+          File path: {file_path}
+          Modification type: {type}
+          
+          ```
+          {content}
+          ```
+          
+          Description: {description}
+          
+          Return a JSON response indicating success or failure.
+    
+    coder_v1:
+      provider: "anthropic"
+      model: "claude-3-opus-20240229"
+      temperature: 0
+      prompts:
+        system: |
+          You are an expert software engineer specialized in Python development.
+          Your task is to analyze requirements and implement clean, well-documented code.
+        user: |
+          Implement the following feature:
+          
+          {task_description}
+          
+          Context:
+          {context}
+          
+          Requirements:
+          {requirements}
+          
+          Return the implementation as a JSON object with file_path, content, and type fields.
+
+# Project path for the test
+project_path: "tests/test_projects/eventlogger_test"
+
+# Runtime configuration for the EventLogger
+runtime:
+  lineage:
+    enabled: true
+    namespace: "c4h_agents.test"
+    backends:
+      file:
+        enabled: true
+        path: "workspaces/lineage/test"
+      marquez:
+        enabled: false
+        url: "http://localhost:5005"
+
+# Create a run ID for this test
+system:
+  runid: "wf_test_eventlogger"
+
+# Test data and instructions
+input_data: |
+  # EventLogger Implementation Test
+  
+  ## Task Description
+  Implement the EventLogger class as a replacement for BaseLineage to provide comprehensive
+  workflow execution tracking.
+  
+  ## Context
+  The EventLogger needs to integrate with the BaseAgent class to log various events
+  during agent execution, including workflow start/end, step start/end, and error events.
+  
+  ## Code to Analyze and Modify
+  
+  ```python
+  # Path: c4h_agents/agents/base_agent.py
+  # Relevant section showing EventLogger integration
+  
+  def _process(self, context: Dict[str, Any]) -> AgentResponse:
+      try:
+          # ... existing code ...
+          
+          # Prepare lineage tracking context
+          lineage_context = self._prepare_lineage_context(context)
+          agent_execution_id = lineage_context.get("agent_execution_id")
+          parent_id = lineage_context.get("parent_id")
+          
+          # ... more code ...
+          
+          # Check if event logger is enabled
+          event_logger_enabled = hasattr(self, 'event_logger') and self.event_logger and getattr(self.event_logger, 'enabled', False)
+          
+          # Log STEP_START event
+          if event_logger_enabled:
+              try:
+                  # Extract config metadata
+                  config_snapshot_path = lineage_context.get("config_snapshot_path")
+                  config_hash = lineage_context.get("config_hash")
+                  
+                  # Log step start event
+                  self.event_logger.log_event(
+                      EventType.STEP_START,
+                      {
+                          "step_type": self._get_agent_name(),
+                          "context_keys": list(lineage_context.keys()),
+                          "agent_id": self.agent_id
+                      },
+                      step_name=self._get_agent_name(),
+                      parent_id=parent_id,
+                      config_snapshot_path=config_snapshot_path,
+                      config_hash=config_hash
+                  )
+              except Exception as e:
+                  self.logger.error("event_logger.step_start_failed", error=str(e))
+          
+          # ... rest of the method ...
+  ```
+  
+  ## Requirements
+  1. Create a comprehensive test implementation of the EventLogger
+  2. The implementation should log events to a file system backend
+  3. Add support for a Marquez/OpenLineage backend
+  4. Include proper error handling for both backends
+  5. Test the event logging integration with an agent workflow
+
+instruction: |
+  You are tasked with implementing the EventLogger class as a replacement for BaseLineage.
+  
+  1. Analyze the provided code to understand the EventLogger integration in BaseAgent
+  2. Design and implement a comprehensive EventLogger class that works with the BaseAgent class
+  3. Include both file system and OpenLineage backends with proper fallbacks
+  4. Ensure comprehensive error handling throughout the implementation
+  5. Return your implementation as a code change with proper documentation
+  
+  Please provide your implementation as a JSON response with:
+  - file_path: The path to the file containing the EventLogger class
+  - content: The complete implementation of the EventLogger class
+  - type: "create" or "modify" depending on whether the file exists
+  - description: A brief description of what your implementation does
+
+# Workflow configuration
+workflow:
+  steps:
+    - type: "semantic_iterator"
+      name: "analyze_code"
+      input:
+        task_description: "Analyze the base_agent.py code to identify EventLogger integration points"
+        code: "${input_data}"
+      output_field: "analysis"
+    
+    - type: "asset_manager"
+      name: "save_analysis"
+      input:
+        file_path: "workspaces/eventlogger_test/analysis.md"
+        type: "create"
+        content: "${analyze_code.analysis.result}"
+        description: "Analysis of EventLogger integration points"
+      output_field: "saved_analysis"
+    
+    - type: "coder"
+      name: "implement_eventlogger"
+      input:
+        task_description: "Implement the EventLogger class as a replacement for BaseLineage"
+        context: "${analyze_code.analysis.result}"
+        requirements: |
+          1. Create a comprehensive EventLogger class that handles event logging
+          2. Support file system and OpenLineage backends
+          3. Include proper error handling for all operations
+          4. Ensure compatibility with BaseAgent integration
+      output_field: "implementation"
+
+# Output format configuration
+format: "json"
+
+# Enable backups for safety
+backup:
+  enabled: true
+  path: "workspaces/backups/eventlogger_test"
+
+# Set project paths
+project:
+  path: "/Users/jim/src/apps/c4h_ai_dev/tests"
+  output_path: "/Users/jim/src/apps/c4h_ai_dev/workspaces/eventlogger_test_output"
+  workspace_root: "/Users/jim/src/apps/c4h_ai_dev/workspaces"

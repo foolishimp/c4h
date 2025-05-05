@@ -1,0 +1,1076 @@
+config_locations:
+  personas_dir: "personas"
+  schemas_dir: "schemas"
+
+llm_config:
+  providers:
+    anthropic:
+      api_base: "https://api.anthropic.com"
+      context_length: 200000
+      env_var: "ANTHROPIC_API_KEY"
+      default_model: "claude-3-5-sonnet-20241022"
+      valid_models:
+        - "claude-3-7-sonnet-20250219"
+        - "claude-3-5-sonnet-20241022"
+        - "claude-3-5-haiku-20241022"
+        - "claude-3-opus-20240229"
+        - "claude-3-sonnet-20240229"
+        - "claude-3-haiku-20240307"
+      extended_thinking:
+        enabled: false
+        budget_tokens: 32000
+        min_budget_tokens: 1024
+        max_budget_tokens: 128000
+      litellm_params:
+        vertex_project: "{YOUR_GCP_PROJECT_ID}" # Replace with your project ID
+        vertex_location: "{YOUR_GCP_REGION}"   # Replace with your region (e.g., us-central1)      
+        retry: true
+        max_retries: 5
+        timeout: 30
+        rate_limit_policy:
+          tokens: 8000
+          requests: 50
+          period: 60
+        backoff:
+          initial_delay: 1
+          max_delay: 30
+          exponential: true
+    openai:
+      api_base: "https://api.openai.com/v1"
+      env_var: "OPENAI_API_KEY"
+      default_model: "gpt-4o"
+      valid_models:
+        - "gpt-4o"
+        - "gpt-4o-mini"
+        - "gpt-4"
+        - "gpt-4-turbo"
+        - "o1"
+        - "o1-mini"
+        - "o3-mini"
+      litellm_params:
+        retry: true
+        max_retries: 3
+        timeout: 30
+        rate_limit_policy:
+          tokens: 4000
+          requests: 200
+          period: 60
+        backoff:
+          initial_delay: 1
+          max_delay: 20
+          exponential: true
+    gemini:
+      # IMPORTANT: Use the base API endpoint WITHOUT /models
+      # LiteLLM will construct this incorrectly, which is why we need this specific format
+      api_base: "https://generativelanguage.googleapis.com/v1beta"
+      context_length: 32000
+      env_var: "GEMINI_API_KEY"
+      default_model: "gemini-1.5-pro-latest"
+      valid_models:
+        - "gemini-2.5-pro-preview-03-25"  # Exact model name that works with curl
+      # Set model parameters specific to Gemini
+      model_params:
+        # Use camelCase format for params as required by Google API
+        maxOutputTokens: 8192
+        temperature: 0.7
+      litellm_params:
+        # Skip LiteLLM's Gemini handling with a custom call
+        custom_gemini_call: true  # We'll add this flag in our code
+        retry: true
+        max_retries: 3
+        timeout: 60
+        backoff:
+          initial_delay: 2
+          max_delay: 30
+          exponential: true
+    xai:
+      api_base: "https://api.x.ai/v1"  # Official xAI API base URL
+      env_var: "XAI_API_KEY"          # Environment variable for API key
+      default_model: "grok-1.5-flash" # Defaulting to flash version
+      valid_models:
+        - "grok-1"                   # Original Grok-1
+        - "grok-1.5"                 # Grok 1.5
+        - "grok-1.5-flash"           # Faster variant of Grok 1.5
+        # - "grok-beta"              # Older beta name, likely deprecated
+        # - "grok-2-latest"          # Anticipated Grok 2 variant (placeholder)
+        # - "grok-3"                 # Hypothetical reasoning model (placeholder)
+      context_length: 128000         # Adjust based on actual Grok specs
+      litellm_params:
+        retry: true
+        max_retries: 3
+        timeout: 45
+        rate_limit_policy:
+          tokens: 10000             # Adjust based on xAI rate limits
+          requests: 50
+          period: 60
+        backoff:
+          initial_delay: 1
+          max_delay: 20
+          exponential: true
+
+  default_provider: "anthropic"
+  default_model: "claude-3-opus-20240229"
+  
+  # Base structure for personas - will be template/schema
+  personas:
+    # Common fields all personas inherit
+    provider: null # Provider to use (e.g., "anthropic")
+    model: null    # Model to use (e.g., "claude-3-7-sonnet-20250219")
+    temperature: 0.7
+    extended_thinking:
+      enabled: true
+      budget_tokens: 32000
+    
+    # Template for prompt structures        
+    prompts:
+      system: null  # System instruction prompt
+      user: null    # Default user template
+    
+    # Execution plan for orchestrating agents - used by GenericOrchestratingAgent
+    execution_plan:
+      enabled: false
+      steps: []
+    
+    # Model-specific parameters
+    model_params:
+      max_tokens: 4096
+    
+    # Storage settings
+    storage:
+      root_dir: "workspaces"
+      retention:
+        max_age_days: 30
+        max_runs: 10
+      error_handling:
+        ignore_failures: true
+        log_level: "ERROR"
+
+    lineage:  # Lineage-specific configuration
+      enabled: true
+      namespace: "c4h_agents"
+      backend:
+        type: "file"  # or "marquez" for OpenLineage
+        path: "workspaces/lineage"  # Default path if using file backend
+        url: null  # Required if using marquez backend
+      retention:
+        max_age_days: 30
+        max_runs: 100
+      context:
+        include_metrics: true
+        include_token_usage: true
+        record_timestamps: true
+        
+    discovery:
+      default_provider: "anthropic"
+      default_model: "claude-3-5-sonnet-20241022"  # Fixed hyphenation
+      temperature: 0
+      tartxt_config:
+        script_path: /Users/jim/src/apps/c4h/c4h_agents/skills/tartxt.py
+        exclusions:
+            - '**/node_modules/**'
+            - '**/.git/**'
+            - '**/__pycache__/**'
+            - '**/*.pyc'
+            - '**/package-lock.json'
+            - '**/dist/**'
+            - '**/.DS_Store'
+            - '**/README.md'
+            - '**/workspaces/**'
+            - '**/backup_txt/**'
+      prompts:
+        system: |
+          You are a project discovery agent.
+          You analyze project structure and files to understand:
+          1. Project organization
+          2. File relationships
+          3. Code dependencies
+          4. Available functionality
+
+    solution_designer:
+      provider: "anthropic"
+      model: "claude-3-7-sonnet-20250219"
+      temperature: 1
+      extended_thinking:
+        enabled: true
+        budget_tokens: 32000
+      prompts:
+        system: |
+          You are a code modification solution designer that returns modifications in a clearly structured text format.
+          Return your response in the following format, with no additional explanation:
+
+          ===CHANGE_BEGIN===
+          FILE: path/to/file
+          TYPE: create|modify|delete
+          DESCRIPTION: one line description
+          DIFF:
+          --- a/existing_file.py
+          +++ b/existing_file.py
+          @@ -1,3 +1,4 @@
+          context line
+          -removed line
+          +added line
+          context line
+          ===CHANGE_END===
+
+          PATH REQUIREMENTS:
+          Make sure to use the full path for a file as it appears in the manifest.
+
+          FORMAT REQUIREMENTS FOR EACH TYPE:
+
+          1. NEW FILES (type: "create"):
+          DIFF:
+          --- /dev/null
+          +++ b/new_file.py
+          @@ -0,0 +1,3 @@
+          +new content here
+
+          2. DELETE FILES (type: "delete"):
+          DIFF:
+          --- a/old_file.py
+          +++ /dev/null
+          @@ -1,3 +0,0 @@
+          -content to remove
+
+          3. MODIFY FILES (type: "modify"):
+          DIFF:
+          --- a/existing_file.py
+          +++ b/existing_file.py
+          @@ -1,3 +1,4 @@
+          context line
+          -removed line
+          +added line
+          context line
+
+          CONTINUATION HANDLING:
+          - For long responses that may be split across multiple completions:
+          - Complete each change fully before starting a new one
+          - Never split a single DIFF section if possible
+          - If a response is cut mid-change, the next continuation should start with the same ===CHANGE_BEGIN=== marker
+          
+          RULES:
+          - Use /dev/null for create/delete operations
+          - Include 3 lines of context for modifications
+          - Group related changes into chunks with @@ markers
+          - Include imports in first chunk if needed, make sure to include imports for new code
+          - Return ONLY the changes in the specified format, no explanations
+          - Ensure all paths use forward slashes
+          - Keep descriptions short and clear
+
+        solution: |
+          Source Code:
+          {source_code}
+
+          Intent:
+          {intent}
+
+          Return only the content without any markup or explanations.
+          IMPORTANT do NOT give any other information, only the asked for content
+          IF you provide any other information, you will break the processing pipeline
+
+    semantic_extract:
+      provider: "anthropic"
+      model: "claude-3-7-sonnet-20250219"
+      temperature: 0
+      prompts:
+        system: |
+          You are a precise information extractor.
+          When given content and instructions:
+          1. Follow the instructions exactly as given
+          2. Extract ONLY the specific information requested
+          3. Return in exactly the format specified
+          4. Do not add explanations or extra content
+          5. Do not modify or enhance the instructions
+        
+        extract: |
+          Extract information from the following content:
+          
+          Content to analyze:
+          {content}
+          
+          Input instruction:
+          {instruction}
+          
+          Required format:
+          {format}
+
+    semantic_iterator:
+      prompts:
+        system: |
+          You are a semantic extraction coordinator. 
+          You use fast extraction for structured content and fall back to slow extraction when needed.
+          Your task is to coordinate extraction using the right mode while maintaining result consistency.
+          Never modify the extraction instructions or format requirements from the caller.
+          Do not add any processing or validation beyond what is specifically requested.
+
+    semantic_fast_extractor:
+      provider: "anthropic"
+      model: "claude-3-7-sonnet-20250219"
+      temperature: 0
+      prompts:
+        system: |
+          You are a precise bulk extraction agent for information objects.
+          Your role is to extract information objects from a text format into a consistent structure.
+          Rules:
+          1. Follow the extraction instruction exactly
+          2. Return ONLY raw JSON - no markdown, no code blocks, no backticks
+          3. Each change MUST include a non-empty file_path, type, and either content or diff
+          4. NEVER extract items without a valid file_path
+          5. Never include explanatory text or formatting markers
+          6. Extract all valid changes in a single pass
+          7. Response must start with [ and end with ]
+          8. Every string must use double quotes
+          9. No comments or trailing commas allowed
+          10. Do not extract metadata as separate files - only extract actual file changes
+
+        extract: |
+          Extract all code change objects from the input. The input uses a text-based format with
+          ===CHANGE_BEGIN=== and ===CHANGE_END=== markers. Extract these into proper JSON objects.
+          
+          Content to analyze:
+          {content}
+
+          Each change MUST include ALL of these required fields:
+          1. file_path: Path of the file to modify - THIS MUST BE A NON-EMPTY STRING
+          2. type: One of "modify", "create", or "delete"
+          3. diff: Git-style diff with proper escape sequences
+          4. description: Clear description of the change
+
+          EXTRACTION FORMAT:
+          For each ===CHANGE_BEGIN=== to ===CHANGE_END=== section, extract:
+          - FILE: as "file_path"
+          - TYPE: as "type"
+          - DESCRIPTION: as "description"
+          - DIFF: as "diff" (everything between DIFF: and ===CHANGE_END===)
+          
+          CRITICAL ESCAPE SEQUENCE HANDLING:
+          - Backslashes in diff content must be properly doubled (\\)
+          - Quotes in diff content must be escaped (\")
+          - Newlines in diff content must be represented as literal \n
+          
+          VALIDATION RULES:
+          - SKIP any object that doesn't have a valid file_path
+          - DO NOT extract metadata as separate files
+          - ONLY extract actual file changes
+          - ONLY extract items that represent code or content files
+          - Ensure valid JSON structure with proper escaping throughout
+          
+          Input instruction:
+          {instruction}
+
+          Required format:
+          {format}
+
+          CRITICAL: Return raw JSON array of valid file changes only. Do not include any item without a valid file_path.
+          1. Return ONLY the raw JSON array of valid file changes
+
+    semantic_slow_extractor:
+      provider: "anthropic"
+      model: "claude-3-7-sonnet-20250219"
+      temperature: 0.0 # Strict instruction following
+      extended_thinking:
+        enabled: true
+        budget_tokens: 16000
+      prompts:
+        system: |
+          You are a precise sequential parsing and extraction agent.
+          Your ONLY task is to identify the Nth complete *top-level* text block delimited by '===CHANGE_BEGIN===' and '===CHANGE_END===' markers from the provided input content, parse its internal fields, and return a structured JSON object containing those fields.
+          A top-level block is one whose '===CHANGE_BEGIN===' marker is not inside another block.
+          Ignore any '===CHANGE_BEGIN===' or '===CHANGE_END===' markers that appear *inside* the content of a block when determining its boundaries or counting blocks.
+          You MUST parse the following fields from within the identified block: FILE:, TYPE:, DESCRIPTION:, DIFF:.
+          Do NOT include the '===CHANGE_BEGIN===' or '===CHANGE_END===' markers in the final JSON output.
+          Do NOT add ANY extra text, explanations, formatting (outside the JSON), or conversational filler.
+          If the Nth distinct, complete block cannot be found, your ONLY response MUST be the literal string "NO_MORE_ITEMS".
+
+        extract: |
+          Analyze the 'Content to analyze' below using a two-step process:
+
+          **Step 1: Count Top-Level Blocks**
+          - Carefully count how many distinct, complete *top-level* text blocks exist in the content. A top-level block starts with '===CHANGE_BEGIN===' that is not nested within another block and ends with its corresponding *outermost* '===CHANGE_END==='. Ignore nested markers when counting. Let this count be `TOTAL_BLOCKS`.
+
+          **Step 2: Parse or Terminate**
+          - You are asked to extract and parse the {ordinal} block. Let N = {ordinal}.
+          - Compare N to `TOTAL_BLOCKS`.
+          - **If N is greater than `TOTAL_BLOCKS`**: Your ONLY response MUST be the literal string "NO_MORE_ITEMS".
+          - **If N is less than or equal to `TOTAL_BLOCKS`**:
+              1. Identify the {ordinal} top-level block based on the counting in Step 1.
+              2. Parse the content *inside* that block to extract the values for FILE:, TYPE:, DESCRIPTION:, and DIFF:.
+              3. Construct a single JSON object with the following keys and the extracted values: "file_path", "type", "
+------------END OVERLAP------------
+
+description", "diff".
+              4. Ensure the value for "diff" contains the multi-line diff content accurately, preserving original formatting within the JSON string (use correct newline escapes like \\n).
+              5. Return ONLY this single, complete JSON object.
+
+          Content to analyze:
+          ```text
+          {content}
+          ```
+
+          CRITICAL OUTPUT INSTRUCTIONS:
+          - Perform the count first.
+          - Based on the comparison between {ordinal} and the count, return *either* a single JSON object containing the parsed fields ("file_path", "type", "description", "diff") from the {ordinal} block *or* the literal string "NO_MORE_ITEMS".
+          - Do not include the '===CHANGE_BEGIN===' or '===CHANGE_END===' markers in the JSON output.
+          - Ensure the output is valid JSON.
+          - Absolutely no other text, explanation, or formatting is allowed in your response.
+
+          Return the result based on the two-step process now:
+    semantic_merge:
+      provider: "anthropic"
+      model: "claude-3-7-sonnet-20250219"
+      temperature: 1
+      extended_thinking:
+        enabled: true
+        budget_tokens: 32000
+      merge_config:
+        preserve_formatting: true
+        allow_partial: false
+      prompts:
+        system: |
+          You are a precise code merger that transforms git-style unified diffs into complete, runnable file contents. Your task is to apply the diff to the original code accurately, preserving its structure, formatting, and functionality.
+
+          CRITICAL REQUIREMENTS:
+          1. Input Expectations:
+            - You will receive:
+              - Original code ("original" in context)
+              - Unified git-style diff ("diff" in context)
+            - For new file creation:
+              - If original is empty or contains "New file - no original content" it means this is a NEW FILE
+              - For new files, extract the complete content from the diff by taking all lines starting with "+" and removing the leading "+"
+              - Do not return an error for new files; instead return the extracted content as the complete file content
+            - For modifications to existing files:
+              - If either original or diff is missing, return the error: "Missing required [original|diff] content".
+
+          2. Diff Application Rules:
+            - For NEW FILES:
+              - Extract all content from diff lines that start with "+"
+              - Remove the leading "+" character from each line
+              - Return this as a complete file
+              - Do not return errors about missing original content for new files
+            - For MODIFICATIONS:
+              - Parse the @@ markers to determine exact positions of changes.
+              - Verify that context lines in the diff match the original code.
+              - Modify only the lines specified in the diff and leave all other lines untouched.
+              - Maintain original indentation, whitespace, comments, docstrings, imports, and overall structure.
+
+          3. Validation Checks:
+            - Check if this is a new file by looking for empty original or "New file"
+            - If new file, skip validation checks for original content
+            - Otherwise:
+              - Ensure @@ line numbers align with the original code.
+              - Verify that all context lines exist in the original file.
+              - Ensure no unintended code is added or removed.
+              - Retain all class and function structures, import order, and grouping.
+
+          4. Output Format:
+            - Return ONLY the complete, modified file content.
+            - For new files, return the complete content extracted from the diff
+            - For existing files, start with the original file docstring and end with the last line of actual code.
+            - Never include:
+              * File boundary markers (---, ===, etc)
+              * End-of-file comments or markers
+              * Documentation separators
+              * Markdown formatting (```, etc)
+              * Conversation markers or explanations
+            - Ensure the output is valid and executable code.
+
+          5. File Content Rules:
+            - Never append duplicate methods
+            - Never add content after last code line
+            - Never include file separator comments
+            - Never add markdown or documentation markers
+            - Preserve exact original whitespace patterns
+            - Maintain original method ordering
+
+          REMINDER:
+          Your role is strictly to apply the changes defined in the diff. Any deviation from the original code not specified in the diff is an error.
+        merge: |
+          You will receive a git-style unified diff representing code changes.
+          Your task is to apply these changes to the provided original code and return the COMPLETE modified file content.
+
+          REQUIREMENTS:
+          ======================================================================
+          1. Original Code Context:
+            {original}
+
+          ======================================================================
+          2. Diff Patch to Apply:
+            {diff}
+
+          ======================================================================
+          3. NEW FILE DETECTION:
+            - If original is empty or contains "New file", this is a NEW FILE creation
+            - For new files, extract content directly from the diff by taking all lines that start with "+" and removing the leading "+"
+            - DO NOT return an error about missing original content for new files
+
+          ======================================================================
+          4. Preservation Rules:
+            - For existing files:
+              - Keep original code structure intact.
+              - Apply all modifications from the diff.
+              - Maintain existing imports, comments, and docstrings.
+              - Preserve original functionality.
+              - Keep original whitespace patterns.
+              - Maintain exact method ordering.
+            - For new files:
+              - Extract the complete content from lines starting with "+" in the diff
+              - Remove the leading "+" character from each line
+              - Return the complete clean content as the file content
+
+          CRITICAL OUTPUT INSTRUCTIONS:
+            - Return ONLY the complete final file content.
+            - NO file boundary markers.
+            - NO end-of-file comments.
+            - NO markdown formatting.
+            - NO documentation separators.
+            - NO conversation text or explanations.
+            - Output must be valid code that could be directly saved to a file.
+
+          Any non-code content will break the processing pipeline.
+
+    coder:
+      provider: "anthropic"
+      model: "claude-3-opus-20240229"
+      temperature: 0
+      prompts:
+        system: |
+          You are an expert code modification agent. Your task is to safely and precisely apply code changes.
+          You receive changes in this exact JSON structure:
+          {
+            "changes": [
+              {
+                "file_path": "exact path to file",
+                "type": "modify",
+                "description": "change description",
+                "content": "complete file content"
+              }
+            ]
+          }
+
+          Rules:
+          1. Always expect input in the above JSON format
+          2. If input is a string, parse it as JSON first
+          3. Preserve existing functionality unless explicitly told to change it
+          4. Maintain code style and formatting
+          5. Apply changes exactly as specified
+          6. Handle errors gracefully with backups
+          7. Validate code after changes
+
+# Default teams and lineage configuration
+orchestration:
+  enabled: true
+  entry_team: "discovery"  # First team to execute
+  error_handling:
+    retry_teams: true
+    max_retries: 2
+    log_level: "ERROR"
+  teams:
+    # Discovery team - analyzes project structure
+    discovery:
+      name: "Discovery Team"
+      tasks:
+        - name: "discovery_phase"
+          agent_type: "GenericLLMAgent"  # New agent type (was generic_single_shot)
+          persona_key: "discovery"
+          description: "Analyze project structure and files"
+          requires_approval: false
+          max_retries: 2
+      routing:
+        default: "solution"  # Go to solution team next
+    
+    # Solution team - designs code changes
+    solution:
+      name: "Solution Design Team"
+      tasks:
+        - name: "solution_design_phase"
+          agent_type: "GenericLLMAgent"  # New agent type (was generic_single_shot)
+          persona_key: "solution_designer"
+          description: "Create solution design and code changes"
+          requires_approval: true
+          max_retries: 1
+      routing:
+        rules:
+          - condition: "all_success"
+            next_team: "coder"
+          - condition: "any_failure"
+            next_team: "fallback"
+        default: "coder"  # Default next team
+    
+    # Coder team - implements code changes
+    coder:
+      name: "Coder Team"
+      tasks:
+        - name: "coding_phase"
+          agent_type: "GenericLLMAgent"  # New agent type (was generic_single_shot)
+          persona_key: "coder"
+          description: "Implement code changes based on solution design"
+          requires_approval: true
+          max_retries: 1
+      routing:
+        rules:
+          - condition: "all_success"
+            next_team: null  # End workflow on success
+        default: null  # End workflow by default
+    
+    # Fallback team - specialized for handling failures
+    fallback:
+      name: "Fallback Team"
+      tasks:
+        - name: "fallback_coding_phase"
+          agent_type: "GenericFallbackAgent"  # New specialized fallback agent type
+          persona_key: "coder"
+          description: "Implement code changes with conservative approach"
+          config:
+            temperature: 0  # Lower temperature for more conservative changes
+            max_retries: 2  # Add retries for fallback
+            validation_level: "strict"  # Strict validation for fallback
+      routing:
+        default: null  # End workflow after fallback
+        
+    # Extraction team - specialized skill-based processing
+    extraction:
+      name: "Data Extraction Team"
+      tasks:
+        - name: "extract_semantic_data"
+          agent_type: "GenericSkillAgent"  # New skill-based agent type
+          persona_key: "semantic_extract"
+          description: "Extract structured data from unstructured content"
+          config:
+            skill: "semantic_extract"  # Primary skill to use
+            allow_llm_fallback: true   # Allow LLM fallback if skill fails
+      routing:
+        default: null  # End workflow after extraction
+        
+    # Orchestration team - coordinates complex workflows
+    orchestration:
+      name: "Workflow Orchestration Team"
+      tasks:
+        - name: "orchestrate_workflow"
+          agent_type: "GenericOrchestratorAgent"  # New orchestration agent type
+          persona_key: "semantic_iterator"
+          description: "Orchestrate complex multi-step workflows"
+          config:
+            execution_plan:
+              enabled: true
+              steps:
+                - name: "initialize"
+                  type: "set_value"
+                  field: "status"
+                  value: "initialized"
+                  
+                - name: "process_data"
+                  type: "skill"
+                  skill: "semantic_extract"
+                  params:
+                    format: "json"
+                  output_field: "extraction_result"
+                  
+                - name: "evaluate_result"
+                  type: "branch"
+                  branches:
+                    - condition:
+                        field: "extraction_result.success"
+                        operator: "equals"
+                        value: true
+                      target: "format_output"
+                      
+                    - condition:
+                        field: "extraction_result.success"
+                        operator: "equals"
+                        value: false
+                      target: "handle_error"
+                      
+                - name: "handle_error"
+                  type: "llm"
+                  prompt: "Error occurred during extraction: {extraction_result.error}. Please suggest a recovery strategy."
+                  output_field: "recovery_strategy"
+                  
+                - name: "format_output"
+                  type: "skill"
+                  skill: "semantic_formatter"
+                  params:
+                    data: "{extraction_result.value}"
+                    format: "markdown"
+                  output_field: "formatted_output"
+      routing:
+        default: null  # End workflow after orchestration
+        
+    # Loop processing team - uses iteration
+    batch_processor:
+      name: "Batch Processing Loop"
+      type: "loop"  # Loop team type
+      iterate_on: "context.batches"  # Path to collection
+      loop_variable: "batch"  # Variable for current item
+      body:
+        - name: "process_batch"
+          agent_type: "GenericSkillAgent"  # Skill-based agent for each iteration
+          persona_key: "semantic_extract"
+          description: "Process a single batch"
+          config:
+            skill: "semantic_extract"
+            skill_params:
+              format: "json"
+      routing:
+        default: "summarizer"  # Go to summarizer after loop
+        
+    # Loop Example - iterates over a collection of items
+    item_processor:
+      name: "Item Processing Loop"
+      type: "loop"  # Marks this as a loop-type team
+      iterate_on: "context.items"  # Path to the collection in context
+      loop_variable: "current_item"  # Name to assign each item in the context
+      break_on_failure: false  # Whether to stop the entire loop if one iteration fails
+      stop_on_failure: true  # Whether to stop the current iteration if a task fails
+      body:  # Loop body can contain tasks or references to other teams
+        - name: "process_item"
+          agent_type: "generic_single_shot"
+          persona_key: "coder"
+          description: "Process an individual item"
+          requires_approval: false
+          config:
+            # Each task has access to the loop_variable in its context
+            temperature: 0.2
+      routing:
+        default: "summarizer"  # Team to execute after loop completes
+        
+    # Another loop example with team references
+    file_processor:
+      name: "File Processing Loop"
+      type: "loop"
+      iterate_on: "context.file_paths"
+      loop_variable: "file_path"
+      body:
+        - "file_analyzer"  # Reference to another team
+      routing:
+        default: null
+        
+    # Team referenced by the loop
+    file_analyzer:
+      name: "File Analysis Team"
+      tasks:
+        - name: "analyze_file"
+          agent_type: "generic_single_shot"
+          persona_key: "discovery"
+          description: "Analyze individual file"
+      routing:
+        default: null
+        
+    # Loop with multiple steps per iteration
+    batch_processor:
+      name: "Batch Processing Loop"
+      type: "loop"
+      iterate_on: "context.batches"
+      loop_variable: "batch"
+      body:
+        - name: "validate_batch"
+          agent_type: "generic_single_shot"
+          persona_key: "discovery"
+          description: "Validate batch data"
+        - name: "transform_batch"
+          agent_type: "generic_single_shot"
+          persona_key: "coder"
+          description: "Transform batch data"
+        - name: "save_batch"
+          agent_type: "generic_single_shot" 
+          persona_key: "coder"
+          description: "Save processed batch"
+      routing:
+        rules:
+          - condition:
+              context_field: "batch_processing_complete"
+              operator: "equals"
+              value: true
+            next_team: null  # End workflow if batch processing is complete
+        default: "summarizer"  # Otherwise go to summarizer
+        
+    # Summarizer team for after loops
+    summarizer:
+      name: "Result Summarizer"
+      tasks:
+        - name: "summarize_results"
+          agent_type: "generic_single_shot"
+          persona_key: "discovery"
+          description: "Summarize all processing results"
+      routing:
+        default: null  # End workflow after summarization
+        
+    # Enhanced routing team with complex conditions
+    advanced_routing:
+      name: "Advanced Routing Team"
+      tasks:
+        - name: "analysis_task"
+          agent_type: "GenericLLMAgent"
+          persona_key: "discovery"
+          description: "Analyze data and determine next steps"
+        - name: "validation_task"
+          agent_type: "GenericSkillAgent"
+          persona_key: "semantic_extract"
+          description: "Validate analysis results with skill"
+          config:
+            skill: "semantic_extract"
+      routing:
+        rules:
+          # Complex nested condition with logical operators
+          - condition:
+              type: "and"
+              conditions:
+                - task: "analysis_task"
+                  status: "success"
+                - task: "validation_task"
+                  output_field: "skill_result.quality_score"
+                  operator: "greater_than"
+                  value: 0.8
+                - context_field: "user_feedback.approved"
+                  operator: "equals"
+                  value: true
+            next_team: "implementation"
+            context_updates:
+              quality_verified: true
+            
+          # OR condition example
+          - condition:
+              type: "or"
+              conditions:
+                - task: "validation_task"
+                  output_field: "skill_result.requires_revision"
+                  operator: "equals"
+                  value: true
+                - context_field: "user_feedback.approved"
+                  operator: "equals" 
+                  value: false
+            next_team: "revision_team"
+            context_updates:
+              revision_requested: true
+              
+          # NOT condition example with recursion strategy
+          - condition:
+              type: "not"
+              condition:
+                task: "analysis_task"
+                status: "success"
+            next_team: "fallback_team"
+            recursion_strategy: "restart_with_context"
+            context_updates:
+              force_new_snapshot: true
+              failure_count: 1
+              
+          # Type checking condition
+          - condition:
+              context_field: "input_data"
+              operator: "is_type"
+              value: "list"
+            next_team: "batch_processor"
+            context_updates:
+              batches: "{{ context.input_data }}"
+            
+          # String matching condition
+          - condition:
+              context_field: "project_name"
+              operator: "starts_with"
+              value: "urgent_"
+            next_team: "priority_team"
+            context_updates:
+              priority_level: "high"
+              
+        default: "default_team"
+        default_context_updates:
+          status: "processed"
+        default_recursion_strategy: "default"
+        
+    # Recursive team example
+    recursive_team:
+      name: "Recursive Processing Team"
+      tasks:
+        - name: "process_level"
+          agent_type: "GenericLLMAgent"
+          persona_key: "coder"
+          description: "Process current recursion level"
+      routing:
+        rules:
+          # Continue recursion with modified context
+          - condition:
+              context_field: "recursion.depth"
+              operator: "less_than"
+              value: 3
+            next_team: "recursive_team"  # Process same team again
+            recursion_strategy: "recursive_snapshot"  # With new snapshot
+            context_updates:
+              recursion:
+                depth: "{{ context.recursion.depth + 1 }}"
+                parent_data: "{{ context.current_data }}"
+                
+          # Complex condition with multiple fields
+          - condition:
+              type: "all_of"
+              conditions:
+                - context_field: "recursion.depth"
+                  operator: "greater_equal"
+                  value: 3
+                - context_field: "recursion.results"
+                  operator: "has_length"
+                  value: 3
+            next_team: "summarizer"
+            context_updates:
+              recursion_complete: true
+              
+        default: null
+        default_context_updates:
+          recursion_status: "completed"
+
+# Runtime configuration for workflow and lineage
+runtime:
+  # Workflow storage configuration
+  workflow:
+    storage:
+      enabled: true
+      root_dir: "workspaces/workflows"
+      format: "yymmdd_hhmm_{workflow_id}"
+      retention:
+        max_runs: 10
+        max_days: 30
+      error_handling:
+        ignore_storage_errors: true
+        log_level: "ERROR"
+  # Lineage tracking configuration
+  lineage:
+    enabled: true
+    namespace: "c4h_agents"
+    separate_input_output: true
+    backend:
+      type: "file"  # File-based storage is more reliable for initial testing
+      path: "workspaces/lineage"  # Use explicit relative path
+    error_handling:
+      ignore_failures: true  # Don't let lineage errors affect workflow
+      log_level: "ERROR"
+    context:
+      include_metrics: true
+      include_token_usage: true
+      record_timestamps: true
+    retry:
+      enabled: true
+      max_attempts: 3
+      initial_delay: 1
+      max_delay: 30
+      backoff_factor: 2
+      retry_on:
+        - "overloaded_error"
+        - "rate_limit_error"
+        - "timeout_error"
+
+# Backup settings
+backup:
+  enabled: true
+  path: "workspaces/backups"  # Default backup path
+
+# Advanced Orchestration Configuration
+advanced_orchestration:
+  # Configuration Snapshots
+  config_snapshots:
+    enabled: true
+    store_path: "{project_path}/snapshots"
+    include_metadata: true
+    hash_algorithm: "sha256"
+    validation:
+      schema_required: true
+      strict_mode: false
+      schemas:
+        - "persona.json"
+        - "job.json"
+        - "system.json"
+      error_handling:
+        ignore_schema_errors: false
+        log_level: "ERROR"
+    metadata:
+      include_timestamp: true
+      include_run_id: true
+      include_fragment_info: true
+      include_validation_results: true
+      
+  # Enhanced Conditional Routing
+  enhanced_routing:
+    operators:
+      comparison: ["equals", "not_equals", "greater_than", "less_than", "greater_equal", "less_equal"]
+      existence: ["exists", "not_exists", "is_empty", "is_not_empty"]
+      string: ["contains", "starts_with", "ends_with", "matches_regex"]
+      collection: ["in", "not_in", "has_any", "has_all", "has_length"]
+      type: ["is_type", "is_not_type"]
+      logic: ["and", "or", "not", "all_of", "any_of", "none_of"]
+    templates:
+      # Named template conditions that can be reused
+      high_priority:
+        type: "or"
+        conditions:
+          - context_field: "priority"
+            operator: "equals"
+            value: "high"
+          - context_field: "urgent"
+            operator: "equals"
+            value: true
+      requires_approval:
+        context_field: "user_feedback.approved"
+        operator: "equals"
+        value: true
+      
+  # Loop-Based Iteration
+  loop_configurations:
+    # Processing modes
+    processing_modes:
+      - sequential  # Process items one at a time
+      - parallel    # Process items concurrently
+      - batched     # Process items in configurable batches
+    
+    # Result accumulation strategies
+    accumulation_strategies:
+      - append       # Add each result to an array
+      - merge        # Merge objects together
+      - reduce       # Apply a reduction function
+      - last_wins    # Keep only the last result
+    
+    # Loop control options
+    control_options:
+      max_iterations: 100
+      timeout_seconds: 3600
+      error_handling:
+        continue_on_error: true
+        max_errors: 3
+        error_threshold_percent: 10
+  
+  # Context-Aware Recursion
+  recursion:
+    strategies:
+      # Create completely new config snapshot for each recursion level
+      new_snapshot:
+        create_snapshot: true
+        preserve_lineage: true
+        propagate_context: true
+      
+      # Use child context with nondestructive updates
+      child_context:
+        create_snapshot: false
+        preserve_parent_context: true
+        isolate_changes: true
+      
+      # Shared context across recursive calls
+      shared_context:
+        create_snapshot: false
+        preserve_parent_context: false
+        merge_contexts: true
+    
+    # Global recursion controls
+    controls:
+      max_depth: 5
+      track_level: true
+      prevent_cycles: true
+      timeout_seconds: 1800
+
+logging:
+  level: "debug"
+  format: "structured"
+  agent_level: "debug"
+  providers:
+    anthropic:
+      level: "debug"
+    openai:
+      level: "debug"
+  truncate:
+    prefix_length: 2000
+    suffix_length: 1000

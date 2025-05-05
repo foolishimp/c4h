@@ -358,27 +358,34 @@ class BaseAgent(BaseConfig, BaseLLM):
                         config_snapshot_path = lineage_context.get("config_snapshot_path")
                         config_hash = lineage_context.get("config_hash")
                         
-                        # Log step end event
+                        # Create a more detailed event payload similar to the original BaseLineage
+                        event_payload = {
+                            "step_type": self._get_agent_name(),
+                            "agent_response_summary": {
+                                "success": True,
+                                "content": processed_data.get("response", "")
+                            },
+                            "metrics": response_metrics,
+                            "llm_input": {
+                                "system_message": messages.system,
+                                "user_message": messages.user,
+                                "formatted_request": messages.formatted_request if hasattr(messages, "formatted_request") else ""
+                            },
+                            # Store the full raw response to preserve all data
+                            "llm_output": self.event_logger._serialize_value(raw_response),
+                            # Store model information
+                            "llm_model": {
+                                "provider": self.provider.value if hasattr(self, 'provider') else "unknown",
+                                "model": self.model if hasattr(self, 'model') else "unknown"
+                            },
+                            # Include the full context for completeness
+                            "input_context": lineage_context
+                        }
+                        
+                        # Log the comprehensive event
                         self.event_logger.log_event(
                             EventType.STEP_END,
-                            {
-                                "step_type": self._get_agent_name(),
-                                "agent_response_summary": {
-                                    "success": True,
-                                    "content": processed_data.get("response", "")
-                                },
-                                "metrics": response_metrics,
-                                "llm_input": {
-                                    "system": messages.system,
-                                    "user": messages.user,
-                                    "formatted_request": messages.formatted_request if hasattr(messages, "formatted_request") else ""
-                                },
-                                "llm_output": self.event_logger._serialize_value(raw_response),
-                                "llm_model": {
-                                    "provider": self.provider.value if hasattr(self, 'provider') else "unknown",
-                                    "model": self.model if hasattr(self, 'model') else "unknown"
-                                }
-                            },
+                            event_payload,
                             step_name=self._get_agent_name(),
                             parent_id=parent_id,
                             config_snapshot_path=config_snapshot_path,
@@ -417,24 +424,29 @@ class BaseAgent(BaseConfig, BaseLLM):
                         config_snapshot_path = lineage_context.get("config_snapshot_path")
                         config_hash = lineage_context.get("config_hash")
                         
+                        # Create a comprehensive error event payload
+                        error_payload = {
+                            "error_message": str(e),
+                            "error_type": type(e).__name__,
+                            "traceback": traceback.format_exc(),
+                            "location": self._get_agent_name(),
+                            "llm_input": {
+                                "system_message": messages.system,
+                                "user_message": messages.user,
+                                "formatted_request": messages.formatted_request if hasattr(messages, "formatted_request") else ""
+                            },
+                            "llm_model": {
+                                "provider": self.provider.value if hasattr(self, 'provider') else "unknown",
+                                "model": self.model if hasattr(self, 'model') else "unknown"
+                            },
+                            # Include the full context for completeness
+                            "input_context": lineage_context
+                        }
+                        
                         # Log error event
                         self.event_logger.log_event(
                             EventType.ERROR_EVENT,
-                            {
-                                "error_message": str(e),
-                                "error_type": type(e).__name__,
-                                "traceback": traceback.format_exc(),
-                                "location": self._get_agent_name(),
-                                "llm_input": {
-                                    "system": messages.system,
-                                    "user": messages.user,
-                                    "formatted_request": messages.formatted_request if hasattr(messages, "formatted_request") else ""
-                                },
-                                "llm_model": {
-                                    "provider": self.provider.value if hasattr(self, 'provider') else "unknown",
-                                    "model": self.model if hasattr(self, 'model') else "unknown"
-                                }
-                            },
+                            error_payload,
                             step_name=self._get_agent_name(),
                             parent_id=parent_id,
                             config_snapshot_path=config_snapshot_path,

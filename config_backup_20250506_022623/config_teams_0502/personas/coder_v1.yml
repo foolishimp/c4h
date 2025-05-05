@@ -2,22 +2,32 @@ provider: "anthropic"
 model: "claude-3-opus-20240229"
 temperature: 0
 
-# Example execution plan for a coder that uses iterator and asset manager
-# This would be used if agent_type is "generic_orchestrating"
+# Active execution plan for the coder orchestrator that implements the event logging
 execution_plan:
-  - name: "setup_iterator"
-    skill: "SemanticIterator.initialize" # Assumes skill registry maps this
-    input: "{{context.input_data.response}}" # Assuming diffs are here
-    output_variable: "change_iterator"
-  - name: "apply_changes_loop"
-    type: "loop"
-    iterate_on: "{{change_iterator}}" # Reference the output variable
-    loop_variable: "current_change"   # Variable name for each item in loop
-    body:
-      - name: "apply_single_change"
-        skill: "AssetManager.process_action" # Assumes skill registry maps this
-        input: "{{current_change}}"          # Pass the change object
-        output_variable: "apply_result_{{loop.index}}" # Optional: store results
+  enabled: true
+  steps:
+    - name: "extract_changes"
+      type: "skill"
+      skill: "semantic_iterator"
+      params:
+        content: "{{context.input_data.response}}"
+        format: "solution_design"
+      output_field: "iterator_result"
+    
+    - name: "process_changes"
+      type: "loop"
+      iterate_on: "iterator_result.value"
+      loop_variable: "current_change"
+      body:
+        - name: "apply_single_change" 
+          type: "skill"
+          skill: "asset_manager"
+          params:
+            file_path: "{{current_change.file_path}}"
+            content: "{{current_change.content}}"
+            type: "{{current_change.type}}"
+            description: "{{current_change.description}}"
+          output_field: "results.changes.{{loop.index}}"
 
 prompts: # Prompts might be needed for specific steps or error handling
   system: |

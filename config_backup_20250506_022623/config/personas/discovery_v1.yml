@@ -2,9 +2,7 @@ provider: "anthropic"
 model: "claude-3-5-sonnet-20241022"
 temperature: 0
 tartxt_config:
-  # IMPORTANT: Ensure this path is correct for the execution environment
-  # If running via Docker, this might need adjustment or be relative
-  script_path: "c4h_agents/skills/tartxt.py" # Relative path assumed to work via PYTHONPATH
+  script_path: /Users/jim/src/apps/c4h/c4h_agents/skills/tartxt.py
   exclusions:
     - '**/node_modules/**'
     - '**/.git/**'

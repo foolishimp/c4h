@@ -152,6 +152,152 @@ llm_config:
         include_token_usage: true
         record_timestamps: true
 
+# Define agents config for discovery phase
+llm_config:
+  default_provider: "anthropic"
+  default_model: "claude-3-opus-20240229"
+  # Define skills for the orchestration
+  skills:
+    semantic_iterator:
+      module: "c4h_agents.skills.semantic_iterator"
+      class: "SemanticIterator"
+      description: "Extracts structured information from text in a consistent format"
+      method: "execute"
+    
+    asset_manager:
+      module: "c4h_agents.skills.asset_manager"
+      class: "AssetManager"
+      description: "Manages file creation, modification, and deletion with safety features"
+      method: "execute"
+    
+    semantic_merge:
+      module: "c4h_agents.skills.semantic_merge"
+      class: "SemanticMerge"
+      description: "Intelligently merges changes into existing files"
+      method: "execute"
+  
+  personas:
+    # Include the actual persona configurations inline
+    discovery_v1:
+      provider: "anthropic"
+      model: "claude-3-5-sonnet-20241022"
+      temperature: 0
+      tartxt_config:
+        script_path: "c4h_agents/skills/tartxt.py"
+        exclusions:
+          - '**/node_modules/**'
+          - '**/.git/**'
+          - '**/__pycache__/**'
+          - '**/*.pyc'
+          - '**/package-lock.json'
+          - '**/dist/**'
+          - '**/.DS_Store'
+          - '**/README.md'
+          - '**/workspaces/**'
+          - '**/backup_txt/**'
+      prompts:
+        system: |
+          You are a project discovery agent.
+          You analyze project structure and files to understand:
+          1. Project organization
+          2. File relationships
+          3. Code dependencies
+          4. Available functionality
+    
+    solution_designer_v1:
+      provider: "anthropic"
+      model: "claude-3-7-sonnet-20250219"
+      temperature: 1
+      extended_thinking:
+        enabled: true
+        budget_tokens: 32000
+      prompts:
+        system: |
+          You are a code modification solution designer that returns modifications in a clearly structured text format.
+          Return your response in the following format, with no additional explanation:
+
+          ===CHANGE_BEGIN===
+          FILE: path/to/file
+          TYPE: create|modify|delete
+          DESCRIPTION: one line description
+          DIFF:
+          --- a/existing_file.py
+          +++ b/existing_file.py
+          @@ -1,3 +1,4 @@
+          context line
+          -removed line
+          +added line
+          context line
+          ===CHANGE_END===
+
+    coder_v1:
+      provider: "anthropic"
+      model: "claude-3-opus-20240229"
+      temperature: 0
+      # Add execution plan directly to inline persona definition
+      execution_plan:
+        enabled: true
+        steps:
+          - name: "extract_changes"
+            type: "skill"
+            skill: "semantic_iterator"
+            params:
+              content: "{{context.input_data.response}}"
+              format: "solution_design"
+            output_field: "iterator_result"
+          
+          - name: "process_changes"
+            type: "loop"
+            iterate_on: "iterator_result.value"
+            loop_variable: "current_change"
+            body:
+              - name: "apply_single_change" 
+                type: "skill"
+                skill: "asset_manager"
+                params:
+                  file_path: "{{current_change.file_path}}"
+                  content: "{{current_change.content}}"
+                  type: "{{current_change.type}}"
+                  description: "{{current_change.description}}"
+                output_field: "results.changes.{{loop.index}}"
+      prompts:
+        system: |
+          You are an expert code modification agent. Your task is to safely and precisely apply code changes.
+          You receive changes in this exact JSON structure:
+          {
+            "changes": [
+              {
+                "file_path": "exact path to file",
+                "type": "modify",
+                "description": "change description",
+                "content": "complete file content"
+              }
+            ]
+          }
+
+          Rules:
+          1. Always expect input in the above JSON format
+          2. If input is a string, parse it as JSON first
+          3. Preserve existing functionality unless explicitly told to change it
+          4. Maintain code style and formatting
+          5. Apply changes exactly as specified
+          6. Handle errors gracefully with backups
+          7. Validate code after changes
+
+  agents:
+    # Define all agent configurations with persona keys
+    discovery_phase:
+      persona_key: "discovery_v1"  # This links to the inline persona above
+    
+    solution_design_phase:
+      persona_key: "solution_designer_v1"  # This links to inline persona above
+    
+    coding_phase:
+      persona_key: "coder_v1"  # This links to the coder_v1.yml file with execution plan
+    
+    fallback_coding_phase:
+      persona_key: "coder_v1"  # Reusing coder persona for fallback
+
 # Orchestration using the new factory model
 orchestration:
   enabled: true
@@ -167,7 +313,7 @@ orchestration:
       name: "Discovery Team"
       tasks:
         - name: "discovery_phase" # Unique instance name
-          agent_type: "generic_single_shot" # Specify generic agent type
+          agent_type: "GenericLLMAgent" # Updated to new type format 
           persona_key: "discovery_v1" # References personas/discovery_v1.yml
           description: "Analyze project structure and files" # Optional description
           requires_approval: false
@@ -179,47 +325,34 @@ orchestration:
       name: "Solution Design Team"
       tasks:
         - name: "solution_design_phase" # Unique instance name
-          agent_type: "generic_single_shot" # Specify generic agent type
+          agent_type: "GenericLLMAgent" # Updated to new type format
           persona_key: "solution_designer_v1" # References personas/solution_designer_v1.yml
           description: "Create solution design and code changes" # Optional description
-          requires_approval: true
+          requires_approval: false
           max_retries: 1
       routing:
-        rules:
-          # Example routing rule based on task success
-          # Note: Condition structure might need adjustment based on evaluate_routing_task implementation
-          - condition:
-              task: "solution_design_phase" # Name of the task in this team
-              status: "success"
-            next_team: "coder"
-          # Example routing rule based on failure (could also check specific error types)
-          - condition:
-              task: "solution_design_phase"
-              status: "failure"
-            next_team: "fallback"
-        default: "coder" # Default if no rules match (e.g., if condition structure is simple string)
+        # Always go to coder team next - simplified for automatic test execution
+        default: "coder"
 
     coder:
       name: "Coder Team"
       tasks:
         - name: "coding_phase" # Unique instance name
-          # Assuming coder might need internal orchestration based on its persona
-          agent_type: "generic_orchestrating"
-          persona_key: "coder_v1" # References personas/coder_v1.yml
+          # Use GenericOrchestratorAgent to use the execution plan
+          agent_type: "GenericOrchestratorAgent"
+          persona_key: "coder_v1" # References personas/coder_v1.yml with execution_plan
           description: "Implement code changes based on solution design" # Optional description
-          requires_approval: true
+          requires_approval: false
           max_retries: 1
       routing:
-        rules:
-          - condition: "all_success" # Simple condition based on task success
-            next_team: null # End workflow on success
-        default: null # End workflow by default
+        # End workflow after coder team completes
+        default: null
 
     fallback:
       name: "Fallback Team"
       tasks:
         - name: "fallback_coding_phase" # Unique instance name
-          agent_type: "generic_orchestrating" # Or single_shot depending on fallback logic
+          agent_type: "GenericFallbackAgent" # Updated to specific fallback agent
           persona_key: "coder_v1" # Reuse coder persona or have a specific fallback persona
           description: "Implement code changes with conservative approach" # Optional description
           config: # Task-specific override for the persona

@@ -60,11 +60,11 @@ class EventLogger:
         
         Args:
             config: Configuration for the event logger, including paths and backends
-            run_id: The workflow run ID (must include the wf_HHMM_ prefix)
+            run_id: The workflow run ID (will be reformatted to wf_HHMMSS_UUID if needed)
         """
         self.enabled = config.get("enabled", True)
         self.sequence = 0
-        self.run_id = run_id
+        self.run_id = run_id  # This may be updated during backend initialization
         
         # Extract agent metadata
         self.agent_name = "Orchestrator"
@@ -96,6 +96,19 @@ class EventLogger:
                     base_dir = Path(base_dir_str.replace('/apps/', '/apps/c4h_ai_dev/'))
                 
                 date_str = datetime.now().strftime('%Y%m%d')
+                
+                # Ensure run_id has the correct format (wf_HHMMSS_UUID)
+                if not run_id.startswith("wf_") or "_" not in run_id[3:]:
+                    # This isn't in the standard format - reconstruct it
+                    current_time = datetime.now().strftime('%H%M%S')
+                    run_uuid = str(uuid.uuid4())
+                    original_id = run_id  # Save for logging
+                    run_id = f"wf_{current_time}_{run_uuid}"
+                    # Update the instance variable to use the new run_id
+                    self.run_id = run_id
+                    logger.info("lineage.run_id_reformatted", 
+                               original=original_id, 
+                               new=run_id)
                 
                 # Setup directory structure according to requirements
                 self.events_dir = base_dir / date_str / run_id / "events"
@@ -177,7 +190,7 @@ class EventLogger:
         # Generate event_id
         event_id = str(uuid.uuid4())
         
-        # Get current timestamp
+        # Get current timestamp in UTC
         timestamp = datetime.now(timezone.utc)
         
         # Create execution path if not provided
@@ -232,9 +245,12 @@ class EventLogger:
             timestamp: The event timestamp
         """
         try:
-            # Create timestamped filename
-            time_str = timestamp.strftime('%H%M%S')
-            event_filename = f"{time_str}_{event_id}.json"
+            # Create timestamped filename using local time (not UTC) with microsecond-based unique sequence
+            local_time = datetime.now()
+            time_str = local_time.strftime('%H%M%S')
+            # Use microseconds to ensure unique sequence, plus agent's sequence counter for ordering
+            unique_seq = f"{(local_time.microsecond // 1000):03d}{self.sequence:03d}"
+            event_filename = f"{time_str}_{unique_seq}_{event_id}.json"
             
             event_file = self.events_dir / event_filename
             temp_file = self.events_dir / f"tmp_{event_filename}"

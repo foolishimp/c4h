@@ -644,6 +644,15 @@ class GenericOrchestratorAgent(BaseAgent):
         
         # Get execution plan from persona configuration
         self.execution_plan = self.config_node.get_value(f"{self.persona_path}.execution_plan")
+        
+        # Also check for execution_plan in the agent's own config
+        agent_config = self.config_node.get_value(self.config_path)
+        if agent_config and isinstance(agent_config, dict) and "execution_plan" in agent_config:
+            self.logger.info("execution_plan.using_agent_config",
+                           agent_name=self.unique_name,
+                           plan_steps=len(agent_config["execution_plan"].get("steps", [])))
+            self.execution_plan = agent_config["execution_plan"]
+            
         if not self.execution_plan:
             self.logger.warning("execution_plan.not_found", 
                               persona_key=self.persona_key,

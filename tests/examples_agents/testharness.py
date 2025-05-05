@@ -18,20 +18,23 @@ import json
 import sys
 
 # Add source directory to path
-root_dir = Path(__file__).parent.parent
-sys.path.append(str(root_dir / 'src'))
+root_dir = Path(__file__).parent.parent.parent
+sys.path.append(str(root_dir))
 
-from agents.base import BaseAgent, LogDetail
-from agents.coder import Coder
-from skills.semantic_iterator import SemanticIterator
-from skills.semantic_merge import SemanticMerge
-from skills.shared.types import ExtractConfig
-from agents.discovery import DiscoveryAgent
-from agents.solution_designer import SolutionDesigner
-from skills.asset_manager import AssetManager
-from skills.semantic_merge import SemanticMerge
-from skills.semantic_extract import SemanticExtract
-from config import deep_merge
+from c4h_agents.agents.base_agent import BaseAgent
+# Import LogDetail enum from c4h_agents.agents.types
+from c4h_agents.agents.types import LogDetail
+
+# Update imports to use the new module structure
+from c4h_agents.agents.generic import GenericLLMAgent as Coder
+from c4h_agents.skills.semantic_iterator import SemanticIterator
+from c4h_agents.skills.semantic_merge import SemanticMerge
+from c4h_agents.skills.shared.types import ExtractConfig
+from c4h_agents.agents.generic import GenericLLMAgent as DiscoveryAgent
+from c4h_agents.agents.generic import GenericLLMAgent as SolutionDesigner
+from c4h_agents.skills.asset_manager import AssetManager
+from c4h_agents.skills.semantic_extract import SemanticExtract
+from c4h_agents.config import deep_merge
 
 logger = structlog.get_logger()
 
@@ -185,7 +188,8 @@ class AgentTestHarness:
             raise ValueError(f"Unsupported agent type: {agent_type}")
                 
         agent_class = self.AGENT_TYPES[agent_type]
-        return agent_class(config=config)
+        # New signature expects full_effective_config and unique_name
+        return agent_class(full_effective_config=config, unique_name=agent_type)
 
     def process_agent(self, config: AgentConfig) -> None:
         """Process agent with configuration"""

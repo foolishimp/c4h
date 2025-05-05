@@ -1,0 +1,107 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Persona Configuration Schema",
+  "description": "Schema for validating persona configuration files",
+  "type": "object",
+  "properties": {
+    "provider": { 
+      "type": ["string", "null"],
+      "description": "LLM provider to use (e.g., anthropic, openai)"
+    },
+    "model": {
+      "type": ["string", "null"],
+      "description": "Model to use from the provider"
+    },
+    "temperature": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 2,
+      "description": "Temperature setting for LLM generation"
+    },
+    "extended_thinking": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "budget_tokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "prompts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": ["string", "null"]
+      },
+      "description": "Prompt templates used by the persona"
+    },
+    "execution_plan": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "skill": { "type": "string" },
+              "config": { "type": "object" },
+              "input": { "type": ["string", "object"] },
+              "output": { "type": "string" }
+            },
+            "required": ["name", "skill"]
+          }
+        }
+      }
+    },
+    "model_params": {
+      "type": "object",
+      "properties": {
+        "max_tokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "properties": {
+        "root_dir": { "type": "string" },
+        "retention": { "type": "object" },
+        "error_handling": { "type": "object" }
+      }
+    },
+    "lineage": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "namespace": { "type": "string" },
+        "backend": {
+          "type": "object",
+          "properties": {
+            "type": { "type": "string", "enum": ["file", "marquez"] },
+            "path": { "type": "string" },
+            "url": { "type": ["string", "null"] }
+          },
+          "required": ["type"]
+        },
+        "retention": {
+          "type": "object",
+          "properties": {
+            "max_age_days": { "type": "integer", "minimum": 1 },
+            "max_runs": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "context": {
+          "type": "object",
+          "properties": {
+            "include_metrics": { "type": "boolean" },
+            "include_token_usage": { "type": "boolean" },
+            "record_timestamps": { "type": "boolean" },
+            "separate_input_output": { "type": "boolean" }
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": true,
+  "required": [
+    "provider",
+    "model"
+  ]
+}
