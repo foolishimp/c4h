@@ -1,13 +1,17 @@
 from prefect import flow, get_run_logger
 from prefect.context import get_run_context
 from typing import Dict, Any, Optional, List
+import asyncio
+import concurrent.futures
 # Import get_logger from the shared utility path
 from c4h_services.src.utils.logging import get_logger, truncate_log_string
 from pathlib import Path
 from datetime import datetime, timezone
 from copy import deepcopy
 import uuid
+import time
 import os
+import json
 import io
 import yaml
 
@@ -242,10 +246,77 @@ def run_declarative_workflow(
         final_workflow_status = "success" # Assume success initially
         final_workflow_error = None
 
+        # Helper function to execute a team and handle its result
+        def execute_single_team(team_id, team_context):
+            """Execute a single team with the given context and return its result"""
+            logger = get_run_logger()
+            logger.info(f"Executing team: {team_id} as part of workflow")
+            
+            try:
+                # Get per-team recursion depth limit (if specified in config)
+                team_max_depth = config_node.get_value(f"orchestration.teams.{team_id}.max_recursion_depth", default=final_max_recursion_depth)
+                
+                # Check team-specific recursion depth
+                current_team_count = team_execution_counts.get(team_id, 0)
+                if current_team_count >= team_max_depth:
+                    logger.warning(f"Maximum recursion depth ({team_max_depth}) reached for team {team_id}")
+                    return {
+                        "success": False,
+                        "error": f"Exceeded maximum recursion depth ({team_max_depth}) for team {team_id}",
+                        "team_id": team_id,
+                        "execution_path": team_context.get("execution_path", [])
+                    }
+                
+                # Update team execution counter
+                team_execution_counts[team_id] = current_team_count + 1
+                nonlocal total_teams_executed
+                total_teams_executed += 1
+                
+                # Add to execution path for tracking
+                execution_path_update = list(team_context.get("execution_path", [])) + [team_id]
+                team_context["execution_path"] = execution_path_update
+                
+                logger.info(f"Executing team: {team_id} "
+                            f"(execution {total_teams_executed}, depth {current_team_count + 1})")
+                
+                # Execute the team as a subflow
+                team_result = execute_team_subflow(
+                    team_id=team_id,
+                    effective_config=effective_config,
+                    current_context=team_context
+                )
+                
+                # Add execution path information to the result
+                team_result["execution_path"] = execution_path_update
+                return team_result
+                
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Failed to execute team {team_id}: {error_msg}", exc_info=True)
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "team_id": team_id,
+                    "execution_path": team_context.get("execution_path", [])
+                }
+
+        # Prepare concentrator tracking (for fan-in)
+        concentrator_data = {
+            "active": False,
+            "team_id": None,
+            "source_teams": [],
+            "completion_condition": {},
+            "aggregation_strategy": {},
+            "pending_results": {},
+            "received_results": []
+        }
+        
         # Main workflow loop
         while current_team_id:
             # Check global execution limits
-            if total_teams_executed >= final_max_total_teams:
+            # For fan-out/parallel execution we need to account for potential parallel teams
+            remaining_capacity = final_max_total_teams - total_teams_executed
+            if remaining_capacity <= 0:
                 run_logger.warning(f"Maximum total team executions ({final_max_total_teams}) reached")
                 final_workflow_status = "error"
                 final_workflow_error = f"Exceeded maximum total team executions ({final_max_total_teams})"
@@ -254,56 +325,405 @@ def run_declarative_workflow(
             # Get per-team recursion depth limit (if specified in config)
             team_max_depth = config_node.get_value(f"orchestration.teams.{current_team_id}.max_recursion_depth", default=final_max_recursion_depth)
 
-            # Check team-specific recursion depth
-            current_team_count = team_execution_counts.get(current_team_id, 0)
-            if current_team_count >= team_max_depth:
-                run_logger.warning(f"Maximum recursion depth ({team_max_depth}) reached for team {current_team_id}")
-                final_workflow_status = "error"
-                final_workflow_error = f"Exceeded maximum recursion depth ({team_max_depth}) for team {current_team_id}"
-                break
-
-            # Update team execution counter
-            team_execution_counts[current_team_id] = current_team_count + 1
-            total_teams_executed += 1
-
-            # Add to execution path for tracking
-            execution_path.append(current_team_id)
-
-            run_logger.info(f"Executing team: {current_team_id} "
-                            f"(execution {total_teams_executed}, depth {current_team_count + 1})")
-
-            # Execute the team as a subflow
-            # Ensure the effective_config dictionary is passed correctly
-            team_result = execute_team_subflow(
-                team_id=current_team_id,
-                effective_config=effective_config,
-                current_context=current_context
-            )
-
-            # Store the team result with a unique key per execution
-            team_results[f"{current_team_id}_{current_team_count}"] = team_result
-
-            # Check for team execution failure
-            if not team_result.get("success", False):
-                error_detail = team_result.get('error', 'Unknown team error')
-                run_logger.error(f"Team {current_team_id} execution failed: {error_detail}")
-                # Check if workflow should stop on failure for this team
-                stop_on_fail = config_node.get_value(f"orchestration.teams.{current_team_id}.stop_on_failure", default=True)
-                if stop_on_fail:
-                     final_workflow_status = "error"
-                     final_workflow_error = f"Team {current_team_id} failed: {error_detail}"
-                     break # Stop the workflow
+            # Check if the current team is a concentrator
+            team_type = config_node.get_value(f"orchestration.teams.{current_team_id}.type", default="standard")
+            
+            if team_type == "concentrator":
+                run_logger.info(f"Executing concentrator team: {current_team_id}")
+                
+                # Get concentrator configuration
+                concentrator_config = config_node.get_value(f"orchestration.teams.{current_team_id}")
+                
+                # Extract concentrator parameters
+                source_teams = concentrator_config.get("source_teams", [])
+                source_step = concentrator_config.get("source_step")
+                completion_condition = concentrator_config.get("completion_condition", {"type": "count", "value": len(source_teams)})
+                aggregation_strategy = concentrator_config.get("aggregation_strategy", {"type": "list", "output_field": "aggregated_results"})
+                
+                run_logger.info(f"Concentrator setup: source_teams={source_teams}, completion_condition={completion_condition}")
+                
+                # Initialize concentrator state
+                concentrator_data = {
+                    "active": True,
+                    "team_id": current_team_id,
+                    "source_teams": source_teams,
+                    "source_step": source_step,
+                    "completion_condition": completion_condition,
+                    "aggregation_strategy": aggregation_strategy,
+                    "pending_results": {team: None for team in source_teams},
+                    "received_results": []
+                }
+                
+                # If we don't have any source teams defined, we can't concentrate
+                if not source_teams:
+                    run_logger.error(f"Concentrator {current_team_id} has no source_teams defined")
+                    team_result = {
+                        "success": False,
+                        "team_id": current_team_id,
+                        "error": "Concentrator has no source_teams defined",
+                        "type": "concentrator_error"
+                    }
+                    
+                    team_results[f"{current_team_id}_concentrator"] = team_result
+                    
+                    # Evaluate routing to determine next team
+                    routing_result = evaluate_routing_task(
+                        team_results=team_result, # Pass the concentrator error result
+                        current_context=current_context,
+                        effective_config=effective_config,
+                        team_id=current_team_id
+                    )
+                    
+                    current_team_id = routing_result.get("next_team_id")
+                    continue
+                
+                # Check if we're waiting for a completion count
+                if completion_condition.get("type") == "count":
+                    required_count = completion_condition.get("value", len(source_teams))
+                    run_logger.info(f"Concentrator waiting for {required_count} results")
+                    
+                    # Wait for results to arrive - initially just wait for all (future: implement timeout)
+                    received_results = []
+                    
+                    # Create a deep copy of the context for each team to ensure immutability
+                    team_contexts = {team_id: deepcopy(current_context) for team_id in source_teams}
+                    
+                    # Add concentrator ID to each team's context
+                    for team_id, ctx in team_contexts.items():
+                        if "concentrator" not in ctx:
+                            ctx["concentrator"] = {}
+                        ctx["concentrator"]["id"] = current_team_id
+                        ctx["concentrator"]["role"] = "source"
+                    
+                    # Add concentrator metadata to the main context
+                    concentrator_ctx = deepcopy(current_context)
+                    if "concentrator" not in concentrator_ctx:
+                        concentrator_ctx["concentrator"] = {}
+                    concentrator_ctx["concentrator"]["id"] = current_team_id
+                    concentrator_ctx["concentrator"]["role"] = "aggregator"
+                    concentrator_ctx["concentrator"]["expected_teams"] = source_teams
+                    
+                    # Execute all source teams in parallel
+                    run_logger.info(f"Executing concentrator source teams in parallel: {source_teams}")
+                    
+                    try:
+                        # Execute all source teams concurrently using Prefect's concurrent execution
+                        concurrent_results = []
+                        
+                        # Use a thread pool for parallelism (simple approach)
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=len(source_teams)) as executor:
+                            # Submit all team executions
+                            future_to_team = {
+                                executor.submit(execute_single_team, team_id, team_contexts[team_id]): team_id
+                                for team_id in source_teams
+                            }
+                            
+                            # As futures complete, we get their results
+                            for future in concurrent.futures.as_completed(future_to_team):
+                                team_id = future_to_team[future]
+                                try:
+                                    result = future.result()
+                                    run_logger.info(f"Received result from team {team_id} for concentrator {current_team_id}")
+                                    
+                                    # Add to received results
+                                    received_results.append({
+                                        "team_id": team_id,
+                                        "result": result
+                                    })
+                                    
+                                    # Store in team results with a unique key
+                                    team_results[f"{team_id}_source_for_{current_team_id}"] = result
+                                
+                                except Exception as exc:
+                                    run_logger.error(f"Source team {team_id} generated an exception: {exc}")
+                                    # Add a failed result
+                                    received_results.append({
+                                        "team_id": team_id,
+                                        "result": {
+                                            "success": False,
+                                            "error": f"Exception in team execution: {str(exc)}",
+                                            "team_id": team_id
+                                        }
+                                    })
+                    
+                    except Exception as e:
+                        run_logger.error(f"Error during parallel execution of source teams: {str(e)}", exc_info=True)
+                        # If we failed to execute parallel teams, treat as concentrator failure
+                        team_result = {
+                            "success": False,
+                            "team_id": current_team_id,
+                            "error": f"Failed to execute source teams in parallel: {str(e)}",
+                            "type": "concentrator_error"
+                        }
+                        team_results[f"{current_team_id}_concentrator"] = team_result
+                        
+                        # Evaluate routing with failure result
+                        routing_result = evaluate_routing_task(
+                            team_results=team_result,
+                            current_context=current_context,
+                            effective_config=effective_config,
+                            team_id=current_team_id
+                        )
+                        
+                        current_team_id = routing_result.get("next_team_id")
+                        continue
+                    
+                    # Check if we received the required number of results
+                    if len(received_results) >= required_count:
+                        run_logger.info(f"Concentrator received required {required_count} results")
+                        
+                        # Apply aggregation strategy
+                        aggregation_type = aggregation_strategy.get("type", "list")
+                        output_field = aggregation_strategy.get("output_field", "aggregated_results")
+                        
+                        if aggregation_type == "list":
+                            # Simple list aggregation - collect all results
+                            aggregated_data = {
+                                output_field: [item["result"] for item in received_results]
+                            }
+                            run_logger.info(f"Applied 'list' aggregation strategy, collected {len(aggregated_data[output_field])} results")
+                            
+                        elif aggregation_type == "merge_dict":
+                            # Merge dictionaries from all results
+                            merged_dict = {}
+                            for item in received_results:
+                                result_data = item.get("result", {}).get("data", {})
+                                if isinstance(result_data, dict):
+                                    merged_dict.update(result_data)
+                            
+                            aggregated_data = {output_field: merged_dict}
+                            run_logger.info(f"Applied 'merge_dict' aggregation strategy, merged keys: {list(merged_dict.keys())}")
+                            
+                        elif aggregation_type == "custom_skill":
+                            # TODO: Implement custom skill aggregation in future
+                            run_logger.warning(f"Custom skill aggregation not yet implemented, falling back to list")
+                            aggregated_data = {
+                                output_field: [item["result"] for item in received_results]
+                            }
+                        
+                        else:
+                            # Unknown aggregation type, default to list
+                            run_logger.warning(f"Unknown aggregation type '{aggregation_type}', falling back to list")
+                            aggregated_data = {
+                                output_field: [item["result"] for item in received_results]
+                            }
+                        
+                        # Create concentrator result
+                        team_result = {
+                            "success": True,
+                            "team_id": current_team_id,
+                            "type": "concentrator",
+                            "aggregated_count": len(received_results),
+                            "source_teams": [item["team_id"] for item in received_results],
+                            "data": aggregated_data
+                        }
+                        
+                        # Store in team results
+                        team_results[f"{current_team_id}_concentrator"] = team_result
+                        
+                        # Evaluate routing based on concentrator result
+                        routing_result = evaluate_routing_task(
+                            team_results=team_result,
+                            current_context=current_context,
+                            effective_config=effective_config,
+                            team_id=current_team_id
+                        )
+                        
+                        # Update the context with aggregated data
+                        context_updates = routing_result.get("context_updates", {})
+                        # Merge in the aggregated data if not already in context updates
+                        for key, value in aggregated_data.items():
+                            if key not in context_updates:
+                                context_updates[key] = value
+                        
+                        routing_result["context_updates"] = context_updates
+                        
+                        # Get next team
+                        current_team_id = routing_result.get("next_team_id")
+                    else:
+                        # We didn't receive enough results, treat as error
+                        run_logger.error(f"Concentrator did not receive enough results: got {len(received_results)}, needed {required_count}")
+                        team_result = {
+                            "success": False,
+                            "team_id": current_team_id,
+                            "error": f"Concentrator did not receive enough results: got {len(received_results)}, needed {required_count}",
+                            "type": "concentrator_error"
+                        }
+                        
+                        # Evaluate routing with failure result
+                        routing_result = evaluate_routing_task(
+                            team_results=team_result,
+                            current_context=current_context,
+                            effective_config=effective_config,
+                            team_id=current_team_id
+                        )
+                        
+                        current_team_id = routing_result.get("next_team_id")
+                
+                # For other completion condition types, implement similar logic
+                # (For now we only support 'count')
+                
+                continue  # Skip to next iteration to process the next team
+            
+            else:
+                # Standard team execution (not concentrator)
+                # Check if the next_team_id from previous routing is a list (fan-out)
+                if isinstance(current_team_id, list):
+                    run_logger.info(f"Executing fan-out to {len(current_team_id)} teams: {current_team_id}")
+                    
+                    # Check if we have enough capacity
+                    if len(current_team_id) > remaining_capacity:
+                        run_logger.warning(f"Fan-out exceeds remaining capacity. Need {len(current_team_id)}, have {remaining_capacity}.")
+                        current_team_id = current_team_id[:remaining_capacity]  # Truncate to remaining capacity
+                        run_logger.warning(f"Truncated fan-out to: {current_team_id}")
+                    
+                    # Create contexts for each team to maintain immutability
+                    team_contexts = {team_id: deepcopy(current_context) for team_id in current_team_id}
+                    
+                    # Add fan-out metadata to each context
+                    for team_id, ctx in team_contexts.items():
+                        if "fan_out" not in ctx:
+                            ctx["fan_out"] = {}
+                        ctx["fan_out"]["source"] = "fan_out_dispatch"
+                        ctx["fan_out"]["target_teams"] = current_team_id
+                    
+                    try:
+                        # Execute all teams in parallel using a thread pool
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=len(current_team_id)) as executor:
+                            # Submit all team executions
+                            future_to_team = {
+                                executor.submit(execute_single_team, team_id, team_contexts[team_id]): team_id
+                                for team_id in current_team_id
+                            }
+                            
+                            # Process results as they complete
+                            parallel_results = []
+                            for future in concurrent.futures.as_completed(future_to_team):
+                                team_id = future_to_team[future]
+                                try:
+                                    result = future.result()
+                                    run_logger.info(f"Received result from fan-out team {team_id}")
+                                    parallel_results.append({
+                                        "team_id": team_id,
+                                        "result": result
+                                    })
+                                    
+                                    # Store in team results
+                                    team_results[f"{team_id}_fanout"] = result
+                                    
+                                    # Track execution paths
+                                    if "execution_path" in result:
+                                        for path_item in result["execution_path"]:
+                                            if path_item not in execution_path:
+                                                execution_path.append(path_item)
+                                    else:
+                                        if team_id not in execution_path:
+                                            execution_path.append(team_id)
+                                    
+                                except Exception as exc:
+                                    run_logger.error(f"Fan-out team {team_id} generated an exception: {exc}")
+                                    # Add failed result
+                                    parallel_results.append({
+                                        "team_id": team_id,
+                                        "result": {
+                                            "success": False,
+                                            "error": f"Exception in team execution: {str(exc)}",
+                                            "team_id": team_id
+                                        }
+                                    })
+                        
+                        # After all parallel executions complete:
+                        # - For fan-out without explicit concentrator, we need to determine next step
+                        # - The simplest approach is to check if any team specified a next_team explicitly,
+                        #   otherwise end the workflow (return None)
+                        
+                        # Look for explicit next team in any result
+                        next_teams = set()
+                        for item in parallel_results:
+                            result = item["result"]
+                            # Check if the team explicitly specified next_team in its routing
+                            if "routing_result" in result and "next_team_id" in result["routing_result"]:
+                                next_team = result["routing_result"]["next_team_id"]
+                                if next_team:  # Only add non-None values
+                                    if isinstance(next_team, list):
+                                        for t in next_team:
+                                            next_teams.add(t)
+                                    else:
+                                        next_teams.add(next_team)
+                        
+                        if next_teams:
+                            # Found explicit next teams, use them
+                            next_teams_list = list(next_teams)
+                            run_logger.info(f"Fan-out continuing to explicit next teams: {next_teams_list}")
+                            # If just one team, set directly; if multiple, pass as list for another fan-out
+                            current_team_id = next_teams_list[0] if len(next_teams_list) == 1 else next_teams_list
+                        else:
+                            # No explicit next teams, end workflow
+                            run_logger.info("Fan-out complete, no explicit next teams specified; ending workflow")
+                            current_team_id = None
+                    
+                    except Exception as e:
+                        run_logger.error(f"Error during fan-out execution: {str(e)}", exc_info=True)
+                        final_workflow_status = "error"
+                        final_workflow_error = f"Fan-out execution failed: {str(e)}"
+                        break
+                
                 else:
-                     run_logger.warning(f"Team {current_team_id} failed but stop_on_failure is false, continuing workflow.")
+                    # Regular single team execution
+                    run_logger.info(f"Executing single team: {current_team_id}")
+                    
+                    # Check team-specific recursion depth
+                    current_team_count = team_execution_counts.get(current_team_id, 0)
+                    if current_team_count >= team_max_depth:
+                        run_logger.warning(f"Maximum recursion depth ({team_max_depth}) reached for team {current_team_id}")
+                        final_workflow_status = "error"
+                        final_workflow_error = f"Exceeded maximum recursion depth ({team_max_depth}) for team {current_team_id}"
+                        break
 
+                    # Update team execution counter
+                    team_execution_counts[current_team_id] = current_team_count + 1
+                    total_teams_executed += 1
 
-            # Evaluate routing to determine next team
-            routing_result = evaluate_routing_task(
-                team_results=team_result, # Pass the result of the *current* team execution
-                current_context=current_context,
-                effective_config=effective_config,
-                team_id=current_team_id
-            )
+                    # Add to execution path for tracking
+                    execution_path.append(current_team_id)
+
+                    run_logger.info(f"Executing team: {current_team_id} "
+                                    f"(execution {total_teams_executed}, depth {current_team_count + 1})")
+
+                    # Execute the team as a subflow
+                    # Ensure the effective_config dictionary is passed correctly
+                    team_result = execute_team_subflow(
+                        team_id=current_team_id,
+                        effective_config=effective_config,
+                        current_context=current_context
+                    )
+
+                    # Store the team result with a unique key per execution
+                    team_results[f"{current_team_id}_{current_team_count}"] = team_result
+
+                    # Check for team execution failure
+                    if not team_result.get("success", False):
+                        error_detail = team_result.get('error', 'Unknown team error')
+                        run_logger.error(f"Team {current_team_id} execution failed: {error_detail}")
+                        # Check if workflow should stop on failure for this team
+                        stop_on_fail = config_node.get_value(f"orchestration.teams.{current_team_id}.stop_on_failure", default=True)
+                        if stop_on_fail:
+                            final_workflow_status = "error"
+                            final_workflow_error = f"Team {current_team_id} failed: {error_detail}"
+                            break # Stop the workflow
+                        else:
+                            run_logger.warning(f"Team {current_team_id} failed but stop_on_failure is false, continuing workflow.")
+
+                    # Evaluate routing to determine next team
+                    routing_result = evaluate_routing_task(
+                        team_results=team_result, # Pass the result of the *current* team execution
+                        current_context=current_context,
+                        effective_config=effective_config,
+                        team_id=current_team_id
+                    )
+                    
+                    # Store routing result in team result for potential use in fan-out
+                    team_result["routing_result"] = routing_result
 
             # Update context with any context updates returned by routing
             if "context_updates" in routing_result and routing_result["context_updates"]:
@@ -356,8 +776,6 @@ def run_declarative_workflow(
                          config_node = create_config_node(effective_config)
                          
                          # Add snapshot metadata to context
-------------END OVERLAP------------
-
                          context_updates["config_snapshot"] = {
                              "path": str(new_config_info.snapshot_path),
                              "hash": new_config_info.config_hash,
@@ -442,7 +860,10 @@ def run_declarative_workflow(
             
             # Log next team for visibility
             if current_team_id:
-                run_logger.info(f"Next team: {current_team_id}")
+                if isinstance(current_team_id, list):
+                    run_logger.info(f"Next step: fan-out to {len(current_team_id)} teams: {current_team_id}")
+                else:
+                    run_logger.info(f"Next team: {current_team_id}")
             else:
                 run_logger.info("No next team, workflow will terminate")
 
@@ -748,8 +1169,6 @@ def execute_loop_team(
                     # Add to iteration results
                     iter_result["results"].append(result)
                     
-                    # Check
-------------END OVERLAP------------
                     # Check for failure
                     if not result.get("success", False) and stop_on_fail:
                         iter_result["success"] = False

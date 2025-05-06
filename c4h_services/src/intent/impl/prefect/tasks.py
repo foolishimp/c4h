@@ -658,9 +658,11 @@ def evaluate_routing_task(
                         
                         # Check for recursion_strategy in the rule
                         recursion_strategy = rule.get("recursion_strategy", "default")
-                        
+                             
                         # Enhanced return value with recursion support
                         return {
+                            # The next_team field can now be either a string (single team) 
+                            # or a list of strings (multiple teams for fan-out)
                             "next_team_id": rule.get("next_team"),
                             "context_updates": context_updates,
                             "matched_rule": i+1,
@@ -676,6 +678,7 @@ def evaluate_routing_task(
                     # Support minimal legacy behavior
                     if condition == "all_success" and all(r.get("success", False) for r in team_results.get("results", [])):
                         prefect_logger.info(f"Rule #{i+1} matched (all_success): {rule.get('next_team')}")
+                        # Will support next_team being a list for fan-out
                         # Include recursion strategy for legacy conditions as well
                         recursion_strategy = rule.get("recursion_strategy", "default")
                         
@@ -687,6 +690,7 @@ def evaluate_routing_task(
                         }
                     elif condition == "any_failure" and any(not r.get("success", True) for r in team_results.get("results", [])):
                         prefect_logger.info(f"Rule #{i+1} matched (any_failure): {rule.get('next_team')}")
+                        # Will support next_team being a list for fan-out
                         # Include recursion strategy for legacy conditions as well
                         recursion_strategy = rule.get("recursion_strategy", "default")
                         
@@ -704,6 +708,7 @@ def evaluate_routing_task(
         # No rules matched, use default
         prefect_logger.info(f"No rules matched, using default: {routing_config.get('default')}")
         
+        # Note: default can also be a list of teams for fan-out
         # Check for default recursion strategy
         default_recursion_strategy = routing_config.get("default_recursion_strategy", "default")
         

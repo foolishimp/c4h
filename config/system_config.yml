@@ -358,7 +358,85 @@ orchestration:
           config: # Task-specific override for the persona
             temperature: 0 # Make fallback more conservative
       routing:
+        # End workflow after fallback
         default: null # End workflow after fallback
+
+    # Example Fan-Out Pattern - can be uncommented and customized as needed
+    # fan_out_example:
+    #   name: "Fan-Out Example Team"
+    #   tasks:
+    #     - name: "prepare_for_parallel"
+    #       agent_type: "GenericLLMAgent"
+    #       persona_key: "discovery_v1"
+    #       description: "Prepare data for parallel processing"
+    #   routing:
+    #     rules:
+    #       - condition:
+    #           task: "prepare_for_parallel"
+    #           status: "success"
+    #         # Fan-out by specifying multiple target teams
+    #         next_team: ["parallel_team_a", "parallel_team_b", "parallel_team_c"]
+    #         context_updates:
+    #           fan_out_metadata:
+    #             source_team: "fan_out_example"
+    #             timestamp: "{{runtime.timestamp}}"
+    #     default: null
+    
+    # # Example Parallel Teams (targets for fan-out)
+    # parallel_team_a:
+    #   name: "Parallel Team A"
+    #   tasks:
+    #     - name: "process_part_a"
+    #       agent_type: "GenericLLMAgent"
+    #       persona_key: "discovery_v1"
+    #       description: "Process part A of the task"
+    #   routing:
+    #     # Route to the concentrator for aggregation
+    #     default: "concentration_team"
+    
+    # parallel_team_b:
+    #   name: "Parallel Team B"
+    #   tasks:
+    #     - name: "process_part_b"
+    #       agent_type: "GenericLLMAgent"
+    #       persona_key: "discovery_v1"
+    #       description: "Process part B of the task"
+    #   routing:
+    #     # Route to the concentrator for aggregation
+    #     default: "concentration_team"
+    
+    # parallel_team_c:
+    #   name: "Parallel Team C"
+    #   tasks:
+    #     - name: "process_part_c"
+    #       agent_type: "GenericLLMAgent"
+    #       persona_key: "discovery_v1"
+    #       description: "Process part C of the task"
+    #   routing:
+    #     # Route to the concentrator for aggregation
+    #     default: "concentration_team"
+    
+    # # Example Concentrator Pattern
+    # concentration_team:
+    #   name: "Concentrator Team"
+    #   type: "concentrator"  # Special team type for fan-in/concentration
+    #   # List of teams whose results should be collected
+    #   source_teams: ["parallel_team_a", "parallel_team_b", "parallel_team_c"]
+    #   # Completion condition to determine when aggregation should occur
+    #   completion_condition:
+    #     type: "count"  # Wait for a specific number of results
+    #     value: 3       # Require all 3 teams to report back
+    #   # How to combine results from the source teams
+    #   aggregation_strategy:
+    #     type: "list"  # Collect results in a list
+    #     output_field: "aggregated_parallel_results"  # Name of field in context to store results
+    #   routing:
+    #     rules:
+    #       - condition:
+    #           context_field: "aggregated_parallel_results"
+    #           operator: "exists"  # Check if aggregation was successful
+    #         next_team: "final_processing_team"  # Continue to next step with aggregated results
+    #     default: "fallback"  # In case of aggregation failure
 
 # Runtime configuration
 runtime:
