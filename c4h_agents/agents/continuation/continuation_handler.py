@@ -8,9 +8,9 @@ import logging # Keep standard logging for fallback
 import litellm
 # Import the central logger utility
 from c4h_agents.utils.logging import get_logger
-from .config import WINDOW_CONFIG, STITCHING_STRATEGIES, requires_json_cleaning
+from .config import WINDOW_CONFIG, STITCHING_STRATEGIES
 from .overlap_strategies import find_explicit_overlap
-from .joining_strategies import join_with_explicit_overlap, clean_json_content
+from .joining_strategies import join_with_explicit_overlap
 
 class ContinuationHandler:
     """Handles LLM response continuations using a simple window approach with explicit overlaps."""
@@ -183,11 +183,8 @@ class ContinuationHandler:
                                   attempt=attempt) 
                     break 
             
-            # Clean up final accumulated content if needed
-            if requires_json_cleaning(accumulated_content):
-                accumulated_content = clean_json_content(accumulated_content, self.logger)
-            
-            # Clean up final accumulated content by removing any marker text
+            # Clean up final accumulated content by removing any marker text only
+            # Removed automatic brace balancing which can introduce syntax errors
             accumulated_content = self._clean_marker_text(accumulated_content)
                         # Update final response's content ONLY if final_response is valid
             if final_response and hasattr(final_response, 'choices') and final_response.choices:
@@ -226,22 +223,53 @@ HERE IS THE END OF THE PREVIOUS CONTENT:
 ```
 
 CRITICAL CONTINUATION INSTRUCTIONS:
-1. First, analyze the code to detect its language and structure
+1. First, analyze the code to detect its language and structure:
    - Is it Python? Look for indentation, def/class keywords, colons followed by indented blocks
    - Is it JavaScript/TypeScript? Look for braces, function/const/let keywords, semicolons
    - Is it JSON? Look for strict object/array notation with double quotes
    - Is it Markdown? Look for heading markers, list items, code blocks
+   - Is it a diff/patch? Look for +/- line prefixes, @@ markers, and file path headers
 
-2. Then, repeat EXACTLY (character for character) this text:
+2. Before continuing, ANALYZE THE STRUCTURE FOR COMPLETENESS:
+   - Check for unclosed parentheses, brackets, or braces that need closing
+   - Check for incomplete function calls or expressions (e.g., missing arguments or closing parentheses)
+   - Check if any string literals are unclosed
+   - Check if any Python statements are incomplete (e.g., missing colons, incomplete if/else blocks)
+   - For Python dicts/objects, ensure all keys have values and there are no trailing commas
+   - For function calls, ensure all required arguments are provided
+
+3. Then, repeat EXACTLY (character for character) this text:
 ```repeat_exactly
 {explicit_overlap}
 ```
 
-3. Continue the code seamlessly from that point, maintaining:
-   - FOR PYTHON: Exact indentation is critical; watch for open blocks after colons
-   - FOR JAVASCRIPT: Ensure all braces, parentheses, and quotes are balanced
-   - FOR JSON: Maintain strict JSON format with double quotes and proper comma placement
-   - FOR ALL LANGUAGES: Ensure proper closing of all open structures
+4. Continue the code seamlessly from that point, maintaining:
+   - FOR PYTHON: 
+     * Exact indentation is critical
+     * Complete all function calls with proper arguments
+     * Close all open parentheses, brackets, and braces
+     * Maintain consistent indentation for blocks
+     * Make sure all return statements return proper values
+   
+   - FOR JAVASCRIPT/TYPESCRIPT: 
+     * Ensure all braces, parentheses, and quotes are properly balanced
+     * Complete all function calls with proper arguments
+     * Close all code blocks properly
+   
+   - FOR JSON/YAML: 
+     * Maintain strict format with proper quoting
+     * Ensure correct comma placement
+     * Verify all objects have complete key-value pairs
+   
+   - FOR DIFF/PATCH:
+     * Maintain proper diff syntax
+     * Complete change blocks with context lines
+     * Ensure all file sections are properly marked
+
+5. VERIFY YOUR CONTINUATION:
+   - Double-check that you've properly completed any statements, expressions, or blocks
+   - Verify all syntax is valid for the detected language
+   - Ensure no dangling tokens, incomplete expressions, or syntax errors
 
 DO NOT include the ```repeat_exactly marker or any other markers in your response.
 Output ONLY the continuation starting with the exact overlap text.
