@@ -9,7 +9,6 @@ c4h_agents/
 ├── agents/
 │   ├── base_agent.py     # Base implementation
 │   ├── base_config.py    # Configuration management
-│   ├── base_lineage.py   # Lineage tracking
 │   ├── base_llm.py       # LLM interaction
 │   ├── lineage_context.py # Context management
 │   ├── discovery.py      # Project discovery
@@ -62,11 +61,11 @@ classDiagram
         +_get_system_message()
         +call_skill(skill_name, context)
     }
-    class BaseLineage {
+    class EventLogger {
         +namespace: str
         +agent_name: str
         +enabled: bool
-        +track_llm_interaction(context, messages, response, metrics)
+        +log_event(event_type, payload, step_name, parent_id, execution_path, config_snapshot_path, config_hash)
     }
     class DiscoveryAgent {
         +tartxt_config: Dict

@@ -116,7 +116,7 @@ input_data: |
   # EventLogger Implementation Test
   
   ## Task Description
-  Implement the EventLogger class as a replacement for BaseLineage to provide comprehensive
+  Implement the EventLogger class to provide comprehensive
   workflow execution tracking.
   
   ## Context
@@ -177,7 +177,7 @@ input_data: |
   5. Test the event logging integration with an agent workflow
 
 instruction: |
-  You are tasked with implementing the EventLogger class as a replacement for BaseLineage.
+  You are tasked with implementing the EventLogger class.
   
   1. Analyze the provided code to understand the EventLogger integration in BaseAgent
   2. Design and implement a comprehensive EventLogger class that works with the BaseAgent class
@@ -213,7 +213,7 @@ workflow:
     - type: "coder"
       name: "implement_eventlogger"
       input:
-        task_description: "Implement the EventLogger class as a replacement for BaseLineage"
+        task_description: "Implement the EventLogger class"
         context: "${analyze_code.analysis.result}"
         requirements: |
           1. Create a comprehensive EventLogger class that handles event logging
