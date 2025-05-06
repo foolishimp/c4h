@@ -332,8 +332,6 @@ class BaseAgent(BaseConfig, BaseLLM):
                 self.logger.debug("agent.messages",
                             system_length=len(system_message),
                             user_length=len(user_message),
-                            agent_execution_id=agent_execution_id,
-                            system=system_message[:10] + "..." if len(system_message) > 10 else system_message,
                             user_message=user_message[:10] + "..." if len(user_message) > 10 else user_message)
 
             # Create complete messages object for LLM and lineage tracking
@@ -538,329 +536,6 @@ class BaseAgent(BaseConfig, BaseLLM):
             self.logger.error("process.failed", error=str(e), exc_info=True) # Log traceback
             return AgentResponse(success=False, data={}, error=str(e))
 
-    def _get_data(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Extracts primary data payload, ensuring it's a dictionary.
-        
-        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
-        It provides standard data extraction that works for all agent types.
-        
-        Args:
-            context: The context dictionary to extract data from
-            
-        Returns:
-            Dictionary containing the primary payload data
-        """
-        # Use self.logger which should be initialized
-        logger_to_use = self.logger
-        try:
-            # Prioritize 'input_data' as the primary container
-            if 'input_data' in context and isinstance(context['input_data'], dict):
-                 logger_to_use.debug("_get_data: using 'input_data' key")
-                 return context['input_data']
-            # If input_data isn't a dict or doesn't exist, use the context itself if it's a dict
-            elif isinstance(context, dict):
-                 logger_to_use.debug("_get_data: using context as data (input_data missing or not dict)")
-                 return context
-            # Fallback: create a basic dict if context isn't suitable
-            logger_to_use.warning("_get_data: context is not a suitable dict, creating basic wrapper", context_type=type(context).__name__)
-            return {'content': str(context)}
-        except Exception as e:
-            logger_to_use.error("_get_data.failed", error=str(e))
-            return {}
-
-    def _format_request(self, data: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> str:
-         """
-         Format request with support for dynamic overrides.
-         
-         IMPORTANT: This uses standard configuration paths and template formatting.
-         This method is NOT intended to be overridden in the generic agent model.
-         All formatting templates are sourced from the persona configuration or runtime overrides,
-         NOT from agent class-specific implementations.
-         
-         Args:
-             data: The data to format
-             context: Optional runtime context that may contain overrides
-             
-         Returns:
-             Formatted request string
-         """
-         try:
-              # Check for a format template override in context
-              template = None
-              template_key = "user"  # Default template key
-              
-              # Check for overrides in context if provided
-              if context:
-                  overrides = context.get('agent_config_overrides', {}).get(self.unique_name, {})
-                  
-                  # Direct template override
-                  if 'template' in overrides:
-                      template = overrides['template']
-                      self.logger.debug("format_request.using_direct_template_override", 
-                                     agent_name=self.unique_name,
-                                     template_length=len(template) if template else 0)
-                  
-                  # Template key override
-                  elif 'template_key' in overrides:
-                      template_key = overrides['template_key']
-                      self.logger.debug("format_request.using_template_key_override", 
-                                     agent_name=self.unique_name,
-                                     template_key=template_key)
-              
-              # If no direct template override, get template from persona
-              if template is None:
-                  # Get template using updated _get_prompt method (which also handles overrides)
-                  template = self._get_prompt(template_key, context)
-              
-              # Format the template with data if it contains format placeholders
-              if isinstance(template, str) and '{' in template:
-                  try:
-                      return template.format(**data)
-                  except KeyError as e:
-                      self.logger.warning("format_request.missing_key_in_template", error=str(e))
-                      # Fall back to JSON format on template key error
-                      return json.dumps(data, indent=2, default=str)
-              elif template:
-                  # Template exists but doesn't need formatting
-                  return str(template)
-              else:
-                  # No template, use default JSON format
-                  self.logger.debug("format_request.using_default_json")
-                  return json.dumps(data, indent=2, default=str)
-         except Exception as e:
-              self.logger.error("format_request.failed", error=str(e))
-              return str(data) # Ultimate fallback
-
-    def _get_llm_content(self, response: Any) -> Any:
-        """
-        Extract content from LLM response or context data with robust error handling.
-        
-        This method provides comprehensive content extraction from various LLM response formats.
-        It robustly handles different response structures including standard LLM objects, 
-        strings, nested dictionaries, and more.
-        
-        While agent implementations MAY override this method for highly specialized content 
-        extraction, the base implementation is quite robust and should handle most cases.
-        
-        Args:
-            response: The raw response from an LLM or other response object
-            
-        Returns:
-            Extracted content in string format
-        """
-        logger_to_use = getattr(self, 'logger', get_logger())
-        response_repr = repr(response)
-        logger_to_use.debug("_get_llm_content.received",
-                     input_type=type(response).__name__,
-                     input_repr_preview=response_repr[:200] + "..." if len(response_repr) > 200 else response_repr)
-        try:
-            # 1. Handle standard LLM response objects
-            if hasattr(response, 'choices') and response.choices:
-                logger_to_use.debug("_get_llm_content.checking_choices")
-                if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
-                    content = response.choices[0].message.content
-                    logger_to_use.debug("content.extracted_from_model", content_length=len(content) if content else 0)
-                    return content
-                elif hasattr(response.choices[0], 'delta') and hasattr(response.choices[0].delta, 'content'):
-                    content = response.choices[0].delta.content
-                    logger_to_use.debug("content.extracted_from_delta", content_length=len(content) if content else 0)
-                    return content
-
-            # 2. Handle direct string input
-            if isinstance(response, str):
-                logger_to_use.debug("content.extracted_direct_string", content_length=len(response))
-                return response
-
-            # 3. Handle dictionary inputs
-            if isinstance(response, dict):
-                logger_to_use.debug("_get_llm_content.checking_dict_keys", keys=list(response.keys()))
-
-                # Check nested {'response': {'content': '...'}} structure FIRST
-                if 'response' in response:
-                    response_val = response['response']
-                    logger_to_use.debug("_get_llm_content.found_response_key", response_val_type=type(response_val).__name__)
-                    if isinstance(response_val, str):
-                        logger_to_use.debug("content.extracted_from_dict_response_key", content_length=len(response_val))
-                        return response_val
-                    elif isinstance(response_val, dict) and 'content' in response_val:
-                         content_val = response_val['content']
-                         if isinstance(content_val, str):
-                              logger_to_use.debug("content.extracted_from_nested_dict_response_content_key", content_length=len(content_val))
-                              return content_val
-                         else:
-                              logger_to_use.warning("_get_llm_content.nested_content_not_string", nested_content_type=type(content_val).__name__)
-                    # Fall through if response['response'] is dict but has no 'content'
-
-                # Check for {'content': '...'}
-                if 'content' in response and isinstance(response['content'], str):
-                     logger_to_use.debug("content.extracted_from_dict_content_key", content_length=len(response['content']))
-                     return response['content']
-
-                # Check for apply_diff structure {'llm_output': {'content': '...'}}
-                if 'llm_output' in response and isinstance(response['llm_output'], dict):
-                    logger_to_use.debug("_get_llm_content.checking_dict_llm_output_key", llm_output_keys=list(response['llm_output'].keys()))
-                    if 'content' in response['llm_output'] and isinstance(response['llm_output']['content'], str):
-                         logger_to_use.debug("content.extracted_from_dict_llm_output_content_key", content_length=len(response['llm_output']['content']))
-                         return response['llm_output']['content']
-
-            # 4. Last resort fallback - convert to string
-            result = str(response)
-            logger_to_use.warning("content.extraction_fallback",
-                        response_type=type(response).__name__,
-                        content_preview=result[:100] if len(result) > 100 else result)
-            return result
-
-        except Exception as e:
-            logger_to_use.error("content_extraction.failed", error=str(e), exc_info=True)
-            return str(response)
-
-
-    def _process_response(self, content: str, raw_response: Any) -> Dict[str, Any]:
-        """
-        Process LLM response into standard format.
-        
-        This method provides basic processing of LLM responses into a standard dictionary format.
-        Advanced agent implementations may override this method to provide specialized response 
-        processing, but should maintain compatibility with the expected return format.
-        
-        Args:
-            content: The content string from the LLM
-            raw_response: The raw response object from the LLM
-            
-        Returns:
-            Dictionary containing processed response data
-        """
-        # Use self.logger which should be initialized in BaseAgent __init__
-        logger_to_use = self.logger # Use the instance logger
-        try:
-            # Extract content using THIS class's _get_llm_content method
-            processed_content = self._get_llm_content(content) # Calls the overridden method
-            # Check if logger exists before logging
-            if logger_to_use and self._should_log(LogDetail.DEBUG):
-                logger_to_use.debug("agent.processing_response",
-                            content_length=len(str(processed_content)) if processed_content else 0,
-                            response_type=type(raw_response).__name__)
-
-            # Create standard response structure
-            response = {
-                "response": processed_content,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-
-            # Add token usage metrics if available
-            if hasattr(raw_response, 'usage'):
-                usage = raw_response.usage
-                usage_data = {
-                    "completion_tokens": getattr(usage, 'completion_tokens', 0),
-                    "prompt_tokens": getattr(usage, 'prompt_tokens', 0),
-                    "total_tokens": getattr(usage, 'total_tokens', 0)
-                }
-                # Check if logger exists before logging
-                if logger_to_use: logger_to_use.info("llm.token_usage", **usage_data)
-                response["usage"] = usage_data
-
-            return response
-        except Exception as e:
-            # Check if logger exists before logging
-            if logger_to_use: logger_to_use.error("response_processing.failed", error=str(e), exc_info=True) # Added traceback
-            return {
-                "response": str(content),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "error": str(e)
-            }
-
-    def _get_required_keys(self) -> List[str]:
-        """
-        Returns required keys for context validation.
-        
-        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
-        In the persona-based configuration approach, required keys should be specified in 
-        the persona configuration, not through class-specific overrides.
-        
-        Returns:
-            List of required keys for context validation
-        """
-        return []
-
-    def _get_agent_name(self) -> str:
-        """
-        Returns the unique name assigned to this agent instance.
-        
-        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
-        In the persona-based configuration approach, the agent name comes from the unique_name 
-        parameter provided during instantiation, NOT from class-specific overrides.
-        
-        Returns:
-            The unique name of this agent instance
-        """
-        if hasattr(self, 'unique_name') and self.unique_name:
-             return self.unique_name
-        else:
-             # Fallback, though unique_name should always be set by the factory
-             # Use self.logger if available, otherwise print a warning
-             logger_instance = getattr(self, 'logger', None)
-             if logger_instance:
-                  logger_instance.warning("_get_agent_name called before unique_name was set or unique_name is empty.")
-             else:
-                  print("Warning: _get_agent_name called before unique_name was set or unique_name is empty.")
-             # Attempt to derive from class name as a last resort, but this deviates from the new design
-             class_name = self.__class__.__name__
-             name = re.sub(r'(?<!^)(?=[A-Z])', '_', class_name).lower()
-             if name.endswith("_agent"): name = name[:-6]
-             return name or "base_agent"
-
-    def _get_system_message(self, context: Optional[Dict[str, Any]] = None) -> str:
-        """
-        Get system message with support for dynamic overrides.
-        
-        IMPORTANT: This uses standard configuration paths based on unique_name and persona_key.
-        This method is NOT intended to be overridden in the generic agent model.
-        All configuration is sourced from the persona configuration or runtime overrides,
-        NOT from agent class-specific implementations.
-        
-        Args:
-            context: Optional runtime context that may contain overrides
-            
-        Returns:
-            System message string from context override or persona config
-        """
-        # Initialize system_prompt to None to track source
-        system_prompt = None
-        
-        # First check for override in context if provided
-        if context:
-            # Look for override in agent_config_overrides structure
-            overrides = context.get('agent_config_overrides', {}).get(self.unique_name, {})
-            
-            # Direct system_prompt override
-            if 'system_prompt' in overrides:
-                system_prompt = overrides['system_prompt']
-                self.logger.debug("system_prompt.from_context_override", 
-                                agent_name=self.unique_name,
-                                prompt_length=len(system_prompt) if system_prompt else 0)
-                
-            # Or check for system_prompt_key override (key in persona.prompts)
-            elif 'system_prompt_key' in overrides:
-                prompt_key = overrides['system_prompt_key']
-                system_prompt = self.config_node.get_value(f"{self.persona_path}.prompts.{prompt_key}")
-                self.logger.debug("system_prompt.from_key_override", 
-                                agent_name=self.unique_name,
-                                key=prompt_key,
-                                found=system_prompt is not None)
-        
-        # If no override was found, use default from persona
-        if system_prompt is None:
-            system_prompt = self.config_node.get_value(f"{self.persona_path}.prompts.system")
-            
-            if not system_prompt:
-                self.logger.warning("system_prompt.not_found", 
-                                  persona_key=self.persona_key,
-                                  persona_path=f"{self.persona_path}.prompts.system")
-                
-        return system_prompt or ""
-
-
     def _get_prompt(self, prompt_type: str, context: Optional[Dict[str, Any]] = None) -> str:
         """
         Get a prompt template with support for dynamic overrides.
@@ -920,201 +595,60 @@ class BaseAgent(BaseConfig, BaseLLM):
         # Ensure prompt is a string before returning
         return str(prompt) if prompt is not None else ""
 
-
-    def call_skill(self, skill_name: str, skill_context: Dict[str, Any]) -> Dict[str, Any]:
+    def _format_request(self, data: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> str:
         """
-        Call a skill with proper lineage tracking.
-        
-        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
-        It provides standard lineage tracking for skill calls that works for all agent types.
+        Format request data using a template from persona configuration.
         
         Args:
-            skill_name: Name of the skill to call
-            skill_context: Context to pass to the skill
-
-        Returns:
-            Result from the skill (actually returns enhanced context for skill execution)
-        """
-        # Use self.logger which is initialized
-        logger_to_use = self.logger
-        try:
-            # Prepare lineage tracking context for the skill
-            # Use self.run_id which should be set during BaseAgent init
-            current_run_id = getattr(self, 'run_id', None)
-            if not current_run_id:
-                 logger_to_use.warning("call_skill invoked before run_id was set.")
-                 current_run_id = "unknown_run_id" # Fallback
-
-            lineage_skill_context = LineageContext.create_skill_context(
-                agent_id=self.agent_id, # Use agent's unique instance ID
-                skill_type=skill_name,
-                workflow_run_id=current_run_id,
-                base_context=skill_context
-            )
-
-            logger_to_use.debug("agent.calling_skill",
-                    agent_id=self.agent_id,
-                    skill=skill_name,
-                    skill_execution_id=lineage_skill_context.get("agent_execution_id"))
-
-            # Return enhanced context - the skill itself will handle execution
-            return lineage_skill_context
-        except Exception as e:
-             logger_to_use.error("agent.skill_context_failed",
-                    error=str(e),
-                    skill=skill_name,
-                    exc_info=True) # Log traceback
-
-        # If lineage context fails, fall back to original context
-        return skill_context
-    
-    def _invoke_skill(self, skill_identifier: str, skill_kwargs: Dict[str, Any]) -> SkillResult:
-        """
-        Dynamically invoke a skill by identifier.
-        
-        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
-        It provides standard skill invocation logic for all agent types.
-        
-        Args:
-            skill_identifier: String in format "module.Class.method" or "module.Class"
-            skill_kwargs: Arguments to pass to the skill execute method
+            data: Data to format
+            context: Optional context that may contain overrides
             
         Returns:
-            SkillResult from the skill execution
+            Formatted request string
         """
-        logger_to_use = self.logger
         try:
-            # Parse the skill identifier
-            parts = skill_identifier.split('.')
-            
-            # Need at least module and class
-            if len(parts) < 2:
-                logger_to_use.error("skill.invalid_identifier", identifier=skill_identifier)
-                return SkillResult(
-                    success=False, 
-                    error=f"Invalid skill identifier format: {skill_identifier}. Expected 'module.Class' or 'module.Class.method'"
-                )
-                
-            module_path = '.'.join(parts[:-1]) if len(parts) > 2 else parts[0]
-            class_name = parts[-1] if len(parts) <= 2 else parts[-2]
-            method_name = 'execute' if len(parts) <= 2 else parts[-1]
-            
-            logger_to_use.debug("skill.resolution", 
-                              module=module_path, 
-                              class_name=class_name, 
-                              method=method_name)
-            
-            # Import the module
-            try:
-                # Try relative to c4h_agents first
-                try:
-                    full_module_path = f"c4h_agents.{module_path}"
-                    module = __import__(full_module_path, fromlist=[class_name])
-                except (ImportError, ModuleNotFoundError):
-                    # If that fails, try the direct path
-                    module = __import__(module_path, fromlist=[class_name])
-                    
-                # Get the class
-                skill_class = getattr(module, class_name)
-                
-            except (ImportError, ModuleNotFoundError) as e:
-                logger_to_use.error("skill.module_import_failed", 
-                                  module=module_path, 
-                                  error=str(e))
-                return SkillResult(
-                    success=False,
-                    error=f"Failed to import skill module '{module_path}': {str(e)}"
-                )
-            except AttributeError as e:
-                logger_to_use.error("skill.class_not_found", 
-                                  module=module_path, 
-                                  class_name=class_name, 
-                                  error=str(e))
-                return SkillResult(
-                    success=False, 
-                    error=f"Skill class '{class_name}' not found in module '{module_path}': {str(e)}"
-                )
-                
-            # Instantiate the skill with our config
-            try:
-                # Pass our effective config to the skill
-                skill_instance = skill_class(self.config, class_name)
-            except Exception as e:
-                logger_to_use.error("skill.instantiation_failed", 
-                                  class_name=class_name, 
-                                  error=str(e))
-                return SkillResult(
-                    success=False, 
-                    error=f"Failed to instantiate skill '{class_name}': {str(e)}"
-                )
-                
-            # Get the method
-            try:
-                skill_method = getattr(skill_instance, method_name)
-            except AttributeError as e:
-                logger_to_use.error("skill.method_not_found", 
-                                  class_name=class_name, 
-                                  method_name=method_name, 
-                                  error=str(e))
-                return SkillResult(
-                    success=False, 
-                    error=f"Method '{method_name}' not found in skill '{class_name}': {str(e)}"
-                )
-                
-            # Prepare lineage context for skill execution
-            try:
-                # Add lineage tracking context
-                skill_context = self.call_skill(class_name, skill_kwargs)
-                skill_kwargs.update(skill_context)
-            except Exception as e:
-                logger_to_use.warning("skill.lineage_preparation_failed", 
-                                   error=str(e), 
-                                   proceeding="without_lineage")
-                # Proceed without lineage tracking
-            
-            # Call the method
-            try:
-                result = skill_method(**skill_kwargs)
-                
-                # Make sure the result is a SkillResult
-                if not isinstance(result, SkillResult):
-                    logger_to_use.warning("skill.invalid_result_type", 
-                                       expected="SkillResult", 
-                                       actual=type(result).__name__)
-                    # Wrap in SkillResult if not already
-                    if hasattr(result, 'success'):
-                        # Has success attribute - likely compatible
-                        return SkillResult(
-                            success=getattr(result, 'success', False),
-                            value=result,
-                            error=getattr(result, 'error', None)
-                        )
-                    else:
-                        # No success attribute - treat as raw value
-                        return SkillResult(
-                            success=True,
-                            value=result
-                        )
-                        
-                return result
-                
-            except Exception as e:
-                logger_to_use.error("skill.execution_failed", 
-                                  class_name=class_name, 
-                                  method_name=method_name, 
-                                  error=str(e),
-                                  exc_info=True)
-                return SkillResult(
-                    success=False, 
-                    error=f"Skill execution failed: {str(e)}"
-                )
-                
+             # Check for a format template override in context
+             template = None
+             template_key = "user"  # Default template key
+             
+             # Check for overrides in context if provided
+             if context:
+                 overrides = context.get('agent_config_overrides', {}).get(self.unique_name, {})
+                 
+                 # Direct template override
+                 if 'template' in overrides:
+                     template = overrides['template']
+                     self.logger.debug("format_request.using_direct_template_override", 
+                                     agent_name=self.unique_name,
+                                     template_length=len(template) if template else 0)
+                 
+                 # Template key override
+                 elif 'template_key' in overrides:
+                     template_key = overrides['template_key']
+                     self.logger.debug("format_request.using_template_key_override", 
+                                     agent_name=self.unique_name,
+                                     template_key=template_key)
+             
+             # If no direct template override, get template from persona
+             if template is None:
+                 # Get template using updated _get_prompt method (which also handles overrides)
+                 template = self._get_prompt(template_key, context)
+             
+             # Format the template with data if it contains format placeholders
+             if isinstance(template, str) and '{' in template:
+                 try:
+                     return template.format(**data)
+                 except KeyError as e:
+                     self.logger.warning("format_request.missing_key_in_template", error=str(e))
+                     # Fall back to JSON format on template key error
+                     return json.dumps(data, indent=2, default=str)
+             elif template:
+                 # Template exists but doesn't need formatting
+                 return str(template)
+             else:
+                 # No template, use default JSON format
+                 self.logger.debug("format_request.using_default_json")
+                 return json.dumps(data, indent=2, default=str)
         except Exception as e:
-            logger_to_use.error("skill.invocation_failed", 
-                              identifier=skill_identifier, 
-                              error=str(e),
-                              exc_info=True)
-            return SkillResult(
-                success=False, 
-                error=f"Skill invocation failed: {str(e)}"
-            )
+             self.logger.error("format_request.failed", error=str(e))
+             return str(data) # Ultimate fallback

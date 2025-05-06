@@ -1,4 +1,3 @@
-# Path: /Users/jim/src/apps/c4h/c4h_agents/agents/continuation/continuation_handler.py
 from typing import Dict, Any, List, Tuple, Optional
 import time
 import random
@@ -58,7 +57,7 @@ class ContinuationHandler:
         rate_limit_backoff = WINDOW_CONFIG["rate_limit_retry_base_delay"]
         
         try:
-            completion_params = self._build_completion_params(messages) 
+            completion_params = self._build_completion_params(messages, context) 
             response = self._make_llm_request(completion_params)
             content = self._get_content_from_response(response)
             self.logger.debug("Received initial content",
@@ -107,7 +106,7 @@ class ContinuationHandler:
                     try:
                         cont_params = completion_params.copy() 
                         cont_params["messages"] = cont_messages 
-                        response = self._make_llm_request(cont_params) 
+                        response = self._make_llm_request(cont_params)
                         cont_content = self._get_content_from_response(response)
                         
                         joined_content, success = join_with_explicit_overlap(
@@ -223,9 +222,7 @@ class ContinuationHandler:
 I need you to continue code that was interrupted due to length limits.
 
 HERE IS THE END OF THE PREVIOUS CONTENT:
-```previous
 {context_window}
-```
 
 CRITICAL CONTINUATION INSTRUCTIONS:
 1. First, analyze the code to detect its language and structure
@@ -235,9 +232,7 @@ CRITICAL CONTINUATION INSTRUCTIONS:
    - Is it Markdown? Look for heading markers, list items, code blocks
 
 2. Then, repeat EXACTLY (character for character) this text:
-```repeat_exactly
 {explicit_overlap}
-```
 
 3. Continue the code seamlessly from that point, maintaining:
    - FOR PYTHON: Exact indentation is critical; watch for open blocks after colons
@@ -245,7 +240,6 @@ CRITICAL CONTINUATION INSTRUCTIONS:
    - FOR JSON: Maintain strict JSON format with double quotes and proper comma placement
    - FOR ALL LANGUAGES: Ensure proper closing of all open structures
 
-DO NOT include the ```repeat_exactly marker or any other markers in your response.
 Output ONLY the continuation starting with the exact overlap text.
 
 Begin your response now with the exact overlap text and continue:
@@ -256,7 +250,7 @@ Begin your response now with the exact overlap text and continue:
                               error=str(e), stack_trace=traceback.format_exc())
             return f"Continue precisely from: {explicit_overlap}" # Fallback prompt
 
-    def _build_completion_params(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    def _build_completion_params(self, messages: List[Dict[str, str]], context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Build parameters for LLM completion request."""
         try:
             params = {"model": self.model_str, "messages": messages}
@@ -324,8 +318,9 @@ Begin your response now with the exact overlap text and continue:
                      if isinstance(content, str): 
                           return content
                      else:
-                          self.logger.warning("Extracted content is not string in _get_content_from_response", content_type=type(content).__name__)
-                          return str(content) 
+                          self.logger.warning("Extracted content is not string in _get_content_from_response", 
+                                             content_type=type(content).__name__)
+                          return str(content)
             self.logger.warning("No valid content structure found in LLM response", response_obj=response)
             return ""
         except Exception as e:

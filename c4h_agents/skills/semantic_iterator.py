@@ -416,5 +416,3 @@ class SemanticIterator(BaseAgent):
         
     # The deprecated 'configure' method has been removed.
     # Use 'process' with appropriate context instead.
-===CHANGE_END===
-===CHANGE_END===
