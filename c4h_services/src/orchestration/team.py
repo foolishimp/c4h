@@ -1,6 +1,12 @@
 """
 Team implementation for agent orchestration.
 Path: c4h_services/src/orchestration/team.py
+
+This module follows the immutable context pattern:
+- The Team class treats its input context as read-only
+- It does not modify the context dictionary that is passed to execute()
+- Results and state transitions are returned in a result object
+- The orchestrator is responsible for managing context transitions
 """
 
 from typing import Dict, Any, List, Optional
@@ -33,6 +39,14 @@ class Team:
         Execute this team's agents in sequence.
         
         Args:
+            context: Execution context including workflow data.
+                Context follows these conventions:
+                - data_context: The evolving payload/results data
+                - execution_metadata: Information about workflow execution
+                - config: Reference to effective configuration
+            
+            IMPORTANT: This method treats the context as immutable. 
+            It does not modify the input context directly.
             context: Execution context including workflow data
             
         Returns:
@@ -40,7 +54,8 @@ class Team:
         """
         logger.info("team.execution_starting", team_id=self.team_id, name=self.name)
         
-        # Track results of each agent
+        # Track results of each agent (using immutable patterns)
+        # Create new result objects rather than modifying existing ones
         results = []
         team_result = {"success": True, "data": {}, "team_id": self.team_id}
         
@@ -58,10 +73,12 @@ class Team:
                     "agent_type": task_config.agent_type,
                     "persona_key": task_config.persona_key,
                     "config": task_config.config
+                    # Preserve immutability - create new dict rather than modifying
                 }
 
+                # Pass the context as-is (immutable/read-only input)
                 result = run_agent_task(
-                    task_config=task_config_dict,
+                    task_config=task_config_dict, # newly created dict
                     context=context,
                     effective_config=context.get("config", {})
                 )

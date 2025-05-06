@@ -1,8 +1,3 @@
-"""
-Path: c4h_services/src/intent/impl/prefect/tasks.py 
-Task wrapper implementation with enhanced configuration handling.
-"""
-
 from typing import Dict, Any, Optional, List
 from c4h_services.src.utils.logging import get_logger
 from prefect import task, get_run_logger, flow
@@ -38,15 +33,37 @@ def run_agent_task(
     """
     Prefect task wrapper for agent execution with factory-based instantiation.
     Uses only the factory pattern for agent creation.
+
+    Context Structure Conventions:
+    The context follows these conventions for separation of concerns:
+    
+    1. data_context: Contains the evolving payload/results of the workflow
+       - Project-specific data, usually modified by agents
+       - Content produced during workflow execution
+       - Input/output data exchanged between teams
+    
+    2. execution_metadata: Contains information about the workflow execution itself
+       - workflow_run_id: Unique identifier for this workflow run
+       - agent_execution_id: Identifiers for specific agent executions
+       - step: Current step in the workflow
+       - execution_path: Array of executed team IDs
+       - timestamps: Execution timestamps
+    
+    3. config: Reference to the effective configuration snapshot
+       - Contains all configuration needed for the workflow
+    
+    IMPORTANT: Context is treated as immutable. This function does not modify the 
+    input context directly. Any updates to context state should be returned in the 
+    result object for the orchestrator to handle.
     
     Args:
         task_config: Configuration for the specific task
-        context: Execution context
+        context: Execution context (treated as immutable read-only input)
         effective_config: Complete effective configuration snapshot
         task_name: Optional name override
         
     Returns:
-        Dict with agent execution results
+        Dict with agent execution results, including any context updates
     """
     prefect_logger = get_run_logger()
     
@@ -366,6 +383,12 @@ def evaluate_routing_task(
     """
     Evaluate routing rules to determine next team and context updates.
     
+    IMPORTANT: This function treats current_context as immutable/read-only.
+    It does not modify the input context directly but instead returns context_updates
+    which will be merged immutably by the orchestrator to create the next context.
+    
+    This follows the convention that context state progression is managed by the orchestrator
+    
     Args:
         team_results: Results from team execution
         current_context: Current workflow context
@@ -374,6 +397,7 @@ def evaluate_routing_task(
         
     Returns:
         Dict with next_team_id and context_updates
+        (context_updates will be merged immutably with current_context by the orchestrator)
     """
     prefect_logger = get_run_logger()
     
@@ -618,7 +642,16 @@ def evaluate_routing_task(
                         context_updates["routing_info"] = {
                             "team_id": team_id,
                             "rule_index": i,
+                            "matched_rule": i+1,
                             "next_team": rule.get("next_team"),
+                            # Add temporal data to execution_metadata namespace
+                            # following context structure conventions:
+                            # - data_context: workflow payload data
+                            # - execution_metadata: workflow execution information
+                            "execution_metadata": {
+                                "prior_team": team_id,
+                                "routing_evaluation_time": datetime.now(timezone.utc).isoformat()
+                            },
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                             "condition_type": "structured" if "type" in condition else "simple"
                         }

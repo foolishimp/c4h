@@ -1,6 +1,3 @@
-# File: /Users/jim/src/apps/c4h_ai_dev/c4h_services/src/intent/impl/prefect/workflows.py
-# Correction: Add missing import for evaluate_routing_task
-
 from prefect import flow, get_run_logger
 from prefect.context import get_run_context
 from typing import Dict, Any, Optional, List
@@ -124,6 +121,30 @@ def run_declarative_workflow(
     """
     Execute a workflow defined declaratively in configuration.
     Uses the effective configuration snapshot for all execution.
+    
+    Context Structure Conventions:
+    The workflow context follows these conventions for separation of concerns:
+    
+    1. data_context: Contains the evolving payload/results of the workflow
+       - Project-specific data, usually modified by agents
+       - Content produced during workflow execution
+       - Input/output data exchanged between teams
+    
+    2. execution_metadata: Contains information about the workflow execution itself
+       - workflow_run_id: Unique identifier for this workflow run
+       - agent_execution_id: Identifiers for specific agent executions
+       - step: Current step in the workflow
+       - execution_path: Array of executed team IDs
+       - timestamps: Execution timestamps
+       (Often managed by LineageContext)
+    
+    3. config: Reference to the effective configuration snapshot
+       - Immutable snapshot reference that doesn't change during execution
+       - Contains all configuration needed for the workflow
+    
+    IMPORTANT: Context is treated as immutable. Context updates create new context
+    objects rather than modifying existing ones. This ensures reproducible state
+    transitions and prevents side effects.
 
     Args:
         initial_context: Initial context including config fragments
@@ -217,6 +238,7 @@ def run_declarative_workflow(
         # Track execution results
         team_results = {}
         execution_path = []
+        # Track the workflow status
         final_workflow_status = "success" # Assume success initially
         final_workflow_error = None
 
@@ -286,15 +308,20 @@ def run_declarative_workflow(
             # Update context with any context updates returned by routing
             if "context_updates" in routing_result and routing_result["context_updates"]:
                 context_updates = routing_result["context_updates"]
-                if isinstance(context_updates, dict): # Ensure it's a dict
-                     run_logger.info(f"Applying context updates from routing: {list(context_updates.keys())}")
-                     
+                if isinstance(context_updates, dict): # Ensure it's a dict                         
                      # Check if config_fragments were supplied for a new snapshot
                      create_new_snapshot = False
                      new_config_fragments = None
                      
                      if "config_fragments" in context_updates:
-                         new_config_fragments = context_updates.pop("config_fragments")
+                         # Extract config_fragments without modifying the original context_updates 
+                         new_config_fragments = context_updates["config_fragments"]
+                         # Create a new context_updates without config_fragments for regular merging
+                         context_updates = {k: v for k, v in context_updates.items() if k != "config_fragments"}
+                         run_logger.info(f"Extracted config_fragments for new snapshot, remaining context updates: {list(context_updates.keys())}")
+                     else:
+                         run_logger.info(f"Applying context updates from routing: {list(context_updates.keys())}")
+                         
                          if isinstance(new_config_fragments, list) and len(new_config_fragments) > 0:
                              create_new_snapshot = True
                              run_logger.info(f"Found config fragments for new snapshot: {len(new_config_fragments)} fragments")
@@ -329,6 +356,8 @@ def run_declarative_workflow(
                          config_node = create_config_node(effective_config)
                          
                          # Add snapshot metadata to context
+------------END OVERLAP------------
+
                          context_updates["config_snapshot"] = {
                              "path": str(new_config_info.snapshot_path),
                              "hash": new_config_info.config_hash,
@@ -338,8 +367,22 @@ def run_declarative_workflow(
                          
                          run_logger.info(f"Created new snapshot at: {new_config_info.snapshot_path}")
                      
-                     # Perform immutable merge of context updates
-                     current_context = {**current_context, **context_updates}
+                     # Create a new context dictionary by unpacking the current context and then
+                     # the updates, ensuring immutability (AR4, REQ-DET-05)
+                     
+                     # IMPORTANT: For proper immutability, we need to handle nested dictionaries
+                     # by creating deep copies rather than shallow references
+                     from copy import deepcopy
+                     
+                     # First create a deep copy of the current context to avoid modifying shared references
+                     next_context = deepcopy(current_context)
+                     
+                     # Then apply updates, ensuring each update is also a deep copy to prevent shared references
+                     for key, value in context_updates.items():
+                         next_context[key] = deepcopy(value)
+                         
+                     run_logger.debug("Created new deeply immutable context with updates applied")
+                     current_context = next_context
                 else:
                      run_logger.warning("Routing returned non-dict context_updates, ignoring.", updates=context_updates)
 
@@ -472,11 +515,16 @@ def execute_team_subflow(
     """
     Execute a team's tasks as defined in the effective configuration.
     Supports regular team execution and loop-based iteration.
+    
+    IMPORTANT: This function treats current_context as immutable/read-only.
+    It does not modify the input context directly. Any required context
+    updates are returned in the result object for the orchestrator to handle
+    according to REQ-DET-05.
 
     Args:
         team_id: ID of the team to execute
         effective_config: The complete effective configuration snapshot
-        current_context: Current execution context
+        current_context: Current execution context (treated as immutable read-only input)
 
     Returns:
         Dict with team execution results
@@ -529,8 +577,10 @@ def execute_team_subflow(
             run_logger.info(f"Executing task {i+1}/{len(tasks)}: {task_name}")
 
             # Add task_config to context for factory creation
-            # Pass the specific task definition from the effective config
-            task_context = {**current_context, "task_config": task_config_def}
+            # Use deepcopy to ensure true immutability by creating new copies of nested objects
+            from copy import deepcopy
+            task_context = deepcopy(current_context)
+            task_context["task_config"] = deepcopy(task_config_def)
 
             # Execute the task using run_agent_task
             # Pass the full effective_config snapshot
@@ -578,12 +628,18 @@ def execute_loop_team(
 ) -> Dict[str, Any]:
     """
     Execute a team's tasks in a loop over items in a collection.
+    
+    IMPORTANT: This function treats current_context as immutable/read-only.
+    It does not modify the input context directly. For each loop iteration,
+    a new iteration context is created by copying the current context and adding
+    iteration-specific variables. This follows the immutability principle required
+    by REQ-DET-05.
 
     Args:
         team_id: ID of the loop team
         team_config: Configuration for the specific team
         effective_config: The complete effective configuration
-        current_context: Current workflow context
+        current_context: Current workflow context (treated as immutable read-only input)
 
     Returns:
         Dict with aggregated loop execution results
@@ -622,8 +678,10 @@ def execute_loop_team(
         # Get loop variable name (default to "item")
         loop_variable = team_config.get("loop_variable", "item")
         
-        # Get loop body teams or tasks
-        body = team_config.get("body", [])
+        # Get loop body teams or tasks (data_context convention)
+        # Note: This section operates on the provided context as read-only input
+        # Any modifications are returned in the result, not made to the input context
+        body = team_config.get("body", []) 
         if not body:
             error_msg = f"Empty loop body for loop team: {team_id}"
             run_logger.error(error_msg)
@@ -647,25 +705,31 @@ def execute_loop_team(
         # Track index for debugging
         for idx, item in enumerate(collection):
             # Create iteration context with loop variable
-            iter_context = {
-                **current_context,
-                loop_variable: item,
-                "loop_index": idx,
-                "loop_count": len(collection)
-            }
+            # Use deepcopy to ensure true immutability by creating new copies of nested objects
+            from copy import deepcopy
+            iter_context = deepcopy(current_context)
+            
+            # Add iteration-specific variables
+            iter_context[loop_variable] = item
+            iter_context["loop_index"] = idx
+            iter_context["loop_count"] = len(collection)
             
             run_logger.info(f"Loop {team_id}: iteration {idx+1}/{len(collection)}")
             
             # Initialize iteration result
             iter_result = {
                 "index": idx,
+                "item_key": loop_variable,
                 "success": True,
                 "results": []
             }
             
-            # Execute each body item (task or embedded team)
+            # Execute each body item (task or embedded team) with a new iteration context
+            # This follows the data_context convention by preserving the original context
+            # and creating new contexts for each iteration
             for body_item in body:
-                # Check if this is a task or a team reference
+                # Check if this is a task or a team reference 
+                # (using read-only context pattern)
                 if isinstance(body_item, dict) and "agent_type" in body_item:
                     # This is a task configuration
                     task_name = body_item.get("name", f"loop_task_{idx}")
@@ -684,6 +748,8 @@ def execute_loop_team(
                     # Add to iteration results
                     iter_result["results"].append(result)
                     
+                    # Check
+------------END OVERLAP------------
                     # Check for failure
                     if not result.get("success", False) and stop_on_fail:
                         iter_result["success"] = False
