@@ -9,9 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 import re
-import structlog # Ensure structlog is imported if used directly
 from c4h_agents.agents.base_config import BaseConfig
-from c4h_agents.lineage.event_logger import EventLogger, EventType # New import for EventLogger
+from c4h_agents.lineage.event_logger import EventLogger # Keep import for type hints
 from c4h_agents.agents.lineage_context import LineageContext # Correct import
 from c4h_agents.agents.base_llm import BaseLLM
 from c4h_agents.agents.continuation.continuation_handler import ContinuationHandler
@@ -157,32 +156,6 @@ class BaseAgent(BaseConfig, BaseLLM):
              "run_id": self.run_id
         })
         self.logger = self.logger.bind(**log_context)
-
-        # --- Step 14: Initialize EventLogger for Lineage ---
-        self.event_logger = None
-        try:
-            self.logger.debug(f"{agent_name}.event_logger_init", has_runtime="runtime" in self.config, has_system="system" in self.config, has_workflow_run_id=bool(self.run_id))
-            self.logger.debug(f"{agent_name}.using_run_id", run_id=self.run_id)
-            
-            # Extract lineage config from runtime section
-            lineage_config = self.config_node.get_value("runtime.lineage") or {}
-            if not lineage_config:
-                # Try llm_config path as fallback
-                lineage_config = self.config_node.get_value("llm_config.agents.lineage") or {}
-            
-            # Initialize with run_id
-            self.event_logger = EventLogger(
-                lineage_config,
-                self.run_id
-            )
-            
-            # Set agent type and name in event logger
-            self.event_logger.agent_name = agent_name
-            self.event_logger.agent_type = self.agent_type if hasattr(self, 'agent_type') else agent_name
-            
-            self.logger.info(f"{agent_name}.event_logger_initialized", run_id=self.run_id)
-        except Exception as e:
-            self.logger.error(f"{agent_name}.event_logger_init_failed", error=str(e), exc_info=True)
 
         # --- Step 15: Initialize Continuation Handler ---
         # Ensure it's initialized AFTER all necessary parent attributes (like logger, model_str) are set
@@ -338,44 +311,11 @@ class BaseAgent(BaseConfig, BaseLLM):
             messages = LLMMessages(
                 system=system_message,
                 user=user_message,
-                formatted_request="",  # Don't store duplicate content
+                formatted_request="",
                 raw_context=lineage_context
             )
 
             try:
-                # Check if event logger is enabled
-                event_logger_enabled = hasattr(self, 'event_logger') and self.event_logger and getattr(self.event_logger, 'enabled', False)
-
-                # Log STEP_START event
-                if event_logger_enabled:
-                    try:
-                        # Extract config metadata
-                        config_snapshot_path = lineage_context.get("config_snapshot_path")
-                        config_hash = lineage_context.get("config_hash")
-                        
-                        # Log step start event
-                        self.event_logger.log_event(
-                            EventType.STEP_START,
-                            {
-                                "step_type": self._get_agent_name(),
-                                "context_keys": list(lineage_context.keys()),
-                                "agent_id": self.agent_id
-                            },
-                            step_name=self._get_agent_name(),
-                            parent_id=parent_id,
-                            config_snapshot_path=config_snapshot_path,
-                            config_hash=config_hash
-                        )
-                        self.logger.info("event_logger.step_start_logged",
-                                         agent=self._get_agent_name(),
-                                         agent_execution_id=agent_execution_id)
-                    except Exception as e:
-                        self.logger.error("event_logger.step_start_failed",
-                                          error=str(e),
-                                          error_type=type(e).__name__,
-                                          agent=self._get_agent_name(),
-                                          agent_execution_id=agent_execution_id)
-
                 # Get completion with automatic continuation handling (calls BaseLLM method)
                 # Pass lineage_context to support runtime configuration overrides
                 content, raw_response = self._get_completion_with_continuation(
@@ -402,63 +342,7 @@ class BaseAgent(BaseConfig, BaseLLM):
                 # Calculate metrics
                 response_metrics = {"token_usage": getattr(raw_response, 'usage', {})}
 
-                # Log STEP_END event
-                if event_logger_enabled:
-                    try:
-                        # Extract config metadata
-                        config_snapshot_path = lineage_context.get("config_snapshot_path")
-                        config_hash = lineage_context.get("config_hash")
-                        
-                        # Create a more detailed event payload similar to the original BaseLineage
-                        event_payload = {
-                            "step_type": self._get_agent_name(),
-                            "agent_response_summary": {
-                                "success": True,
-                                "content": processed_data.get("response", "")
-                            },
-                            "metrics": response_metrics,
-                            "llm_input": {
-                                "system_message": messages.system,
-                                "user_message": messages.user,
-                                "formatted_request": messages.formatted_request if hasattr(messages, "formatted_request") else ""
-                            },
-                            # Store the full raw response to preserve all data
-                            "llm_output": self.event_logger._serialize_value(raw_response),
-                            # Store model information
-                            "llm_model": {
-                                "provider": self.provider.value if hasattr(self, 'provider') else "unknown",
-                                "model": self.model if hasattr(self, 'model') else "unknown"
-                            },
-                            # Include the full context for completeness
-                            "input_context": lineage_context
-                        }
-                        
-                        # Log the comprehensive event
-                        self.event_logger.log_event(
-                            EventType.STEP_END,
-                            event_payload,
-                            step_name=self._get_agent_name(),
-                            parent_id=parent_id,
-                            config_snapshot_path=config_snapshot_path,
-                            config_hash=config_hash
-                        )
-                        self.logger.info("event_logger.step_end_logged",
-                                         agent=self._get_agent_name(),
-                                         agent_execution_id=agent_execution_id)
-                    except Exception as e:
-                        self.logger.error("event_logger.step_end_failed",
-                                          error=str(e),
-                                          error_type=type(e).__name__,
-                                          agent=self._get_agent_name(),
-                                          agent_execution_id=agent_execution_id)
-                else:
-                    # Log when event logging is skipped
-                    self.logger.debug("event_logger.tracking_skipped",
-                                     has_event_logger=hasattr(self, 'event_logger'),
-                                     event_logger_enabled=getattr(self.event_logger, 'enabled', False) if hasattr(self, 'event_logger') else False,
-                                     agent=self._get_agent_name())
-
-                # Return successful response with lineage tracking metadata
+                # Return successful response with lineage tracking metadatae tracking metadata
                 return AgentResponse(
                     success=True,
                     data=processed_data,
@@ -468,49 +352,6 @@ class BaseAgent(BaseConfig, BaseLLM):
                     metrics=response_metrics
                 )
             except Exception as e:
-                # Log ERROR_EVENT
-                if event_logger_enabled:
-                    try:
-                        # Extract config metadata
-                        config_snapshot_path = lineage_context.get("config_snapshot_path")
-                        config_hash = lineage_context.get("config_hash")
-                        
-                        # Create a comprehensive error event payload
-                        error_payload = {
-                            "error_message": str(e),
-                            "error_type": type(e).__name__,
-                            "traceback": traceback.format_exc(),
-                            "location": self._get_agent_name(),
-                            "llm_input": {
-                                "system_message": messages.system,
-                                "user_message": messages.user,
-                                "formatted_request": messages.formatted_request if hasattr(messages, "formatted_request") else ""
-                            },
-                            "llm_model": {
-                                "provider": self.provider.value if hasattr(self, 'provider') else "unknown",
-                                "model": self.model if hasattr(self, 'model') else "unknown"
-                            },
-                            # Include the full context for completeness
-                            "input_context": lineage_context
-                        }
-                        
-                        # Log error event
-                        self.event_logger.log_event(
-                            EventType.ERROR_EVENT,
-                            error_payload,
-                            step_name=self._get_agent_name(),
-                            parent_id=parent_id,
-                            config_snapshot_path=config_snapshot_path,
-                            config_hash=config_hash
-                        )
-                        self.logger.info("event_logger.error_event_logged",
-                                        agent=self._get_agent_name(),
-                                        agent_execution_id=agent_execution_id)
-                    except Exception as event_logger_error:
-                        self.logger.error("event_logger.error_event_failed",
-                                        error=str(event_logger_error),
-                                        original_error=str(e))
-
                 self.logger.error("llm.completion_failed",
                         error=str(e),
                         agent_execution_id=agent_execution_id,
@@ -652,3 +493,10 @@ class BaseAgent(BaseConfig, BaseLLM):
         except Exception as e:
              self.logger.error("format_request.failed", error=str(e))
              return str(data) # Ultimate fallback
+             
+    def _get_agent_name(self) -> str:
+        """
+        Return the unique name of this agent.
+        Overrides the placeholder in BaseLLM to return the actual agent name.
+        """
+        return self.unique_name
