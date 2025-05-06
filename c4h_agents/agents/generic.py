@@ -1566,7 +1566,6 @@ If you can't solve the full problem, solve a simpler subset rather than failing 
             self.logger.info("fallback_agent.handling_previous_error", 
                           error=self.previous_error)
         
-        #
         # Check for skill configuration - same as GenericLLMAgent
         agent_config = self.config_node.get_value(self.config_path)
         skill_identifier = None

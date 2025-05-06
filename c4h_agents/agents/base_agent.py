@@ -1,7 +1,7 @@
 # File: /Users/jim/src/apps/c4h_ai_dev/c4h_agents/agents/base_agent.py
 # Corrections for errors related to 'config' and 'agent_name' scope
 
-# Necessary Imports (ensure these are present)
+# Necessary Imports
 import json
 import uuid
 import traceback
@@ -967,7 +967,7 @@ class BaseAgent(BaseConfig, BaseLLM):
 
         # If lineage context fails, fall back to original context
         return skill_context
-        
+    
     def _invoke_skill(self, skill_identifier: str, skill_kwargs: Dict[str, Any]) -> SkillResult:
         """
         Dynamically invoke a skill by identifier.
@@ -1022,7 +1022,7 @@ class BaseAgent(BaseConfig, BaseLLM):
                                   module=module_path, 
                                   error=str(e))
                 return SkillResult(
-                    success=False, 
+                    success=False,
                     error=f"Failed to import skill module '{module_path}': {str(e)}"
                 )
             except AttributeError as e:
