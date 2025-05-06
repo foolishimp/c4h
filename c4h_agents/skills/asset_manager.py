@@ -129,7 +129,7 @@ class AssetManager(BaseSkill):
             
         Returns:
             SkillResult with the operation outcome
-        """
+        """        
         # Extract parameters
         action = kwargs.get('action', 'info')
         path_str = kwargs.get('path')
@@ -165,21 +165,21 @@ class AssetManager(BaseSkill):
         # Dispatch to appropriate method based on action
         try:
             if action == 'read':
-                return self._handle_errors(self._read_file, path)
+                result = self._handle_errors(self._read_file, path)
             elif action == 'write':
-                return self._handle_errors(self._write_file, path, content)
+                result = self._handle_errors(self._write_file, path, content)
             elif action == 'backup':
-                return self._handle_errors(self._backup_file, path)
+                result = self._handle_errors(self._backup_file, path)
             elif action == 'delete':
-                return self._handle_errors(self._delete_file, path)
+                result = self._handle_errors(self._delete_file, path)
             elif action == 'info':
-                return self._handle_errors(self._get_file_info, path)
+                result = self._handle_errors(self._get_file_info, path)
             elif action == 'list':
-                return self._handle_errors(self._list_directory, path)
+                result = self._handle_errors(self._list_directory, path)
             else:
-                return SkillResult(
+                result = SkillResult(
                     success=False,
-                    error=f"Unsupported action: {action}"
+                    error=f"Unsupported action: {action}",
                 )
         except Exception as e:
             self.logger.error("asset_manager.execute_failed", 
@@ -187,10 +187,11 @@ class AssetManager(BaseSkill):
                            path=str(path), 
                            error=str(e))
             return SkillResult(
-                success=False,
-                error=f"Operation failed: {str(e)}"
+               success=False,
+               error=f"Operation failed: {str(e)}"
             )
-            
+        
+        return result
     def _get_file_info(self, path: Path) -> SkillResult:
         """Get information about a file or directory"""
         asset_path = AssetPath.from_path(path)

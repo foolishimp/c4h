@@ -1,4 +1,3 @@
-# Path: /Users/jim/src/apps/c4h/c4h_agents/skills/semantic_iterator.py
 """
 Semantic iterator with improved preprocessing for more reliable extraction.
 Path: c4h_agents/skills/semantic_iterator.py
@@ -8,6 +7,8 @@ from typing import List, Dict, Any, Optional, Iterator, Union
 from dataclasses import dataclass
 import json
 import re
+from c4h_agents.skills.base_skill import BaseSkill, SkillProtocol
+from c4h_agents.agents.types import SkillResult
 # Ensure locate_config is imported if needed, or rely on BaseAgent's config handling
 from c4h_agents.config import locate_config 
 from c4h_agents.agents.base_agent import BaseAgent, AgentResponse 
@@ -82,6 +83,32 @@ class SemanticIterator(BaseAgent):
     def _get_agent_name(self) -> str:
         """Get agent name for config lookup"""
         return "semantic_iterator"
+        
+    def execute(self, **kwargs) -> SkillResult:
+        """
+        Execute the iterator following the SkillProtocol contract.
+        
+        Args:
+            input_data: Content to extract items from
+            **kwargs: Additional parameters
+            
+        Returns:
+            SkillResult with extraction results or error information
+        """
+        try:
+            # Call process method which performs the extraction
+            response = self.process(kwargs)
+            
+            if not response.success:
+                return SkillResult(
+                    success=False,
+                    error=response.error or "Extraction failed"
+                )
+                
+            return SkillResult(success=True, value=response.data.get("results", []))
+        except Exception as e:
+            logger.error("iterator.execute_failed", error=str(e), exc_info=True)
+            return SkillResult(success=False, error=f"Iterator execution failed: {str(e)}")
 
     def _preprocess_content(self, content: Any) -> str:
         """
@@ -389,3 +416,5 @@ class SemanticIterator(BaseAgent):
         
     # The deprecated 'configure' method has been removed.
     # Use 'process' with appropriate context instead.
+===CHANGE_END===
+===CHANGE_END===

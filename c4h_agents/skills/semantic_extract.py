@@ -6,7 +6,9 @@ Path: src/skills/semantic_extract.py
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime
-from c4h_agents.agents.base_agent import BaseAgent, AgentResponse 
+from c4h_agents.agents.base_agent import BaseAgent, AgentResponse
+from c4h_agents.skills.base_skill import BaseSkill, SkillProtocol
+from c4h_agents.agents.types import SkillResult
 from c4h_agents.skills.shared.markdown_utils import extract_code_block, is_code_block
 from c4h_agents.utils.logging import get_logger
 
@@ -30,6 +32,29 @@ class SemanticExtract(BaseAgent):
 
     def _get_agent_name(self) -> str:
         return "semantic_extract"
+
+    def execute(self, **kwargs) -> SkillResult:
+        """
+        Execute extraction operation following the SkillProtocol contract.
+        
+        Args:
+            content: Content to extract from
+            instruction: Instruction for extraction
+            format_hint: Format hint for extraction
+            **kwargs: Additional parameters
+            
+        Returns:
+            SkillResult with extracted content or error information
+        """
+        try:
+            content = kwargs.get('content')
+            instruction = kwargs.get('instruction', '')
+            format_hint = kwargs.get('format_hint', 'default')
+            extract_result = self.extract(content, instruction, format_hint, **kwargs)
+            return SkillResult(success=extract_result.success, value=extract_result.value, error=extract_result.error)
+        except Exception as e:
+            logger.error("extract.execute_failed", error=str(e))
+            return SkillResult(success=False, error=f"Extraction failed: {str(e)}")
 
     def _format_request(self, context: Dict[str, Any]) -> str:
         """Format extraction request using config template"""

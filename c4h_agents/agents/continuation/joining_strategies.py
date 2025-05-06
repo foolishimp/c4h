@@ -26,23 +26,35 @@ def join_with_explicit_overlap(previous: str, current: str, explicit_overlap: st
         (joined_content, success) tuple
     """
     try:
+        # Clean any potential marker text that might have been included
+        current_cleaned = current
+        markers = ["```repeat_exactly", "```previous", "```"]
+        for marker in markers:
+            current_cleaned = current_cleaned.replace(marker, "")
+        
         # Find the overlap position
-        success, position = find_explicit_overlap(previous, current, explicit_overlap, requested_size, logger)
+        success, position = find_explicit_overlap(previous, current_cleaned, explicit_overlap, requested_size, logger)
         
         if success and position > 0:
             # Join the content at the identified position
-            joined_content = previous + current[position:]
+            joined_content = previous + current_cleaned[position:]
             logger.debug("Successfully joined with explicit overlap", 
-                        overlap_size=position, joined_length=len(joined_content)) # Pass directly
+                        overlap_size=position, joined_length=len(joined_content))
             return joined_content, True
             
         # If explicit overlap matching failed, try some simple structural heuristics
         # This can handle case where the LLM didn't repeat properly but continued sensibly
         
-        if _is_valid_append_point(previous, current):
-            logger.info("Used structural heuristics for joining", #
-                       method="valid_append_point") # Removed 'extra'
-            return previous + current, True
+        if _is_valid_append_point(previous, current_cleaned):
+            logger.info("Used structural heuristics for joining",
+                       method="valid_append_point")
+            return previous + current_cleaned, True
+            
+        # Try a more aggressive approach to find the overlap if all else fails
+        if explicit_overlap in current_cleaned:
+            position = current_cleaned.find(explicit_overlap) + len(explicit_overlap)
+            logger.info("Found overlap using direct search as fallback")
+            return previous + current_cleaned[position:], True
             
         # If no matches at all, we return failure
         logger.warning("Could not join content with any method")
@@ -50,7 +62,7 @@ def join_with_explicit_overlap(previous: str, current: str, explicit_overlap: st
         
     except Exception as e:
         logger.error("Join with explicit overlap failed",
-                    error=str(e), # Pass directly
+                    error=str(e),
                     stack_trace=traceback.format_exc())
         return previous, False
 

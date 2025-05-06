@@ -5,7 +5,9 @@ Path: c4h_agents/skills/semantic_merge.py
 
 from typing import Dict, Any, Optional
 from pathlib import Path
-from c4h_agents.agents.base_agent import BaseAgent, AgentResponse 
+from c4h_agents.agents.base_agent import BaseAgent, AgentResponse
+from c4h_agents.skills.base_skill import BaseSkill, SkillProtocol
+from c4h_agents.agents.types import SkillResult
 from c4h_agents.config import locate_config
 from c4h_agents.utils.logging import get_logger
 
@@ -13,6 +15,27 @@ logger = get_logger()
 
 class SemanticMerge(BaseAgent):
     """Handles merging of code modifications."""
+    
+    def execute(self, **kwargs) -> SkillResult:
+        """
+        Execute merge operation following the SkillProtocol contract.
+        
+        Args:
+            **kwargs: Parameters including file_path, diff, content, type, etc.
+            
+        Returns:
+            SkillResult with the merged content or error information
+        """
+        try:
+            agent_response = self.process(kwargs)
+            return SkillResult(
+                success=agent_response.success,
+                value=agent_response.data.get("response", ""),
+                error=agent_response.error
+            )
+        except Exception as e:
+            logger.error("merge.execute_failed", error=str(e))
+            return SkillResult(success=False, error=f"Merge execution failed: {str(e)}")
     
     def __init__(self, config: Dict[str, Any] = None):
         """Initialize merger with configuration."""

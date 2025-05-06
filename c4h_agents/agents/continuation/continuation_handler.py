@@ -189,6 +189,9 @@ class ContinuationHandler:
             if requires_json_cleaning(accumulated_content):
                 accumulated_content = clean_json_content(accumulated_content, self.logger)
             
+            # Clean up final accumulated content by removing any marker text
+            accumulated_content = self._clean_marker_text(accumulated_content)
+            
             # Update final response's content ONLY if final_response is valid
             if final_response and hasattr(final_response, 'choices') and final_response.choices:
                  if hasattr(final_response.choices[0], 'message'):
@@ -199,7 +202,6 @@ class ContinuationHandler:
                  else:
                       self.logger.warning("Could not update final response content, message structure missing", response_obj=final_response)
 
-            # Fixed syntax error here
             self.logger.info("Continuation process completed",
                            attempts=attempt, metrics=self.metrics, 
                            content_length=len(accumulated_content))
@@ -218,27 +220,38 @@ class ContinuationHandler:
         try:
             overlap_len = len(explicit_overlap) if explicit_overlap else 0
             prompt = f"""
-I need you to continue the previous response that was interrupted due to length limits.
-HERE IS THE END OF YOUR PREVIOUS RESPONSE:
-------------BEGIN PREVIOUS CONTENT------------
+I need you to continue code that was interrupted due to length limits.
+
+HERE IS THE END OF THE PREVIOUS CONTENT:
+```previous
 {context_window}
-------------END PREVIOUS CONTENT------------
+```
 
 CRITICAL CONTINUATION INSTRUCTIONS:
-1. First, repeat these EXACT {overlap_len} characters:
-------------OVERLAP TO REPEAT------------
+1. First, analyze the code to detect its language and structure
+   - Is it Python? Look for indentation, def/class keywords, colons followed by indented blocks
+   - Is it JavaScript/TypeScript? Look for braces, function/const/let keywords, semicolons
+   - Is it JSON? Look for strict object/array notation with double quotes
+   - Is it Markdown? Look for heading markers, list items, code blocks
+
+2. Then, repeat EXACTLY (character for character) this text:
+```repeat_exactly
 {explicit_overlap}
-------------END OVERLAP------------
+```
 
-2. Then continue seamlessly from that point
-3. Maintain identical style, formatting and organization
-4. If in the middle of a code block, function, or component, respect its structure
+3. Continue the code seamlessly from that point, maintaining:
+   - FOR PYTHON: Exact indentation is critical; watch for open blocks after colons
+   - FOR JAVASCRIPT: Ensure all braces, parentheses, and quotes are balanced
+   - FOR JSON: Maintain strict JSON format with double quotes and proper comma placement
+   - FOR ALL LANGUAGES: Ensure proper closing of all open structures
 
-Begin by repeating the overlap text exactly, then continue:
+DO NOT include the ```repeat_exactly marker or any other markers in your response.
+Output ONLY the continuation starting with the exact overlap text.
+
+Begin your response now with the exact overlap text and continue:
 """
             return prompt
         except Exception as e:
-            # Fixed syntax error here
             self.logger.error("Prompt creation failed",
                               error=str(e), stack_trace=traceback.format_exc())
             return f"Continue precisely from: {explicit_overlap}" # Fallback prompt
@@ -316,7 +329,34 @@ Begin by repeating the overlap text exactly, then continue:
             self.logger.warning("No valid content structure found in LLM response", response_obj=response)
             return ""
         except Exception as e:
-             # Fixed syntax error here
              self.logger.error("Content extraction failed in _get_content_from_response",
                              error=str(e), stack_trace=traceback.format_exc())
              return ""
+             
+    def _clean_marker_text(self, content: str) -> str:
+        """Remove any marker text that might have been included."""
+        try:
+            cleaned = content
+            
+            # Remove marker patterns
+            markers = [
+                "```repeat_exactly", 
+                "```previous",
+                "```", 
+                "------------END OVERLAP------------",
+                "------------OVERLAP TO REPEAT------------", 
+            ]
+            
+            # Check line by line to remove any lines that contain markers
+            lines = cleaned.split('\n')
+            cleaned_lines = []
+            
+            for line in lines:
+                if not any(marker in line for marker in markers):
+                    cleaned_lines.append(line)
+            
+            return '\n'.join(cleaned_lines)
+        except Exception as e:
+            self.logger.error("Error cleaning response artifacts", 
+                           error=str(e), stack_trace=traceback.format_exc())
+            return content  # Return original if cleaning fails
