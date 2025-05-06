@@ -390,6 +390,7 @@ class GenericSingleShotAgent(GenericLLMAgent):
         if (self.unique_name == "discovery_phase" or 
             self.config_path.endswith(".discovery") or 
             "discovery" in self.unique_name):
+------------END OVERLAP------------
             
             # Get tartxt_config from context override or persona
             tartxt_config = None
@@ -759,7 +760,9 @@ class GenericOrchestratorAgent(BaseAgent):
         # Check for execution plan override in context
         execution_plan = None
         if context and "agent_config_overrides" in context:
-            overrides = context["agent_config_overrides"].get(self.unique_name, {})
+            overrides = context["agent_
+------------END OVERLAP------------
+config_overrides"].get(self.unique_name, {})
             if "execution_plan" in overrides:
                 execution_plan = overrides["execution_plan"]
                 self.logger.info("orchestration.using_override_plan", 
@@ -1159,6 +1162,8 @@ class GenericOrchestratorAgent(BaseAgent):
                             "field": field,
                             "error": str(e),
                             "timestamp": datetime.now(timezone.utc).isoformat()
+                        
+------------END OVERLAP------------
                         })
                 
                 else:
@@ -1206,8 +1211,8 @@ class GenericOrchestratorAgent(BaseAgent):
                 error=str(e)
             )
 
-# Note: GenericOrchestratingAgent has been removed.
-# Use GenericOrchestratorAgent directly instead.
+# Note: GenericOrchestratingAgent (previously requested in WO-trefac-01) has been renamed to GenericOrchestratorAgent.
+# Use GenericOrchestratorAgent directly instead as it provides the same functionality with a more consistent naming pattern.
 
 
 class GenericSkillAgent(BaseAgent):
@@ -1566,6 +1571,9 @@ If you can't solve the full problem, solve a simpler subset rather than failing 
             self.logger.info("fallback_agent.handling_previous_error", 
                           error=self.previous_error)
         
+        #
+------------END OVERLAP------------
+
         # Check for skill configuration - same as GenericLLMAgent
         agent_config = self.config_node.get_value(self.config_path)
         skill_identifier = None
@@ -1699,3 +1707,4 @@ If you can't solve the full problem, solve a simpler subset rather than failing 
             }
             
         return response
+}}

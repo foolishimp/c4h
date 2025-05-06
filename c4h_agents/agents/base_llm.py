@@ -514,7 +514,18 @@ class BaseLLM:
 
 
     def _should_log(self, level: LogDetail) -> bool:
-        """Check if current log level includes the specified detail level"""
+        """
+        Check if current log level includes the specified detail level.
+        
+        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
+        It provides standard log level comparison logic for all agent types.
+        
+        Args:
+            level: The detail level to check against the current log level
+            
+        Returns:
+            True if the current log level includes the specified detail level
+        """
         current_log_level = getattr(self, 'log_level', LogDetail.BASIC)
         log_levels = {
             LogDetail.MINIMAL: 0,
@@ -526,6 +537,14 @@ class BaseLLM:
         return log_levels.get(target_level, 0) <= log_levels.get(current_log_level, 1)
 
     def _get_agent_name(self) -> str:
-        """Placeholder: Get the agent name"""
-        # Subclasses like BaseAgent should provide a more specific name
+        """
+        Placeholder method to get the agent name.
+        
+        This method is expected to be overridden by BaseAgent to return the unique agent name.
+        When invoked directly on BaseLLM, it returns a fallback value.
+        
+        Returns:
+            A string representation of the agent name
+        """
+        # When implemented in BaseAgent, should return self.unique_name
         return "base_llm"

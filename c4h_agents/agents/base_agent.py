@@ -199,7 +199,16 @@ class BaseAgent(BaseConfig, BaseLLM):
 
 
     def _get_workflow_run_id(self) -> Optional[str]:
-        """Extract workflow run ID from configuration using hierarchical path queries"""
+        """
+        Extract workflow run ID from configuration using hierarchical path queries.
+        
+        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
+        It provides standard configuration path resolution for workflow run IDs.
+        The hierarchical search ensures compatibility with various configuration structures.
+        
+        Returns:
+            Workflow run ID or None if not found
+        """
         # Check hierarchical sources in order of priority
         # Ensure self.config_node is used
         run_id = (
@@ -215,13 +224,36 @@ class BaseAgent(BaseConfig, BaseLLM):
         return None
 
     def process(self, context: Dict[str, Any]) -> AgentResponse:
-        """Main process entry point"""
+        """
+        Main process entry point for handling requests.
+        
+        This is the primary method that MAY be overridden by specific agent implementations.
+        It will fall back to a simple LLM interaction via _process(context) if not overridden.
+        
+        Note: Even when overriding this method, implementations should generally use the
+        persona-based configuration approach rather than hardcoding prompts or behavior.
+        
+        Args:
+            context: Input context containing data for processing
+            
+        Returns:
+            Standard AgentResponse with results
+        """
         return self._process(context)
 
     def _prepare_lineage_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
         Prepare context with appropriate lineage tracking IDs.
         Ensures each execution has proper parent-child relationships.
+        
+        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
+        It provides standard lineage context handling that works for all agent types.
+        
+        Args:
+            context: The original context dictionary
+            
+        Returns:
+            Context with added lineage tracking identifiers
         """
         # Extract workflow run ID from context or config
         workflow_run_id = context.get("workflow_run_id", self.run_id)
@@ -253,6 +285,27 @@ class BaseAgent(BaseConfig, BaseLLM):
             )
 
     def _process(self, context: Dict[str, Any]) -> AgentResponse:
+        """
+        Core internal processing method for agent functionality.
+        
+        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
+        The core process logic is standardized for all agents, following these steps:
+        1. Prepare lineage context tracking
+        2. Extract primary data
+        3. Get prompts and messages from configuration
+        4. Call LLM with appropriate logging and error handling
+        5. Process and return response
+        
+        Instead of overriding this method, agent implementations should override the public
+        'process' method to add specialized pre/post processing while still leveraging this
+        core implementation when needed.
+        
+        Args:
+            context: Context dictionary with request information
+            
+        Returns:
+            AgentResponse with results from the LLM interaction
+        """
         try:
             if self._should_log(LogDetail.DETAILED): # Use self.logger below
                 self.logger.info("agent.processing", context_keys=list(context.keys()) if context else None)
@@ -486,7 +539,18 @@ class BaseAgent(BaseConfig, BaseLLM):
             return AgentResponse(success=False, data={}, error=str(e))
 
     def _get_data(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """Extracts primary data payload, ensuring it's a dictionary."""
+        """
+        Extracts primary data payload, ensuring it's a dictionary.
+        
+        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
+        It provides standard data extraction that works for all agent types.
+        
+        Args:
+            context: The context dictionary to extract data from
+            
+        Returns:
+            Dictionary containing the primary payload data
+        """
         # Use self.logger which should be initialized
         logger_to_use = self.logger
         try:
@@ -508,6 +572,11 @@ class BaseAgent(BaseConfig, BaseLLM):
     def _format_request(self, data: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> str:
          """
          Format request with support for dynamic overrides.
+         
+         IMPORTANT: This uses standard configuration paths and template formatting.
+         This method is NOT intended to be overridden in the generic agent model.
+         All formatting templates are sourced from the persona configuration or runtime overrides,
+         NOT from agent class-specific implementations.
          
          Args:
              data: The data to format
@@ -563,80 +632,105 @@ class BaseAgent(BaseConfig, BaseLLM):
               self.logger.error("format_request.failed", error=str(e))
               return str(data) # Ultimate fallback
 
-    # --- THIS IS THE OVERRIDDEN METHOD IN BaseAgent ---
-    # --- Includes fix for nested 'response' and 'llm_output' ---
     def _get_llm_content(self, response: Any) -> Any:
-        """Extract content from LLM response or context data with robust error handling."""
+        """
+        Extract content from LLM response or context data with robust error handling.
+        
+        This method provides comprehensive content extraction from various LLM response formats.
+        It robustly handles different response structures including standard LLM objects, 
+        strings, nested dictionaries, and more.
+        
+        While agent implementations MAY override this method for highly specialized content 
+        extraction, the base implementation is quite robust and should handle most cases.
+        
+        Args:
+            response: The raw response from an LLM or other response object
+            
+        Returns:
+            Extracted content in string format
+        """
         logger_to_use = getattr(self, 'logger', get_logger())
         response_repr = repr(response)
-        logger_to_use.debug("_get_llm_content.received (BaseAgent)",
+        logger_to_use.debug("_get_llm_content.received",
                      input_type=type(response).__name__,
                      input_repr_preview=response_repr[:200] + "..." if len(response_repr) > 200 else response_repr)
         try:
             # 1. Handle standard LLM response objects
             if hasattr(response, 'choices') and response.choices:
-                logger_to_use.debug("_get_llm_content.checking_choices (BaseAgent)")
+                logger_to_use.debug("_get_llm_content.checking_choices")
                 if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
                     content = response.choices[0].message.content
-                    logger_to_use.debug("content.extracted_from_model (BaseAgent)", content_length=len(content) if content else 0)
+                    logger_to_use.debug("content.extracted_from_model", content_length=len(content) if content else 0)
                     return content
                 elif hasattr(response.choices[0], 'delta') and hasattr(response.choices[0].delta, 'content'):
                     content = response.choices[0].delta.content
-                    logger_to_use.debug("content.extracted_from_delta (BaseAgent)", content_length=len(content) if content else 0)
+                    logger_to_use.debug("content.extracted_from_delta", content_length=len(content) if content else 0)
                     return content
 
             # 2. Handle direct string input
             if isinstance(response, str):
-                logger_to_use.debug("content.extracted_direct_string (BaseAgent)", content_length=len(response))
+                logger_to_use.debug("content.extracted_direct_string", content_length=len(response))
                 return response
 
             # 3. Handle dictionary inputs
             if isinstance(response, dict):
-                logger_to_use.debug("_get_llm_content.checking_dict_keys (BaseAgent)", keys=list(response.keys()))
+                logger_to_use.debug("_get_llm_content.checking_dict_keys", keys=list(response.keys()))
 
                 # Check nested {'response': {'content': '...'}} structure FIRST
                 if 'response' in response:
                     response_val = response['response']
-                    logger_to_use.debug("_get_llm_content.found_response_key (BaseAgent)", response_val_type=type(response_val).__name__)
+                    logger_to_use.debug("_get_llm_content.found_response_key", response_val_type=type(response_val).__name__)
                     if isinstance(response_val, str):
-                        logger_to_use.debug("content.extracted_from_dict_response_key (string, BaseAgent)", content_length=len(response_val))
+                        logger_to_use.debug("content.extracted_from_dict_response_key", content_length=len(response_val))
                         return response_val
                     elif isinstance(response_val, dict) and 'content' in response_val:
                          content_val = response_val['content']
                          if isinstance(content_val, str):
-                              logger_to_use.debug("content.extracted_from_nested_dict_response_content_key (BaseAgent)", content_length=len(content_val))
+                              logger_to_use.debug("content.extracted_from_nested_dict_response_content_key", content_length=len(content_val))
                               return content_val
                          else:
-                              logger_to_use.warning("_get_llm_content.nested_content_not_string (BaseAgent)", nested_content_type=type(content_val).__name__)
+                              logger_to_use.warning("_get_llm_content.nested_content_not_string", nested_content_type=type(content_val).__name__)
                     # Fall through if response['response'] is dict but has no 'content'
 
                 # Check for {'content': '...'}
                 if 'content' in response and isinstance(response['content'], str):
-                     logger_to_use.debug("content.extracted_from_dict_content_key (BaseAgent)", content_length=len(response['content']))
+                     logger_to_use.debug("content.extracted_from_dict_content_key", content_length=len(response['content']))
                      return response['content']
 
                 # Check for apply_diff structure {'llm_output': {'content': '...'}}
                 if 'llm_output' in response and isinstance(response['llm_output'], dict):
-                    logger_to_use.debug("_get_llm_content.checking_dict_llm_output_key (BaseAgent)", llm_output_keys=list(response['llm_output'].keys()))
+                    logger_to_use.debug("_get_llm_content.checking_dict_llm_output_key", llm_output_keys=list(response['llm_output'].keys()))
                     if 'content' in response['llm_output'] and isinstance(response['llm_output']['content'], str):
-                         logger_to_use.debug("content.extracted_from_dict_llm_output_content_key (BaseAgent)", content_length=len(response['llm_output']['content']))
+                         logger_to_use.debug("content.extracted_from_dict_llm_output_content_key", content_length=len(response['llm_output']['content']))
                          return response['llm_output']['content']
 
             # 4. Last resort fallback - convert to string
             result = str(response)
-            logger_to_use.warning("content.extraction_fallback (BaseAgent)",
+            logger_to_use.warning("content.extraction_fallback",
                         response_type=type(response).__name__,
                         content_preview=result[:100] if len(result) > 100 else result)
             return result
 
         except Exception as e:
-            logger_to_use.error("content_extraction.failed (BaseAgent)", error=str(e), exc_info=True)
+            logger_to_use.error("content_extraction.failed", error=str(e), exc_info=True)
             return str(response)
 
 
-    # Example: Assuming the error is in _process_response
     def _process_response(self, content: str, raw_response: Any) -> Dict[str, Any]:
-        """Process LLM response into standard format without duplicating raw output"""
+        """
+        Process LLM response into standard format.
+        
+        This method provides basic processing of LLM responses into a standard dictionary format.
+        Advanced agent implementations may override this method to provide specialized response 
+        processing, but should maintain compatibility with the expected return format.
+        
+        Args:
+            content: The content string from the LLM
+            raw_response: The raw response object from the LLM
+            
+        Returns:
+            Dictionary containing processed response data
+        """
         # Use self.logger which should be initialized in BaseAgent __init__
         logger_to_use = self.logger # Use the instance logger
         try:
@@ -677,12 +771,29 @@ class BaseAgent(BaseConfig, BaseLLM):
             }
 
     def _get_required_keys(self) -> List[str]:
-        # Can be overridden by subclasses if they require specific keys in context
+        """
+        Returns required keys for context validation.
+        
+        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
+        In the persona-based configuration approach, required keys should be specified in 
+        the persona configuration, not through class-specific overrides.
+        
+        Returns:
+            List of required keys for context validation
+        """
         return []
 
     def _get_agent_name(self) -> str:
-        # This method now returns the unique name assigned during instantiation
-        # Ensure self.unique_name is set in __init__
+        """
+        Returns the unique name assigned to this agent instance.
+        
+        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
+        In the persona-based configuration approach, the agent name comes from the unique_name 
+        parameter provided during instantiation, NOT from class-specific overrides.
+        
+        Returns:
+            The unique name of this agent instance
+        """
         if hasattr(self, 'unique_name') and self.unique_name:
              return self.unique_name
         else:
@@ -702,6 +813,11 @@ class BaseAgent(BaseConfig, BaseLLM):
     def _get_system_message(self, context: Optional[Dict[str, Any]] = None) -> str:
         """
         Get system message with support for dynamic overrides.
+        
+        IMPORTANT: This uses standard configuration paths based on unique_name and persona_key.
+        This method is NOT intended to be overridden in the generic agent model.
+        All configuration is sourced from the persona configuration or runtime overrides,
+        NOT from agent class-specific implementations.
         
         Args:
             context: Optional runtime context that may contain overrides
@@ -748,6 +864,11 @@ class BaseAgent(BaseConfig, BaseLLM):
     def _get_prompt(self, prompt_type: str, context: Optional[Dict[str, Any]] = None) -> str:
         """
         Get a prompt template with support for dynamic overrides.
+        
+        IMPORTANT: This uses standard configuration paths based on unique_name and persona_key.
+        This method is NOT intended to be overridden in the generic agent model.
+        All prompt templates are sourced from the persona configuration or runtime overrides,
+        NOT from agent class-specific implementations.
         
         Args:
             prompt_type: Type of prompt to retrieve (e.g., 'user')
@@ -803,6 +924,10 @@ class BaseAgent(BaseConfig, BaseLLM):
     def call_skill(self, skill_name: str, skill_context: Dict[str, Any]) -> Dict[str, Any]:
         """
         Call a skill with proper lineage tracking.
+        
+        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
+        It provides standard lineage tracking for skill calls that works for all agent types.
+        
         Args:
             skill_name: Name of the skill to call
             skill_context: Context to pass to the skill
@@ -846,6 +971,9 @@ class BaseAgent(BaseConfig, BaseLLM):
     def _invoke_skill(self, skill_identifier: str, skill_kwargs: Dict[str, Any]) -> SkillResult:
         """
         Dynamically invoke a skill by identifier.
+        
+        IMPORTANT: This method is NOT intended to be overridden in the generic agent model.
+        It provides standard skill invocation logic for all agent types.
         
         Args:
             skill_identifier: String in format "module.Class.method" or "module.Class"
