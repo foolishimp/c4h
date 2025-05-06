@@ -1,7 +1,7 @@
 """
 Event logger for comprehensive workflow execution tracking.
 
-This module provides a centralized mechanism for capturing workflow
+This module provides a centralized mechanism for capturing workflow 
 execution details for observability, debuggability, reproducibility,
 and auditability purposes.
 """
@@ -22,6 +22,8 @@ try:
     OPENLINEAGE_AVAILABLE = True
 except ImportError:
     OPENLINEAGE_AVAILABLE = False
+    # Define stubs for type checking when OpenLineage is not available
+    RunEvent = RunState = InputDataset = OutputDataset = ParentRunFacet = DocumentationJobFacet = object
 
 # Import logging utilities
 from c4h_agents.utils.logging import get_logger
@@ -58,7 +60,7 @@ class EventLogger:
         """
         Initialize the event logger.
         
-        Args:
+        Args: 
             config: Configuration for the event logger, including paths and backends
             run_id: The workflow run ID (will be reformatted to wf_HHMMSS_UUID if needed)
         """
@@ -381,9 +383,7 @@ class EventLogger:
                 # Standard LLM response format
                 if hasattr(value.choices[0], 'message') and hasattr(value.choices[0].message, 'content'):
                     response_data = {
-                        "content": value.choices[0].message.content,
-                        "finish_reason": getattr(value.choices[0], 'finish_reason', None),
-                        "model": getattr(value, 'model', None)
+                                  "model": getattr(value, 'model', None)
                     }
                     
                     # Add usage if available
