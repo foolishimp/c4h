@@ -10,24 +10,36 @@ execution_plan:
       type: "skill"
       skill: "semantic_iterator"
       params:
-        content: "{{context.input_data.response}}"
-        format: "solution_design"
+        input_data: "{{context.input_data.response}}"
+        format: "json"
       output_field: "iterator_result"
     
-    - name: "process_changes"
-      type: "loop"
-      iterate_on: "iterator_result.value"
-      loop_variable: "current_change"
-      body:
-        - name: "apply_single_change" 
-          type: "skill"
-          skill: "asset_manager"
-          params:
-            file_path: "{{current_change.file_path}}"
-            content: "{{current_change.content}}"
-            type: "{{current_change.type}}"
-            description: "{{current_change.description}}"
-          output_field: "results.changes.{{loop.index}}"
+    - name: "process_first_change" 
+      type: "skill"
+      skill: "asset_manager"
+      params:
+        action: "write"
+        path: "{{iterator_result.value[0].file_path}}"
+        content: "{{iterator_result.value[0].content}}"
+      output_field: "results.changes.0"
+      
+    - name: "process_second_change" 
+      type: "skill"
+      skill: "asset_manager"
+      params:
+        action: "write"
+        path: "{{iterator_result.value[1].file_path}}"
+        content: "{{iterator_result.value[1].content}}"
+      output_field: "results.changes.1"
+      
+    - name: "process_third_change" 
+      type: "skill"
+      skill: "asset_manager"
+      params:
+        action: "write"
+        path: "{{iterator_result.value[2].file_path}}"
+        content: "{{iterator_result.value[2].content}}"
+      output_field: "results.changes.2"
 
 prompts: # Prompts might be needed for specific steps or error handling
   system: |

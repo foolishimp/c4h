@@ -10,47 +10,48 @@ prompts:
     Return your response in the following format, with no additional explanation:
 
     ===CHANGE_BEGIN===
-    FILE: path/to/file
+    FILE: /absolute/path/to/file
     TYPE: create|modify|delete
     DESCRIPTION: one line description
     DIFF:
-    --- a/existing_file.py
-    +++ b/existing_file.py
-    @@ -1,3 +1,4 @@
-    context line
-    -removed line
-    +added line
-    context line
+    ```python
+    # Complete new file content here, not a diff
+    def example():
+        print("This is the new content")
+    ```
     ===CHANGE_END===
 
     PATH REQUIREMENTS:
-    Make sure to use the full path for a file as it appears in the manifest.
+    Make sure to use the FULL ABSOLUTE PATH for a file as it appears in the manifest.
+    Example: /Users/jim/src/apps/c4h_ai_dev/tests/test_projects/project1/sample.py
 
     FORMAT REQUIREMENTS FOR EACH TYPE:
 
     1. NEW FILES (type: "create"):
     DIFF:
-    --- /dev/null
-    +++ b/new_file.py
-    @@ -0,0 +1,3 @@
-    +new content here
+    ```python
+    # Full new file content
+    import logging
+    
+    def new_function():
+        logging.info("New function called")
+    ```
 
-    2. DELETE FILES (type: "delete"):
+    2. MODIFY FILES (type: "modify"):
     DIFF:
-    --- a/old_file.py
-    +++ /dev/null
-    @@ -1,3 +0,0 @@
-    -content to remove
+    ```python
+    # Full file content with modifications
+    import logging
+    
+    def existing_function():
+        logging.info("Function called")  # Modified to use logging
+    ```
 
-    3. MODIFY FILES (type: "modify"):
+    3. DELETE FILES (type: "delete"):
     DIFF:
-    --- a/existing_file.py
-    +++ b/existing_file.py
-    @@ -1,3 +1,4 @@
-    context line
-    -removed line
-    +added line
-    context line
+    ```
+    # File will be deleted
+    ```
 
     CONTINUATION HANDLING:
     - For long responses that may be split across multiple completions:
@@ -59,10 +60,9 @@ prompts:
     - If a response is cut mid-change, the next continuation should start with the same ===CHANGE_BEGIN=== marker
 
     RULES:
-    - Use /dev/null for create/delete operations
-    - Include 3 lines of context for modifications
-    - Group related changes into chunks with @@ markers
-    - Include imports in first chunk if needed, make sure to include imports for new code
+    - ALWAYS use absolute paths for files
+    - For "modify" operations, include the ENTIRE file content, not just the changes
+    - Include all necessary imports in the file content
     - Return ONLY the changes in the specified format, no explanations
     - Ensure all paths use forward slashes
     - Keep descriptions short and clear

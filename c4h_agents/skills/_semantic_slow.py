@@ -10,6 +10,7 @@ import json
 from c4h_agents.config import locate_config
 from c4h_agents.utils.logging import get_logger
 
+# Get a logger for the non-class components
 logger = get_logger()
 class ExtractionError(Exception):
     """Custom exception for extraction errors"""
@@ -37,6 +38,8 @@ class SlowItemIterator:
         self._max_attempts = 10 # Safety limit
         self._returned_items = set()  # Track returned items
         self._current_attempt = 0  # Track retries for current position
+        # Get the logger from the extractor to ensure consistent logging
+        self.logger = extractor.logger
 
     def __iter__(self):
         return self
@@ -52,22 +55,22 @@ class SlowItemIterator:
                 return "|".join(items)
             return str(content)
         except Exception as e:
-            logger.error("iterator.key_generation_failed", error=str(e))
+            self.logger.error("iterator.key_generation_failed", error=str(e))
             return str(content)
 
     def __next__(self) -> Any:
         """Get next item using lazy extraction"""
-        logger.debug("slow_iterator.next_called", 
+        self.logger.debug("slow_iterator.next_called", 
                     position=self._position,
                     attempt=self._current_attempt,
                     max_attempts=self._max_attempts)
 
         if self._exhausted:
-            logger.debug("slow_iterator.already_exhausted")
+            self.logger.debug("slow_iterator.already_exhausted")
             raise StopIteration
 
         if self._position >= self._max_attempts:
-            logger.warning("slow_iterator.max_attempts_reached",
+            self.logger.warning("slow_iterator.max_attempts_reached",
                         max_attempts=self._max_attempts)
             self._exhausted = True
             raise StopIteration
@@ -81,7 +84,7 @@ class SlowItemIterator:
             })
 
             if not agent_response.success:
-                logger.error("slow_iterator.extraction_failed", 
+                self.logger.error("slow_iterator.extraction_failed", 
                         error=agent_response.error,
                         position=self._position)
                 self._exhausted = True
@@ -90,7 +93,7 @@ class SlowItemIterator:
             # Get response content from standard location
             content = agent_response.data.get('response')
 
-            logger.debug("slow_iterator.response",
+            self.logger.debug("slow_iterator.response",
                         position=self._position,
                         content_type=type(content).__name__,
                         content_preview=str(content)[:100] if content else None)
@@ -99,18 +102,18 @@ class SlowItemIterator:
             if content is None or (isinstance(content, str) and not content.strip()):
                 self._current_attempt += 1
                 if self._current_attempt >= 3:  # Max retries per position
-                    logger.error("slow_iterator.max_retries_for_position",
+                    self.logger.error("slow_iterator.max_retries_for_position",
                             position=self._position)
                     self._exhausted = True
                     raise StopIteration
-                logger.warning("slow_iterator.empty_response_retry",
+                self.logger.warning("slow_iterator.empty_response_retry",
                             position=self._position,
                             attempt=self._current_attempt)
                 return next(self)  # Retry this position
 
             # Fix: Check for NO_MORE_ITEMS at the start of the response string
             if isinstance(content, str) and content.strip().upper().startswith("NO_MORE_ITEMS"):
-                logger.info("slow_iterator.no_more_items", 
+                self.logger.info("slow_iterator.no_more_items", 
                         position=self._position)
                 self._exhausted = True
                 raise StopIteration
@@ -120,7 +123,7 @@ class SlowItemIterator:
                 try:
                     parsed = json.loads(content)
                     content = parsed
-                    logger.debug("slow_iterator.parsed_json",
+                    self.logger.debug("slow_iterator.parsed_json",
                             position=self._position)
                 except json.JSONDecodeError:
                     pass  # Keep as string if not JSON
@@ -130,7 +133,7 @@ class SlowItemIterator:
             
             # Check for duplicates using full content
             if content_key in self._returned_items:
-                logger.warning("slow_iterator.duplicate_item",
+                self.logger.warning("slow_iterator.duplicate_item",
                             position=self._position,
                             content_preview=str(content)[:100])
                 self._current_attempt += 1
@@ -144,14 +147,14 @@ class SlowItemIterator:
             self._position += 1
             self._current_attempt = 0  # Reset attempt counter for next position
 
-            logger.info("slow_iterator.item_extracted",
+            self.logger.info("slow_iterator.item_extracted",
                     position=self._position - 1,
                     item_type=type(content).__name__)
 
             return content
 
         except Exception as e:
-            logger.error("slow_iterator.error", 
+            self.logger.error("slow_iterator.error", 
                         error=str(e),
                         position=self._position)
             self._exhausted = True
@@ -163,8 +166,27 @@ class SlowExtractor(BaseAgent):
 
     def __init__(self, config: Dict[str, Any] = None):
         """Initialize with parent agent configuration"""
+        # Create a customized config if needed to prevent errors
+        if config is None:
+            config = {}
+        
+        # Clone our configuration to avoid modifying the original
+        patched_config = dict(config)
+        
+        # Ensure the slow extractor has a persona key in the config 
+        if 'llm_config' not in patched_config:
+            patched_config['llm_config'] = {}
+        if 'agents' not in patched_config['llm_config']:
+            patched_config['llm_config']['agents'] = {}
+        if 'semantic_slow_extractor' not in patched_config['llm_config']['agents']:
+            patched_config['llm_config']['agents']['semantic_slow_extractor'] = {}
+        if 'persona_key' not in patched_config['llm_config']['agents']['semantic_slow_extractor']:
+            # Use a default persona that should exist in config
+            parent_persona = config.get('llm_config', {}).get('agents', {}).get('semantic_iterator', {}).get('persona_key')
+            patched_config['llm_config']['agents']['semantic_slow_extractor']['persona_key'] = parent_persona or "discovery_v1"
+            
         # Pass positional parameters to BaseAgent
-        super().__init__(config, "semantic_slow_extractor")
+        super().__init__(patched_config, "semantic_slow_extractor")
         
         # The unique_name is now stored by BaseAgent
         
@@ -174,11 +196,11 @@ class SlowExtractor(BaseAgent):
         # Validate template at initialization
         template = self._get_prompt('extract')
         if '{ordinal}' not in template:
-            logger.error("slow_extractor.invalid_template", 
+            self.logger.error("slow_extractor.invalid_template", 
                         reason="Missing {ordinal} placeholder")
             raise ValueError("Slow extractor requires {ordinal} in prompt template")
 
-        logger.info("slow_extractor.initialized",
+        self.logger.info("slow_extractor.initialized",
                    settings=slow_cfg)
 
     def _get_agent_name(self) -> str:
@@ -187,7 +209,7 @@ class SlowExtractor(BaseAgent):
     def _format_request(self, context: Dict[str, Any]) -> str:
         """Format extraction request for slow mode using config template"""
         if not context.get('config'):
-            logger.error("slow_extractor.missing_config")
+            self.logger.error("slow_extractor.missing_config")
             raise ValueError("Extract config required")
 
         position = context.get('position', 0)
@@ -204,7 +226,7 @@ class SlowExtractor(BaseAgent):
             format=context['config'].format
         )
 
-        logger.debug("slow_extractor.request",
+        self.logger.debug("slow_extractor.request",
                    position=position,
                    ordinal=ordinal,
                    request_length=len(request))
@@ -219,6 +241,6 @@ class SlowExtractor(BaseAgent):
 
     def create_iterator(self, content: Any, config: ExtractConfig) -> SlowItemIterator:
         """Create iterator for slow extraction"""
-        logger.debug("slow_extractor.creating_iterator",
+        self.logger.debug("slow_extractor.creating_iterator",
                     content_type=type(content).__name__)
         return SlowItemIterator(self, content, config)

@@ -177,13 +177,12 @@ llm_config:
       method: "execute"
   
   personas:
-    # Include the actual persona configurations inline
     discovery_v1:
       provider: "anthropic"
       model: "claude-3-5-sonnet-20241022"
       temperature: 0
       tartxt_config:
-        script_path: "c4h_agents/skills/tartxt.py"
+        script_path: "/Users/jim/src/apps/c4h_ai_dev/c4h_agents/skills/tartxt.py"
         exclusions:
           - '**/node_modules/**'
           - '**/.git/**'
@@ -203,11 +202,27 @@ llm_config:
           2. File relationships
           3. Code dependencies
           4. Available functionality
+        
+        # Add the extract prompt for semantic_slow_extractor
+        extract: |
+          Extract the {ordinal} change item from the solution design.
+          
+          IMPORTANT: Return ONLY ONE item at a time.
+          
+          If there are no more items to extract, respond with "NO_MORE_ITEMS".
+          
+          Format: {format}
+          
+          Content:
+          {content}
+          
+          # Instructions
+          {instruction}
     
     solution_designer_v1:
       provider: "anthropic"
       model: "claude-3-7-sonnet-20250219"
-      temperature: 1
+      temperature: 0.7
       extended_thinking:
         enabled: true
         budget_tokens: 32000
@@ -229,6 +244,31 @@ llm_config:
           +added line
           context line
           ===CHANGE_END===
+          
+          IMPORTANT: You MUST use the format above. Never return any explanations or analysis outside the ===CHANGE_BEGIN=== and ===CHANGE_END=== blocks.
+          Your entire response should only contain one or more of these blocks.
+          
+        user: |
+          Based on the discovery data, create a solution design for adding logging and lineage tracking to the codebase. 
+          
+          EXTREMELY IMPORTANT: Use the EXACT file paths as shown in the discovery data. Do not create files with paths like 'logging/logger.py' or 'utils/logging.py'. Instead, modify the existing files directly.
+          
+          The files available for modification are:
+          - /Users/jim/src/apps/c4h_ai_dev/tests/test_projects/project1/sample.py
+          - /Users/jim/src/apps/c4h_ai_dev/tests/test_projects/project2/main.py
+          - /Users/jim/src/apps/c4h_ai_dev/tests/test_projects/project2/utils.py
+          
+          Use the EXACT format as specified in the system prompt instructions. Your response must consist ONLY of properly formatted change blocks:
+          
+          ===CHANGE_BEGIN===
+          FILE: /exact/path/to/file
+          TYPE: create|modify|delete
+          DESCRIPTION: one line description
+          DIFF:
+          [diff content here]
+          ===CHANGE_END===
+          
+          No analysis or explanations outside these blocks.
 
     coder_v1:
       provider: "anthropic"
@@ -283,11 +323,22 @@ llm_config:
           5. Apply changes exactly as specified
           6. Handle errors gracefully with backups
           7. Validate code after changes
+          
+        # Add user prompt to handle changes
+        user: |
+          I need you to apply these code changes:
+          
+          {content}
+          
+          For each change, verify it carefully and apply it exactly as specified.
 
   agents:
     # Define all agent configurations with persona keys
     discovery_phase:
       persona_key: "discovery_v1"  # This links to the inline persona above
+      tartxt_config:
+        script_path: "/Users/jim/src/apps/c4h_ai_dev/c4h_agents/skills/tartxt.py"
+        input_paths: ["./"]
     
     solution_design_phase:
       persona_key: "solution_designer_v1"  # This links to inline persona above
@@ -297,6 +348,10 @@ llm_config:
     
     fallback_coding_phase:
       persona_key: "coder_v1"  # Reusing coder persona for fallback
+      
+    # Skills that can also function as agents need persona configs
+    semantic_iterator:
+      persona_key: "discovery_v1"  # Use the discovery persona for semantic extraction
 
 # Orchestration using the new factory model
 orchestration:
@@ -318,6 +373,9 @@ orchestration:
           description: "Analyze project structure and files" # Optional description
           requires_approval: false
           max_retries: 2
+          tartxt_config:
+            script_path: "/Users/jim/src/apps/c4h_ai_dev/c4h_agents/skills/tartxt.py"
+            input_paths: ["./tests/test_projects/"]
       routing:
         default: "solution"
 
@@ -344,6 +402,10 @@ orchestration:
           description: "Implement code changes based on solution design" # Optional description
           requires_approval: false
           max_retries: 1
+          agent_config:
+            # Configuration for the semantic_iterator skill
+            semantic_iterator:
+              persona_key: "discovery_v1"
       routing:
         # End workflow after coder team completes
         default: null

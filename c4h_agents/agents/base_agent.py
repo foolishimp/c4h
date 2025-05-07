@@ -65,6 +65,14 @@ class BaseAgent(BaseConfig, BaseLLM):
         log_config_node(self.logger, self.config, "team.llm_config.agents", log_prefix=f"{agent_name}.init_received")
         log_config_node(self.logger, self.config, "llm_config.agents", log_prefix=f"{agent_name}.init_received")
 
+        
+        # Important: Log config structure for diagnosis
+        if agent_name == "semantic_iterator":
+            print(f"DEBUG - Config for semantic_iterator: {self.config}")
+            print(f"DEBUG - llm_config keys: {self.config.get('llm_config', {}).keys()}")
+            print(f"DEBUG - agents keys: {self.config.get('llm_config', {}).get('agents', {}).keys()}")
+            print(f"DEBUG - semantic_iterator config: {self.config.get('llm_config', {}).get('agents', {}).get('semantic_iterator', {})}")
+        
         # --- Step 7: Use persona configuration directly ---
         self.config_path = f"llm_config.agents.{agent_name}"
         agent_config = self.config_node.get_value(self.config_path) or {}
@@ -72,11 +80,24 @@ class BaseAgent(BaseConfig, BaseLLM):
         # Get persona_key from task config - required for this approach
         self.persona_key = agent_config.get('persona_key')
         
+        # Handle skill agents that operate both as skills and agents
+        # Look for the agent in skills config if it's not in agents
         if not self.persona_key:
-            self.logger.error(f"{agent_name}.init.missing_persona_key", 
-                             agent_name=agent_name,
-                             config_path=self.config_path)
-            raise ValueError(f"Agent {agent_name} is missing required persona_key in configuration")
+            skill_config = self.config_node.get_value(f"llm_config.skills.{agent_name}")
+            if skill_config:
+                # This is a skill-based agent, use a default persona
+                self.logger.info(f"{agent_name}.init.skill_based_agent", 
+                               agent_name=agent_name)
+                self.persona_key = self._get_default_persona_key()
+                self.logger.info(f"{agent_name}.init.using_default_persona", 
+                               agent_name=agent_name,
+                               persona_key=self.persona_key)
+            else:
+                # Not a skill-based agent and no persona key - this is an error
+                self.logger.error(f"{agent_name}.init.missing_persona_key", 
+                                agent_name=agent_name,
+                                config_path=self.config_path)
+                raise ValueError(f"Agent {agent_name} is missing required persona_key in configuration")
         
         # Set persona path - this is our primary configuration source
         self.persona_path = f"llm_config.personas.{self.persona_key}"
@@ -295,7 +316,7 @@ class BaseAgent(BaseConfig, BaseLLM):
                         workflow_run_id=lineage_context.get("workflow_run_id"))
 
             # Extract data from context
-            data = self._get_data(lineage_context)
+            data = self._extract_data_from_context(lineage_context)
 
             # Prepare system and user messages with context for potential overrides
             system_message = self._get_system_message(lineage_context)
@@ -376,6 +397,69 @@ class BaseAgent(BaseConfig, BaseLLM):
         except Exception as e:
             self.logger.error("process.failed", error=str(e), exc_info=True) # Log traceback
             return AgentResponse(success=False, data={}, error=str(e))
+
+    def _get_data(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Extracts primary data payload, ensuring it's a dictionary."""
+        try:
+            # Prioritize 'input_data' as the primary container
+            if 'input_data' in context and isinstance(context['input_data'], dict):
+                self.logger.debug("_get_data: using 'input_data' key")
+                return context['input_data']
+            # If input_data isn't a dict or doesn't exist, use the context itself if it's a dict
+            elif isinstance(context, dict):
+                self.logger.debug("_get_data: using context as data (input_data missing or not dict)")
+                return context
+            # Fallback: create a basic dict if context isn't suitable
+            self.logger.warning("_get_data: context is not a suitable dict, creating basic wrapper", context_type=type(context).__name__)
+            return {'content': str(context)}
+        except Exception as e:
+            self.logger.error("_get_data.failed", error=str(e))
+            return {}
+            
+    def _get_system_message(self, context: Dict[str, Any] = None) -> str:
+        """
+        Get the system message from persona configuration with context-based overrides.
+        
+        This method checks for system message in the agent's configuration, with overrides
+        from the context taking precedence. This allows for runtime customization.
+        
+        Args:
+            context: Optional context that may contain overrides
+            
+        Returns:
+            The system message string to use for the LLM
+        """
+        try:
+            # Try to get the persona key for this agent
+            persona_key = self.config_node.get_value(f"orchestration.teams.*.tasks[?name={self.unique_name}].persona_key")
+            if not persona_key:
+                self.logger.warning("_get_system_message.persona_key_not_found", agent_name=self.unique_name)
+                persona_key = "default"
+                
+            # First check for context override (highest priority)
+            if context and 'system_message' in context:
+                self.logger.debug("_get_system_message.using_context_override")
+                return str(context['system_message'])
+                
+            # Next try persona configuration (normal path)
+            system_message = self.config_node.get_value(f"llm_config.personas.{persona_key}.prompts.system")
+            if system_message:
+                self.logger.debug("_get_system_message.using_persona_config", persona_key=persona_key)
+                return str(system_message)
+                
+            # Fallback to legacy agent config structure
+            system_message = self.config_node.get_value(f"llm_config.agents.{self.unique_name}.prompts.system")
+            if system_message:
+                self.logger.debug("_get_system_message.using_legacy_agent_config")
+                return str(system_message)
+                
+            # Last resort - default message
+            self.logger.warning("_get_system_message.no_system_message_found", persona_key=persona_key, agent_name=self.unique_name)
+            return "You are an AI assistant that helps with code analysis and transformation tasks."
+            
+        except Exception as e:
+            self.logger.error("_get_system_message.failed", error=str(e), exc_info=True)
+            return "You are an AI assistant that helps with code analysis and transformation tasks."
 
     def _get_prompt(self, prompt_type: str, context: Optional[Dict[str, Any]] = None) -> str:
         """
@@ -500,3 +584,280 @@ class BaseAgent(BaseConfig, BaseLLM):
         Overrides the placeholder in BaseLLM to return the actual agent name.
         """
         return self.unique_name
+        
+    def _get_default_persona_key(self) -> str:
+        """
+        Get a default persona key for skill-based agents.
+        
+        This is used when an agent is also registered as a skill and doesn't have
+        a specific persona_key in its configuration.
+        
+        Returns:
+            A valid persona key from the configuration
+        """
+        # First try to find a default agent persona
+        default_persona = "discovery_v1" # Prioritize discovery since it's most general
+        
+        # Check if the discovery persona exists
+        if self.config_node.get_value(f"llm_config.personas.{default_persona}"):
+            return default_persona
+            
+        # Next try to find any valid persona
+        persona_keys = self.config_node.get_keys("llm_config.personas") or []
+        if persona_keys:
+            # Use the first available persona
+            return persona_keys[0]
+            
+        # Last resort fallback
+        return "discovery_v1" # This will still fail, but with a clearer error message
+        
+    def call_skill(self, skill_name: str, skill_context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Prepare context for a skill call with proper lineage tracking.
+        
+        Args:
+            skill_name: Name of the skill to call
+            skill_context: Context to pass to the skill
+            
+        Returns:
+            Enhanced context with lineage tracking information
+        """
+        try:
+            # Prepare skill execution context with appropriate lineage IDs
+            skill_exec_context = LineageContext.create_skill_context(
+                agent_id=self.agent_id,
+                skill_type=skill_name,
+                workflow_run_id=getattr(self, 'run_id', None) or skill_context.get('workflow_run_id'),
+                base_context=skill_context
+            )
+            
+            self.logger.debug("call_skill.context_prepared",
+                            agent_id=self.agent_id,
+                            skill=skill_name,
+                            skill_execution_id=skill_exec_context.get("agent_execution_id"))
+                            
+            return skill_exec_context
+            
+        except Exception as e:
+            self.logger.error("call_skill.failed",
+                            error=str(e),
+                            skill=skill_name,
+                            exc_info=True)
+            
+            # Ensure we return a valid context even if lineage tracking fails
+            return skill_context
+    
+    def _invoke_skill(self, skill_name: str, params: Dict[str, Any], context: Dict[str, Any] = None) -> SkillResult:
+        """
+        Invoke a registered skill with the specified parameters.
+        
+        Args:
+            skill_name: The name of the skill to invoke (registered in config under llm_config.skills)
+            params: Parameters to pass to the skill
+            context: Optional context to use for lineage tracking and other metadata
+            
+        Returns:
+            The result from the skill execution
+        """
+        try:
+            # 1. Attempt to locate the skill configuration
+            skill_config = self.config_node.get_value(f"llm_config.skills.{skill_name}")
+            if not skill_config:
+                error_msg = f"Skill '{skill_name}' not found in llm_config.skills configuration"
+                self.logger.error("_invoke_skill.skill_not_found", skill_name=skill_name)
+                return SkillResult(success=False, error=error_msg)
+                
+            # 2. Extract module, class, and method information
+            module_path = skill_config.get("module")
+            class_name = skill_config.get("class")
+            method_name = skill_config.get("method", "execute")
+            
+            if not module_path or not class_name:
+                error_msg = f"Skill '{skill_name}' configuration is missing module or class"
+                self.logger.error("_invoke_skill.invalid_config", 
+                                skill_name=skill_name, 
+                                has_module=bool(module_path), 
+                                has_class=bool(class_name))
+                return SkillResult(success=False, error=error_msg)
+                
+            # 3. Prepare lineage context for the skill
+            if context is None:
+                context = {}
+                
+            skill_exec_context = self.call_skill(skill_name, context)
+            
+            # 4. Import the skill module and get the class
+            self.logger.debug("_invoke_skill.importing", 
+                            skill_name=skill_name, 
+                            module_path=module_path, 
+                            class_name=class_name)
+            
+            import importlib
+            skill_module = importlib.import_module(module_path)
+            skill_class = getattr(skill_module, class_name)
+            
+            # 5. Create configuration for the skill to inherit our config
+            # Clone our configuration
+            skill_full_config = dict(self.config) if self.config else {}
+            
+            # Ensure the config has llm_config.agents.{skill_name} with a persona_key
+            if 'llm_config' not in skill_full_config:
+                skill_full_config['llm_config'] = {}
+            if 'agents' not in skill_full_config['llm_config']:
+                skill_full_config['llm_config']['agents'] = {}
+            
+            # Set a persona_key for the skill if it doesn't have one
+            agent_config = self.config_node.get_value(f"llm_config.agents.{skill_name}")
+            if not agent_config or 'persona_key' not in agent_config:
+                self.logger.debug("_invoke_skill.setting_persona_for_skill",
+                                skill_name=skill_name,
+                                persona_key=self.persona_key)
+                
+                skill_full_config['llm_config']['agents'][skill_name] = {
+                    'persona_key': self.persona_key  # Use our own persona
+                }
+            
+            # 6. Instantiate the skill with our config
+            skill_instance = skill_class(skill_full_config)
+            
+            # 7. Call the skill method with the parameters
+            self.logger.info("_invoke_skill.executing", 
+                           skill_name=skill_name, 
+                           skill_method=method_name,  # Changed from method_name to skill_method to avoid conflict
+                           param_keys=list(params.keys()))
+            
+            skill_method = getattr(skill_instance, method_name)
+            result = skill_method(**params)
+            
+            # 8. Process the result
+            self.logger.info("_invoke_skill.completed", 
+                           skill_name=skill_name,
+                           success=getattr(result, 'success', None))
+            
+            # Ensure result is of correct type (SkillResult)
+            if not isinstance(result, SkillResult):
+                self.logger.warning("_invoke_skill.invalid_result_type", 
+                                  skill_name=skill_name, 
+                                  result_type=type(result).__name__)
+                # Try to convert to SkillResult if possible
+                if hasattr(result, 'success'):
+                    return SkillResult(
+                        success=result.success,
+                        value=getattr(result, 'value', None) or getattr(result, 'data', None),
+                        error=getattr(result, 'error', None)
+                    )
+                # Default
+                return SkillResult(
+                    success=True, 
+                    value=result
+                )
+                
+            return result
+            
+        except Exception as e:
+            error_msg = f"Error executing skill {skill_name}: {str(e)}"
+            self.logger.error("_invoke_skill.failed", 
+                            skill_name=skill_name, 
+                            error=str(e), 
+                            exc_info=True)
+            return SkillResult(success=False, error=error_msg)
+    
+    def _extract_data_from_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract the primary data payload from the context, ensuring it's a dictionary.
+        
+        Args:
+            context: The context dictionary from which to extract data
+            
+        Returns:
+            The extracted data as a dictionary
+        """
+        try:
+            # Prioritize 'input_data' as the primary container
+            if 'input_data' in context and isinstance(context['input_data'], dict):
+                self.logger.debug("_extract_data_from_context: using 'input_data' key")
+                return context['input_data']
+                
+            # If input_data isn't a dict or doesn't exist, use the context itself
+            if isinstance(context, dict):
+                self.logger.debug("_extract_data_from_context: using context as data (input_data missing or not dict)")
+                return context
+                
+            # Fallback: create a basic dict if context isn't suitable
+            self.logger.warning(
+                "_extract_data_from_context: context is not a suitable dict, creating basic wrapper", 
+                context_type=type(context).__name__
+            )
+            return {'content': str(context)}
+            
+        except Exception as e:
+            self.logger.error("_extract_data_from_context.failed", error=str(e))
+            return {}
+        
+    def _should_log(self, detail_level: LogDetail) -> bool:
+        """
+        Check if the current log level allows logging at the specified detail level.
+        
+        Args:
+            detail_level: The detail level to check against the current log level
+            
+        Returns:
+            True if logging should occur at this detail level, False otherwise
+        """
+        try:
+            # Default to BASIC if not explicitly set
+            current_level = getattr(self, 'log_level', LogDetail.BASIC)
+            
+            # Compare level enum values
+            return current_level.value >= detail_level.value
+        except Exception:
+            # Default to True for BASIC level in case of error
+            return detail_level == LogDetail.BASIC
+    
+    def _process_response(self, content: str, raw_response: Any) -> Dict[str, Any]:
+        """
+        Process LLM response into standard format.
+        
+        Extracts and formats the response content into a standardized structure
+        with metadata and metrics.
+        
+        Args:
+            content: The extracted content from the LLM response
+            raw_response: The full raw response object from the LLM
+            
+        Returns:
+            Structured response dictionary
+        """
+        try:
+            # Get content from response safely
+            processed_content = content
+            if self._should_log(LogDetail.DEBUG):
+                self.logger.debug("agent.processing_response",
+                            content_length=len(str(processed_content)) if processed_content else 0,
+                            response_type=type(raw_response).__name__)
+
+            # Create standard response structure
+            response = {
+                "response": processed_content,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+
+            # Add token usage metrics if available
+            if hasattr(raw_response, 'usage'):
+                usage = raw_response.usage
+                usage_data = {
+                    "completion_tokens": getattr(usage, 'completion_tokens', 0),
+                    "prompt_tokens": getattr(usage, 'prompt_tokens', 0),
+                    "total_tokens": getattr(usage, 'total_tokens', 0)
+                }
+                self.logger.info("llm.token_usage", **usage_data)
+                response["usage"] = usage_data
+
+            return response
+        except Exception as e:
+            self.logger.error("response_processing.failed", error=str(e))
+            return {
+                "response": str(content),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "error": str(e)
+            }

@@ -6,8 +6,8 @@ set -e
 # Define variables
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PYTHONPATH=$REPO_ROOT
-PORT=5555
-SERVER_CONFIG="$REPO_ROOT/config/compat_system_config.yml"
+PORT=5565
+SERVER_CONFIG="$REPO_ROOT/config/system_config.yml"
 CLIENT_CONFIG="$REPO_ROOT/tests/examples/config/jobs_coder_01.yml"
 LOG_FILE="$REPO_ROOT/server_client_test.log"
 
@@ -43,13 +43,11 @@ echo "Using compatibility configuration: $SERVER_CONFIG" | tee -a $LOG_FILE
 echo "Using client job configuration: $CLIENT_CONFIG" | tee -a $LOG_FILE
 echo "" | tee -a $LOG_FILE
 
-# Check if test project setup exists
-if [ ! -d "$REPO_ROOT/tests/test_projects" ]; then
-    echo "Setting up test projects..." | tee -a $LOG_FILE
-    $REPO_ROOT/tests/setup/setup_test_projects.sh
-    echo "Test projects set up successfully." | tee -a $LOG_FILE
-    echo "" | tee -a $LOG_FILE
-fi
+# Always reset the test projects to ensure a clean state
+echo "Setting up test projects..." | tee -a $LOG_FILE
+$REPO_ROOT/tests/setup/setup_test_projects.sh
+echo "Test projects reset to initial state." | tee -a $LOG_FILE
+echo "" | tee -a $LOG_FILE
 
 # Function to cleanup on exit
 cleanup() {
@@ -86,11 +84,13 @@ fi
 echo "" | tee -a $LOG_FILE
 echo "Running client job..." | tee -a $LOG_FILE
 
-# Run client job with reduced polling
-echo "Running client job with reduced polling..." | tee -a $LOG_FILE
-PYTHONPATH=$PYTHONPATH $PYTHON_CMD $REPO_ROOT/c4h_services/src/bootstrap/prefect_runner.py jobs -P $PORT --config $CLIENT_CONFIG --poll --poll-interval 10 --max-polls 12 | tee -a $LOG_FILE
+# Run client job with simple approach (no fancy timeout)
+echo "Running client job with simple approach..." | tee -a $LOG_FILE
 
-# Capture client exit code
+# Just run the client directly with minimal polling to keep the test fast
+PYTHONPATH=$PYTHONPATH $PYTHON_CMD $REPO_ROOT/c4h_services/src/bootstrap/prefect_runner.py jobs -P $PORT --config $CLIENT_CONFIG --poll --poll-interval 5 --max-polls 3 | tee -a $LOG_FILE
+
+# Capture exit code
 CLIENT_EXIT_CODE=${PIPESTATUS[0]}
 
 echo "" | tee -a $LOG_FILE

@@ -22,15 +22,18 @@ orchestration:
       tasks:
         - name: "discovery_phase"
           agent_type: "GenericLLMAgent"
-          persona_key: "discovery"
+          persona_key: "discovery_v1"
+          tartxt_config:
+            script_path: "/Users/jim/src/apps/c4h_ai_dev/c4h_agents/skills/tartxt.py"
+            input_paths: ["./tests/test_projects/"]
     solution:
       tasks:
         - name: "solution_design_phase"
           agent_type: "GenericLLMAgent" 
-          persona_key: "solution_designer"
+          persona_key: "solution_designer_v1"
     coder:
       tasks:
         - name: "coding_phase"
           agent_type: "GenericOrchestratorAgent"
-          persona_key: "coder"
+          persona_key: "coder_v1"
 

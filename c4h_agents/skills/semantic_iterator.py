@@ -58,8 +58,6 @@ class SemanticIterator(BaseAgent):
         # Pass positional parameters to BaseAgent
         super().__init__(config, "semantic_iterator")
         
-        # The unique_name is now stored by BaseAgent
-        
         # Get iterator-specific config using inherited method
         iterator_config = self._get_agent_config() # Gets llm_config.agents.semantic_iterator
         extractor_config = iterator_config.get('extractor_config', {})
@@ -78,7 +76,8 @@ class SemanticIterator(BaseAgent):
         # Use self.logger inherited from BaseAgent
         self.logger.info("semantic_iterator.initialized",
                    mode=self._state.mode,
-                   allow_fallback=self._allow_fallback)
+                   allow_fallback=self._allow_fallback,
+                   persona_key=self.persona_key)
 
     def _get_agent_name(self) -> str:
         """Get agent name for config lookup"""

@@ -628,7 +628,7 @@ class GenericOrchestratorAgent(BaseAgent):
             full_effective_config: Complete effective configuration after all merging
             unique_name: Unique instance name used for configuration path
         """
-        # Initialize base agent with full config
+        # Initialize base agent with full 
         super().__init__(full_effective_config, unique_name)
         
         # Store agent type for introspection
