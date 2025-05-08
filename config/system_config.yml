@@ -368,14 +368,11 @@ orchestration:
       name: "Discovery Team"
       tasks:
         - name: "discovery_phase" # Unique instance name
-          agent_type: "GenericLLMAgent" # Updated to new type format 
-          persona_key: "discovery_v1" # References personas/discovery_v1.yml
-          description: "Analyze project structure and files" # Optional description
+          agent_type: "GenericSkillAgent" # Changed to GenericSkillAgent
+          persona_key: "discovery_by_skill_v1" # References the new personas/discovery_by_skill_v1.yml
+          description: "Analyze project structure and files using tartxt_runner skill" # Updated description
           requires_approval: false
           max_retries: 2
-          tartxt_config:
-            script_path: "/Users/jim/src/apps/c4h_ai_dev/c4h_agents/skills/tartxt.py"
-            input_paths: ["./tests/test_projects/"]
       routing:
         default: "solution"
 

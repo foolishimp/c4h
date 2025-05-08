@@ -1,0 +1,27 @@
+description: "Performs project discovery using the command_line_runner skill to execute tartxt."
+agent_type: GenericSkillAgent # Explicitly for GenericSkillAgent
+skill: "command_line_runner"  # Specifies the skill to run
+skill_params:                 # Default parameters for the skill
+  command_line: "python -m c4h_agents.skills.tartxt"  # Direct command line to execute tartxt script
+  command_args:
+    # tartxt.py expects project path as a positional argument, not with --project_path
+    # The agent will set this based on the provided project_path in context
+    positional_args: ["{{context.project_path}}"]
+    exclude: "**/node_modules/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/package-lock.json,**/dist/**,**/.DS_Store,**/README.md,**/workspaces/**,**/backup_txt/**"
+    history: 0   # Default history
+    # Use context's run_id for the output file
+    file: "{{context.workflow_run_id}}_project_scan.txt"
+  # Set working directory and configure output
+  working_dir: "{{context.project_path}}"
+  output_to_file: true
+allow_llm_fallback: false # Explicitly disable LLM fallback
+prompts:
+  system: |
+    You are a project discovery agent.
+    You analyze project structure and files to understand:
+    1. Project organization
+    2. File relationships
+    3. Code dependencies
+    4. Available functionality
+    
+    Your analysis will be used to inform code changes and recommendations.
