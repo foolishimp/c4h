@@ -17,18 +17,30 @@ runner = CommandLineRunner({
         "tartxt": {
             "type": "shell_command",
             "command": [sys.executable, "-m", "c4h_agents.skills.tartxt"],
-            "description": "Project scanning and content extraction"
+            "description": "Project scanning and content extraction",
+            "default_args": {
+                "exclude": "**/node_modules/**,**/dist/**,**/.venv/**,**/__pycache__/**,**/*.pyc,**/.git/**,**/*.log,**/package-lock.json,**/.DS_Store"
+            }
         }
     }
 })
 
-# Execute a named command
+# Execute a basic tartxt scan of a directory
 result = runner.execute(
     command_name="tartxt",
     command_args={
-        "exclude": "**/node_modules/**,**/__pycache__/**",
         "file": "workspaces/project_scan.txt",
         "positional_args": [project_dir]
+    }
+)
+
+# Execute tartxt with git command to get changed files
+result = runner.execute(
+    command_name="tartxt",
+    command_args={
+        "git": "diff 43e7acd52bb69fdcecdd27e527258fa579f6f326",
+        "history": 1,
+        "file": "backup_txt/changed_files.txt"
     }
 )
 

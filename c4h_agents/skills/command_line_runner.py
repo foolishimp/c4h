@@ -97,8 +97,13 @@ class CommandLineRunner:
             # Resolve working directory
             working_dir = self._resolve_working_dir(working_dir, input)
             
-            # Prepare command arguments
-            cmd_args = self._prepare_command_args(cmd_type, command_args or {}, input)
+            # Prepare command arguments, including command_name for defaults
+            cmd_args = self._prepare_command_args(
+                cmd_type, 
+                command_args or {}, 
+                input,
+                command_name=command_name
+            )
             
             # Generate output file path if needed
             output_file = None
@@ -247,7 +252,8 @@ class CommandLineRunner:
         self, 
         cmd_type: str, 
         cmd_args: Dict[str, Any], 
-        input: Dict[str, Any]
+        input: Dict[str, Any],
+        command_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Prepare command arguments from input and explicitly provided args.
@@ -256,12 +262,26 @@ class CommandLineRunner:
             cmd_type: Type of command ("shell_command" or "python_module")
             cmd_args: Explicitly provided command arguments
             input: Input context
+            command_name: Optional name of pre-configured command
             
         Returns:
             Prepared command arguments
         """
-        # Start with explicitly provided args
-        args = dict(cmd_args)
+        # First, check if we have default arguments from command configuration
+        default_args = {}
+        if command_name and command_name in self.command_configs:
+            cmd_config = self.command_configs[command_name]
+            default_args = cmd_config.get("default_args", {})
+            if default_args:
+                self.logger.debug("command_line_runner.using_default_args",
+                               command_name=command_name,
+                               default_arg_keys=list(default_args.keys()))
+        
+        # Start with default args, then override with explicitly provided args
+        args = {}
+        if default_args:
+            args.update(default_args)
+        args.update(cmd_args)  # Override defaults with explicitly provided args
         
         # Add common args from input
         common_args = ["project_path", "input_paths", "exclusions", "output_file"]
@@ -272,6 +292,14 @@ class CommandLineRunner:
         # Special case for tartxt-style commands
         if "project_scan" in input and "project_scan" not in args:
             args["project_scan"] = input["project_scan"]
+        
+        # Handle git command for tartxt
+        if command_name == "tartxt" and "git_command" in input and "git" not in args:
+            args["git"] = input["git_command"]
+            
+        # Handle history for tartxt
+        if command_name == "tartxt" and "history" in input and "history" not in args:
+            args["history"] = input["history"]
             
         # For Python modules, we may need to convert args to the right format
         if cmd_type == "python_module":

@@ -348,7 +348,10 @@ class SkillRegistry:
                                     "tartxt": {
                                         "type": "shell_command",
                                         "command": [sys.executable, "-m", "c4h_agents.skills.tartxt"],
-                                        "description": "Project scanning and content extraction"
+                                        "description": "Project scanning and content extraction",
+                                        "default_args": {
+                                            "exclude": "**/node_modules/**,**/dist/**,**/.venv/**,**/__pycache__/**,**/*.pyc,**/.git/**,**/*.log,**/package-lock.json,**/.DS_Store"
+                                        }
                                     }
                                 }
                             }
@@ -383,7 +386,10 @@ class SkillRegistry:
                     "tartxt": {
                         "type": "shell_command",
                         "command": [sys.executable, "-m", "c4h_agents.skills.tartxt"],
-                        "description": "Project scanning and content extraction"
+                        "description": "Project scanning and content extraction",
+                        "default_args": {
+                            "exclude": "**/node_modules/**,**/dist/**,**/.venv/**,**/__pycache__/**,**/*.pyc,**/.git/**,**/*.log,**/package-lock.json,**/.DS_Store"
+                        }
                     }
                 }
             }

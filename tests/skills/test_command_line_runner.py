@@ -46,7 +46,10 @@ def test_command_line_runner_with_tartxt():
             "tartxt": {
                 "type": "shell_command",  # Use shell command execution instead of module import
                 "command": [sys.executable, "-m", "c4h_agents.skills.tartxt"],
-                "description": "Project scanning and content extraction"
+                "description": "Project scanning and content extraction",
+                "default_args": {
+                    "exclude": "**/__pycache__/**,**/*.pyc,**/.git/**"
+                }
             }
         }
     }
@@ -67,12 +70,11 @@ def test_command_line_runner_with_tartxt():
     args = {
         # These will be converted to command line arguments
         "file": output_file,
-        "exclude": "**/__pycache__/**,**/*.pyc",
         # Add tests directory as a positional argument
         "positional_args": [str(test_dir)]
     }
     
-    # Execute the command
+    # Execute the command - this should use the default exclusions from the config
     result = runner.execute(
         command_name="tartxt",
         command_args=args

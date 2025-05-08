@@ -10,9 +10,13 @@ skill_params:
   command_args:
     # exclusions provided as a comma-separated string for the -x/--exclude parameter
     exclude: "**/node_modules/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/package-lock.json,**/dist/**,**/.DS_Store,**/README.md,**/workspaces/**,**/backup_txt/**"
-    # Generate a unique filename in the workspaces directory
+    # Generate a unique filename in the workspaces directory - can be overridden at runtime
     file: "workspaces/project_scan.txt"
-    # Add positional argument for the current project directory
+    # Optional git command - if not provided, the directory will be scanned directly
+    # git: "diff 43e7acd52bb69fdcecdd27e527258fa579f6f326"
+    # Optional history level - number of git diffs to include (0 for none)
+    # history: 1
+    # Default positional argument (project directory) - only used if git is not specified
     positional_args: ["."]
 
 # Allow falling back to LLM if skill execution fails

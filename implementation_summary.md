@@ -26,6 +26,9 @@
    - Configured the skill registry to properly register the new skill with default config for tartxt
    - Created an example persona configuration (`discovery_generic_v1.yml`) to demonstrate usage
    - Added test cases to verify that the `CommandLineRunner` can correctly execute tartxt
+   - Enhanced implementation to support tartxt's git and history parameters
+   - Added support for default arguments in command configurations
+   - Created comprehensive documentation for migration from TartXTRunner
    - Preserved backward compatibility while enabling a more generic and reusable approach
 
 ## Verification
