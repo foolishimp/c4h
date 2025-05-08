@@ -60,6 +60,9 @@ class BaseConfig:
             "start_time": datetime.utcnow().isoformat(),
             "project": self.project.metadata.name if self.project else None
         }
+        
+        # Check if this agent has an execution plan
+        self._has_execution_plan = self._check_for_execution_plan()
 
     def ensure_paths(self):
         """Ensure project paths exist"""
@@ -222,3 +225,37 @@ class BaseConfig:
         Must be implemented by agent classes.
         """
         raise NotImplementedError("Agent classes must implement _get_agent_name")
+        
+    def _check_for_execution_plan(self) -> bool:
+        """
+        Check if this agent has an execution plan in its configuration.
+        
+        Returns:
+            True if an execution plan exists, False otherwise
+        """
+        try:
+            agent_name = self._get_agent_name()
+            agent_node = self.config_node.get_node(f"llm_config.agents.{agent_name}")
+            
+            return "execution_plan" in agent_node.data and isinstance(agent_node.data["execution_plan"], dict)
+        except Exception:
+            return False
+    
+    def get_execution_plan(self) -> Optional[Dict[str, Any]]:
+        """
+        Get the execution plan for this agent if it exists.
+        
+        Returns:
+            Execution plan dictionary or None if not found
+        """
+        if not self._has_execution_plan:
+            return None
+            
+        try:
+            agent_name = self._get_agent_name()
+            return self.config_node.get_value(f"llm_config.agents.{agent_name}.execution_plan")
+        except Exception as e:
+            logger.error("config.get_execution_plan.failed", 
+                       agent=agent_name if 'agent_name' in locals() else "unknown",
+                       error=str(e))
+            return None

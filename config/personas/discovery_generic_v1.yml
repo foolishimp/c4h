@@ -1,0 +1,42 @@
+provider: "anthropic"
+model: "claude-3-5-sonnet-20241022"
+temperature: 0
+
+# Configure this persona to use the generic skill agent with command_line_runner
+skill: "command_line_runner"
+skill_params:
+  command_name: "tartxt"  # Use the predefined tartxt command
+  # Additional parameters for tartxt - matching tartxt.py's argparse parameters
+  command_args:
+    # exclusions provided as a comma-separated string for the -x/--exclude parameter
+    exclude: "**/node_modules/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/package-lock.json,**/dist/**,**/.DS_Store,**/README.md,**/workspaces/**,**/backup_txt/**"
+    # Generate a unique filename in the workspaces directory
+    file: "workspaces/project_scan.txt"
+    # Add positional argument for the current project directory
+    positional_args: ["."]
+
+# Allow falling back to LLM if skill execution fails
+allow_llm_fallback: true
+fallback_prompt_key: "analyze"
+
+prompts:
+  system: |
+    You are a project discovery agent.
+    You analyze project structure and files to understand:
+    1. Project organization
+    2. File relationships
+    3. Code dependencies
+    4. Available functionality
+    
+  analyze: |
+    Please analyze the following project content to understand its structure, organization,
+    and key functionality.
+    
+    Focus on identifying:
+    - Main modules and their responsibilities
+    - Entry points or core components
+    - Architectural patterns
+    - Framework and library usage
+    - Key data structures and interfaces
+    
+    Project Content: {project_content}

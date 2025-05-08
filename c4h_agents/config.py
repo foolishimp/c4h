@@ -13,8 +13,19 @@ import os
 import hashlib
 import fnmatch
 import re
+import importlib.util
 
 logger = structlog.get_logger()
+
+# Import conditionally to handle circular imports
+def import_validator():
+    """
+    Dynamically import ConfigValidator to avoid circular imports.
+    """
+    if importlib.util.find_spec("c4h_agents.utils.config_validation"):
+        from c4h_agents.utils.config_validation import ConfigValidator
+        return ConfigValidator
+    return None
 
 class ConfigNode:
     """
@@ -489,14 +500,55 @@ def get_available_personas(personas_base_path: Path) -> Dict[str, Path]:
                    error_type=type(e).__name__)
         return {}
 
-def load_with_app_config(system_path: Path, app_path: Path) -> Dict[str, Any]:
-    """Load and merge system config with app config with full logging"""
+def load_with_app_config(system_path: Path, app_path: Path, validate_schema: bool = True) -> Dict[str, Any]:
+    """
+    Load and merge system config with app config with full logging and validation.
+    
+    Args:
+        system_path: Path to the system configuration file
+        app_path: Path to the application configuration file
+        validate_schema: Whether to validate the merged configuration against schemas
+        
+    Returns:
+        Merged and validated configuration dictionary
+    """
     try:
         logger.info("config.merge.starting", system_path=str(system_path), app_path=str(app_path))
         system_config = load_config(system_path)
         app_config = load_config(app_path)
         result = deep_merge(system_config, app_config)
-        logger.info("config.merge.complete", total_keys=len(result), system_keys=len(system_config), app_keys=len(app_config))
+        
+        # Initialize skill registry with the merged config
+        # This is done before validation to ensure skills are available for validation
+        if "llm_config" in result and "skills" in result["llm_config"]:
+            try:
+                from c4h_agents.skills.registry import SkillRegistry
+                registry = SkillRegistry()
+                registry.register_builtin_skills()
+                registry.load_skills_from_config(result)
+                logger.info("config.skill_registry.initialized", 
+                          skills_count=len(registry.list_skills()))
+            except Exception as e:
+                logger.error("config.skill_registry.initialization_failed", 
+                           error=str(e))
+        
+        # Validate configuration against schemas if enabled
+        if validate_schema:
+            validator_class = import_validator()
+            if validator_class:
+                try:
+                    logger.info("config.validation.starting")
+                    result = validator_class.validate_complete_config(result)
+                    logger.info("config.validation.complete")
+                except Exception as e:
+                    logger.error("config.validation.failed", error=str(e))
+            else:
+                logger.warning("config.validation.skipped", reason="validator_not_available")
+        
+        logger.info("config.merge.complete", 
+                  total_keys=len(result), 
+                  system_keys=len(system_config), 
+                  app_keys=len(app_config))
         return result
     except Exception as e:
         logger.error("config.merge.failed", error=str(e), error_type=type(e).__name__)
@@ -550,7 +602,8 @@ def render_config(
     fragments: List[Dict[str, Any]], 
     run_id: str, 
     workdir: Path,
-    transform_funcs: Optional[List[Callable[[Dict[str, Any]], Dict[str, Any]]]] = None
+    transform_funcs: Optional[List[Callable[[Dict[str, Any]], Dict[str, Any]]]] = None,
+    validate_schema: bool = True
 ) -> Path:
     """
     Generate and persist an effective configuration snapshot after merging all fragments.
@@ -560,6 +613,7 @@ def render_config(
         run_id: Unique run identifier
         workdir: Directory to store the snapshot
         transform_funcs: Optional list of transformation functions to apply after merging
+        validate_schema: Whether to validate the configuration against JSON schemas
         
     Returns:
         Path to the generated effective configuration snapshot
@@ -575,6 +629,19 @@ def render_config(
     transform_funcs = transform_funcs or [expand_env_vars]
     for transform in transform_funcs:
         effective_config = transform(effective_config)
+    
+    # Validate configuration against schemas if enabled
+    if validate_schema:
+        validator_class = import_validator()
+        if validator_class:
+            try:
+                logger.info("config.validation.starting")
+                effective_config = validator_class.validate_complete_config(effective_config)
+                logger.info("config.validation.complete")
+            except Exception as e:
+                logger.error("config.validation.failed", error=str(e))
+        else:
+            logger.warning("config.validation.skipped", reason="validator_not_available")
     
     # Create output directory
     output_dir = workdir / run_id

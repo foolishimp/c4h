@@ -21,6 +21,13 @@
    - Confirmed that legacy agent implementation files that were to be deleted are already removed:
      - All old specific agent classes like `coder.py`, `discovery.py`, `solution_designer.py`, etc. are not present in the codebase
 
+4. **Technical Debt Resolution: Generic Command Line Skill**
+   - Implemented a generic `CommandLineRunner` skill to replace the specialized `TartXTRunner` skill
+   - Configured the skill registry to properly register the new skill with default config for tartxt
+   - Created an example persona configuration (`discovery_generic_v1.yml`) to demonstrate usage
+   - Added test cases to verify that the `CommandLineRunner` can correctly execute tartxt
+   - Preserved backward compatibility while enabling a more generic and reusable approach
+
 ## Verification
 
 - The updated BaseAgent implementation correctly initializes all attributes from `full_effective_config` and `unique_name`

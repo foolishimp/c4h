@@ -12,6 +12,7 @@ import subprocess
 from c4h_agents.agents.base_agent import BaseAgent, AgentResponse
 from c4h_agents.agents.types import LLMMessages, LogDetail, AgentType, SkillResult
 from c4h_agents.utils.logging import get_logger
+from c4h_agents.skills.registry import SkillRegistry
 
 logger = get_logger()
 
@@ -24,7 +25,7 @@ class GenericLLMAgent(BaseAgent):
     - Uses persona-based configuration for prompts and parameters
     - Supports runtime overrides through context
     - Can invoke skills if configured instead of using LLM directly
-    - Special handling for discovery agents with project scanning
+    - REMOVED: Special handling for discovery agents with project scanning (now uses tartxt_runner skill)
     """
     
     def __init__(self, full_effective_config: Dict[str, Any], unique_name: str):
@@ -76,9 +77,8 @@ class GenericLLMAgent(BaseAgent):
         3. Formats it using data variables
         4. Returns the formatted prompt
         
-        Special handling for discovery agent:
-        - If this is a discovery agent and tartxt_config is present,
-          run the tartxt.py script to gather project information
+        REMOVED: Special handling for discovery agent with tartxt.py execution.
+        This functionality is now available via the tartxt_runner skill.
         
         Args:
             data: Data to format
@@ -89,96 +89,6 @@ class GenericLLMAgent(BaseAgent):
         """
         # Make a copy of data to avoid modifying the original
         data_copy = dict(data)
-        
-        # Check if this is a discovery agent with tartxt config
-        if (self.unique_name == "discovery_phase" or 
-            self.config_path.endswith(".discovery") or 
-            "discovery" in self.unique_name):
-            
-            # Get tartxt_config from context override or persona
-            tartxt_config = None
-            
-            # First check for override in context
-            if context:
-                overrides = context.get('agent_config_overrides', {}).get(self.unique_name, {})
-                if 'tartxt_config' in overrides and isinstance(overrides['tartxt_config'], dict):
-                    tartxt_config = overrides['tartxt_config']
-                    self.logger.debug("discovery.tartxt_config_from_override")
-            
-            # If no override, get from persona
-            if not tartxt_config:
-                tartxt_config = self.config_node.get_value(f"{self.persona_path}.tartxt_config")
-            
-            if tartxt_config and isinstance(tartxt_config, dict):
-                self.logger.info("discovery.tartxt_config_found", 
-                               config_keys=list(tartxt_config.keys()),
-                               from_override=bool(context and 'tartxt_config' in context.get('agent_config_overrides', {}).get(self.unique_name, {})))
-                
-                # Get script path
-                script_path = tartxt_config.get("script_path")
-                if script_path and os.path.exists(script_path):
-                    # Get project path from data/context
-                    project_path = data_copy.get("project_path")
-                    if not project_path and context:
-                        project_path = context.get("project_path")
-                    if not project_path:
-                        self.logger.warning("discovery.no_project_path_in_context")
-                        project_path = os.getcwd()
-                    
-                    # Get exclusions
-                    exclusions = tartxt_config.get("exclusions", [])
-                    exclusion_arg = ",".join(exclusions) if exclusions else ""
-                    
-                    # Create output file path
-                    output_file = os.path.join(os.getcwd(), "workspaces", f"project_scan_{self.run_id}.txt")
-                    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-                    
-                    # Build command
-                    cmd = [
-                        script_path,
-                        project_path,
-                        "-f", output_file,
-                        "-H", "0"  # No history initially for speed
-                    ]
-                    
-                    if exclusion_arg:
-                        cmd.extend(["-x", exclusion_arg])
-                    
-                    # Run tartxt.py
-                    self.logger.info("discovery.running_tartxt", cmd=cmd)
-                    try:
-                        import subprocess
-                        result = subprocess.run(
-                            cmd,
-                            capture_output=True,
-                            text=True,
-                            check=False
-                        )
-                        
-                        if result.returncode != 0:
-                            self.logger.error("discovery.tartxt_failed", 
-                                            returncode=result.returncode,
-                                            stderr=result.stderr)
-                        else:
-                            self.logger.info("discovery.tartxt_success", output_file=output_file)
-                            
-                            # Read output file and add to data
-                            try:
-                                if os.path.exists(output_file):
-                                    with open(output_file, 'r', encoding='utf-8') as f:
-                                        project_content = f.read()
-                                    
-                                    # Update data with project content
-                                    data_copy['project_content'] = project_content
-                                    data_copy['project_scan_file'] = output_file
-                                    self.logger.info("discovery.added_project_content", 
-                                                  content_length=len(project_content))
-                                else:
-                                    self.logger.error("discovery.output_file_not_found", file=output_file)
-                            except Exception as e:
-                                self.logger.error("discovery.read_output_failed", error=str(e))
-                    except Exception as e:
-                        self.logger.error("discovery.tartxt_execution_failed", error=str(e))
         
         # Get template key from overrides or persona config
         template_key = "user"  # Default template key
@@ -345,272 +255,16 @@ class GenericSingleShotAgent(GenericLLMAgent):
                            message="GenericSingleShotAgent is deprecated. Use GenericLLMAgent instead.",
                            agent_type="GenericSingleShotAgent")
 
-    def _get_agent_name(self) -> str:
-        """Return the unique name for this agent instance."""
-        return self.unique_name
-
-    def _get_system_message(self, context: Optional[Dict[str, Any]] = None) -> str:
-        """
-        Get system message with support for dynamic overrides.
-        
-        Args:
-            context: Optional runtime context that may contain overrides
-            
-        Returns:
-            System message string from context override or persona config
-        """
-        # Use BaseAgent's implementation which now includes persona fallback
-        return super()._get_system_message(context)
-
-    def _format_request(self, data: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> str:
-        """
-        Format user request based on path-addressable config with support for runtime overrides.
-        
-        This method:
-        1. Checks for overrides in context
-        2. Gets the prompt template specified in config or persona
-        3. Formats it using data variables
-        4. Returns the formatted prompt
-        
-        Special handling for discovery agent:
-        - If this is a discovery agent and tartxt_config is present,
-          run the tartxt.py script to gather project information
-        
-        Args:
-            data: Data to format
-            context: Optional runtime context that may contain overrides
-            
-        Returns:
-            Formatted request string
-        """
-        # Make a copy of data to avoid modifying the original
-        data_copy = dict(data)
-        
-        # Check if this is a discovery agent with tartxt config
-        if (self.unique_name == "discovery_phase" or 
-            self.config_path.endswith(".discovery") or 
-            "discovery" in self.unique_name):
-            
-            # Get tartxt_config from context override or persona
-            tartxt_config = None
-            
-            # First check for override in context
-            if context:
-                overrides = context.get('agent_config_overrides', {}).get(self.unique_name, {})
-                if 'tartxt_config' in overrides and isinstance(overrides['tartxt_config'], dict):
-                    tartxt_config = overrides['tartxt_config']
-                    self.logger.debug("discovery.tartxt_config_from_override")
-            
-            # If no override, get from persona
-            if not tartxt_config:
-                tartxt_config = self.config_node.get_value(f"{self.persona_path}.tartxt_config")
-            
-            if tartxt_config and isinstance(tartxt_config, dict):
-                self.logger.info("discovery.tartxt_config_found", 
-                               config_keys=list(tartxt_config.keys()),
-                               from_override=bool(context and 'tartxt_config' in context.get('agent_config_overrides', {}).get(self.unique_name, {})))
-                
-                # Get script path
-                script_path = tartxt_config.get("script_path")
-                if script_path and os.path.exists(script_path):
-                    # Get project path from data/context
-                    project_path = data_copy.get("project_path")
-                    if not project_path and context:
-                        project_path = context.get("project_path")
-                    if not project_path:
-                        self.logger.warning("discovery.no_project_path_in_context")
-                        project_path = os.getcwd()
-                    
-                    # Get exclusions
-                    exclusions = tartxt_config.get("exclusions", [])
-                    exclusion_arg = ",".join(exclusions) if exclusions else ""
-                    
-                    # Create output file path
-                    output_file = os.path.join(os.getcwd(), "workspaces", f"project_scan_{self.run_id}.txt")
-                    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-                    
-                    # Build command
-                    cmd = [
-                        script_path,
-                        project_path,
-                        "-f", output_file,
-                        "-H", "0"  # No history initially for speed
-                    ]
-                    
-                    if exclusion_arg:
-                        cmd.extend(["-x", exclusion_arg])
-                    
-                    # Run tartxt.py
-                    self.logger.info("discovery.running_tartxt", cmd=cmd)
-                    try:
-                        import subprocess
-                        result = subprocess.run(
-                            cmd,
-                            capture_output=True,
-                            text=True,
-                            check=False
-                        )
-                        
-                        if result.returncode != 0:
-                            self.logger.error("discovery.tartxt_failed", 
-                                            returncode=result.returncode,
-                                            stderr=result.stderr)
-                        else:
-                            self.logger.info("discovery.tartxt_success", output_file=output_file)
-                            
-                            # Read output file and add to data
-                            try:
-                                if os.path.exists(output_file):
-                                    with open(output_file, 'r', encoding='utf-8') as f:
-                                        project_content = f.read()
-                                    
-                                    # Update data with project content
-                                    data_copy['project_content'] = project_content
-                                    data_copy['project_scan_file'] = output_file
-                                    self.logger.info("discovery.added_project_content", 
-                                                  content_length=len(project_content))
-                                else:
-                                    self.logger.error("discovery.output_file_not_found", file=output_file)
-                            except Exception as e:
-                                self.logger.error("discovery.read_output_failed", error=str(e))
-                    except Exception as e:
-                        self.logger.error("discovery.tartxt_execution_failed", error=str(e))
-        
-        # Get template key from overrides or persona config
-        template_key = "user"  # Default template key
-        template = None
-        
-        # Check for overrides in context
-        if context:
-            overrides = context.get('agent_config_overrides', {}).get(self.unique_name, {})
-            
-            # Direct template override
-            if 'template' in overrides:
-                template = overrides['template']
-                self.logger.debug("format_request.using_direct_template_override", 
-                               template_length=len(template) if template else 0)
-            
-            # Or template key override
-            elif 'template_key' in overrides:
-                template_key = overrides['template_key']
-                self.logger.debug("format_request.using_template_key_override", template_key=template_key)
-        
-        # If no direct template override, check persona config for template_name
-        if template is None:
-            # First try to get the template_name from persona config
-            persona_template_name = self.config_node.get_value(f"{self.persona_path}.prompts.template_name")
-            if persona_template_name:
-                template_key = persona_template_name
-                self.logger.debug("format_request.using_persona_template_name", template_key=template_key)
-        
-        # If still no template, get it from persona prompts using template_key
-        if template is None:
-            template = self.config_node.get_value(f"{self.persona_path}.prompts.{template_key}")
-            
-            if not template:
-                self.logger.warning("prompt_template.not_found", 
-                                  template_key=template_key,
-                                  persona_key=self.persona_key,
-                                  persona_path=f"{self.persona_path}.prompts.{template_key}")
-                # Fallback to simple JSON string if template not found
-                return json.dumps(data_copy, indent=2)
-        
-        try:
-            # Format the template with context variables
-            # Handle both string templates with format() and direct values
-            if isinstance(template, str) and "{" in template:
-                formatted_prompt = template.format(**data_copy)
-            else:
-                formatted_prompt = str(template)
-                
-            if self._should_log(LogDetail.DEBUG):
-                self.logger.debug("prompt.formatted", 
-                                template_key=template_key,
-                                prompt_length=len(formatted_prompt))
-                
-            return formatted_prompt
-            
-        except KeyError as e:
-            self.logger.error("prompt.format_key_error", 
-                            error=str(e), 
-                            template_key=template_key)
-            # Fall back to sending the context directly as JSON
-            return json.dumps(data_copy, indent=2)
-        except Exception as e:
-            self.logger.error("prompt.format_error", 
-                            error=str(e), 
-                            template_key=template_key)
-            return json.dumps(data_copy, indent=2)
-
-    def process(self, context: Dict[str, Any]) -> AgentResponse:
-        """
-        Process a request using a single LLM interaction or skill invocation.
-        Checks for skill configuration before falling back to LLM.
-        """
-        # Check if a skill is configured for this agent
-        agent_config = self.config_node.get_value(self.config_path)
-        skill_identifier = None
-        skill_params = {}
-        
-        if agent_config and isinstance(agent_config, dict):
-            skill_identifier = agent_config.get('skill')
-            skill_params = agent_config.get('skill_params', {})
-            
-        # Also check persona config for skill configuration
-        if not skill_identifier and self.persona_key:
-            persona_config = self.config_node.get_value(self.persona_path)
-            if persona_config and isinstance(persona_config, dict):
-                skill_identifier = persona_config.get('skill')
-                skill_params = persona_config.get('skill_params', {})
-                
-        # If a skill is configured, invoke it
-        if skill_identifier:
-            self.logger.info("agent.using_skill", 
-                           skill=skill_identifier, 
-                           agent_name=self.unique_name)
-                           
-            # Prepare skill parameters from context
-            # Start with any configured parameters
-            execution_params = dict(skill_params) if skill_params else {}
-            
-            # Add context as input if not already present
-            if 'input' not in execution_params:
-                execution_params['input'] = context
-                
-            # Add agent information
-            execution_params['agent_name'] = self.unique_name
-            execution_params['agent_id'] = self.agent_id
-            
-            # Invoke the skill
-            skill_result = self._invoke_skill(skill_identifier, execution_params)
-            
-            # Convert to AgentResponse
-            if isinstance(skill_result, SkillResult):
-                # Use the built-in conversion
-                return skill_result.to_agent_response()
-            else:
-                # Handle unexpected result type
-                self.logger.warning("agent.unexpected_skill_result_type", 
-                                  type=type(skill_result).__name__)
-                
-                # Attempt to create a valid AgentResponse
-                success = getattr(skill_result, 'success', True)
-                error = getattr(skill_result, 'error', None)
-                
-                return AgentResponse(
-                    success=success,
-                    data={"skill_result": skill_result},
-                    error=error
-                )
-        
-        # No skill configured or skill invocation failed, fall back to LLM
-        return super().process(context)
-
 
 class GenericOrchestratorAgent(BaseAgent):
     """
     Generic agent that orchestrates a series of steps based on an execution plan.
     Uses path-addressable config to access execution plan and settings.
+    
+    IMPORTANT: This class is maintained for backward compatibility but
+    will be deprecated. Its functionality is now provided by the
+    ExecutionPlanExecutor and generic agents with execution_plan in
+    their persona configuration.
     
     Key capabilities:
     - Executes multi-step workflows defined in configuration
@@ -641,6 +295,11 @@ class GenericOrchestratorAgent(BaseAgent):
             agent_type=self.agent_type.value
         )
         self.logger.info("generic_agent.initialized", agent_type=self.agent_type.value)
+        
+        # Log deprecation warning
+        self.logger.warning("generic_agent.deprecation_notice", 
+                          message="GenericOrchestratorAgent will be deprecated in future releases. " +
+                                  "Use ExecutionPlanExecutor with agents that have an execution_plan in their persona instead.")
         
         # Get execution plan from persona configuration
         self.execution_plan = self.config_node.get_value(f"{self.persona_path}.execution_plan")
@@ -754,6 +413,14 @@ class GenericOrchestratorAgent(BaseAgent):
         Returns:
             Standard AgentResponse with results from all executed steps
         """
+        # Add deprecation notice to context for lineage tracking
+        if "agent_metadata" not in context:
+            context["agent_metadata"] = {}
+        context["agent_metadata"]["deprecation_notice"] = (
+            "GenericOrchestratorAgent will be deprecated. " +
+            "Use ExecutionPlanExecutor with agents that have an execution_plan in their persona instead."
+        )
+        
         self.logger.info("orchestration.start", context_keys=list(context.keys()))
         
         # Check for execution plan override in context
@@ -1206,9 +873,6 @@ class GenericOrchestratorAgent(BaseAgent):
                 error=str(e)
             )
 
-# Note: GenericOrchestratingAgent (previously requested in WO-trefac-01) has been renamed to GenericOrchestratorAgent.
-# Use GenericOrchestratorAgent directly instead as it provides the same functionality with a more consistent naming pattern.
-
 
 class GenericSkillAgent(BaseAgent):
     """
@@ -1409,9 +1073,9 @@ class GenericSkillAgent(BaseAgent):
                 
         except Exception as e:
             error_msg = f"Error invoking skill '{skill_identifier}': {str(e)}"
-            self.logger.error("skill_agent.skill_invocation_failed", 
-                           skill=skill_identifier, 
-                           error=str(e))
+            self.logger.exception("skill_agent.skill_invocation_failed", 
+                               skill=skill_identifier, 
+                               error=str(e))
             
             # Check if LLM fallback is allowed
             if self.allow_llm_fallback:

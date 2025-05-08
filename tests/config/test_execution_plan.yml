@@ -1,0 +1,60 @@
+llm_config:
+  agents:
+    test_agent:
+      execution_plan:
+        description: Test execution plan
+        steps:
+        - field: test_value
+          name: set_initial_value
+          type: set_value
+          value: This is a test value
+        - branches:
+          - condition:
+              field: test_value
+              operator: exists
+            target: return_success
+          - condition:
+              condition:
+                field: test_value
+                operator: exists
+              type: not
+            target: return_failure
+          description: Check if value is set
+          name: check_value
+          type: branch
+        - field: response
+          name: return_success
+          type: set_value
+          value: Execution plan completed successfully
+        - field: response
+          name: return_failure
+          type: set_value
+          value: Execution plan failed
+      persona_key: test_persona
+  default_model: claude-3-opus-20240229
+  default_provider: anthropic
+  personas:
+    test_persona:
+      model: claude-3-opus-20240229
+      prompts:
+        system: You are a helpful AI assistant.
+        user: Hello, how can I help you today?
+      provider: anthropic
+      temperature: 0.0
+  providers:
+    anthropic:
+      default_model: claude-3-opus-20240229
+      valid_models:
+      - claude-3-opus-20240229
+      - claude-3-sonnet-20240229
+  skills:
+    semantic_extract:
+      class: SemanticExtract
+      description: Extract semantic data from text
+      method: execute
+      module: c4h_agents.skills.semantic_extract
+    tartxt_runner:
+      class: TartXTRunner
+      description: Scan project and extract content
+      method: execute
+      module: c4h_agents.skills.tartxt_runner

@@ -222,7 +222,9 @@ class BaseAgent(BaseConfig, BaseLLM):
         Main process entry point for handling requests.
         
         This is the primary method that MAY be overridden by specific agent implementations.
-        It will fall back to a simple LLM interaction via _process(context) if not overridden.
+        It will first check if the agent has an execution plan, and if so, use the 
+        ExecutionPlanExecutor to execute it. Otherwise, it will fall back to a simple 
+        LLM interaction via _process(context).
         
         Note: Even when overriding this method, implementations should generally use the
         persona-based configuration approach rather than hardcoding prompts or behavior.
@@ -233,7 +235,111 @@ class BaseAgent(BaseConfig, BaseLLM):
         Returns:
             Standard AgentResponse with results
         """
+        # Check if this agent has an execution plan
+        if self._has_execution_plan:
+            return self._execute_plan(context)
+        
+        # Fall back to LLM processing
         return self._process(context)
+        
+    def _execute_plan(self, context: Dict[str, Any]) -> AgentResponse:
+        """
+        Execute the agent's execution plan using the ExecutionPlanExecutor.
+        
+        Args:
+            context: Input context containing data for processing
+            
+        Returns:
+            Standard AgentResponse with results from the execution plan
+        """
+        try:
+            # Get the execution plan
+            execution_plan = self.get_execution_plan()
+            if not execution_plan:
+                self.logger.error("execute_plan.plan_not_found", 
+                               agent_name=self._get_agent_name())
+                return AgentResponse(
+                    success=False,
+                    data={},
+                    error="Execution plan not found",
+                    messages=None
+                )
+            
+            # Prepare lineage context
+            lineage_context = self._prepare_lineage_context(context)
+            
+            # Add execution metadata
+            agent_execution_id = lineage_context.get("agent_execution_id")
+            parent_id = lineage_context.get("parent_id")
+            
+            # Import executor here to avoid circular imports
+            from c4h_agents.execution.executor import ExecutionPlanExecutor
+            from c4h_agents.skills.registry import SkillRegistry
+            
+            # Initialize skill registry
+            registry = SkillRegistry()
+            registry.register_builtin_skills()
+            registry.load_skills_from_config(self.config)
+            
+            # Create executor
+            executor = ExecutionPlanExecutor(
+                effective_config=self.config,
+                skill_registry=registry
+            )
+            
+            # Execute the plan
+            self.logger.info("execute_plan.starting", 
+                          agent_name=self._get_agent_name(),
+                          agent_execution_id=agent_execution_id,
+                          steps_count=len(execution_plan.get("steps", [])))
+            
+            result = executor.execute_plan(execution_plan, lineage_context)
+            
+            # Create response from execution result
+            self.logger.info("execute_plan.completed", 
+                          agent_name=self._get_agent_name(),
+                          agent_execution_id=agent_execution_id,
+                          steps_executed=result.steps_executed,
+                          success=result.success)
+            
+            # Extract response from context or output
+            response_content = result.output or result.context.get("response", "")
+            
+            # Create agent response
+            return AgentResponse(
+                success=result.success,
+                data={
+                    "response": response_content,
+                    "execution_result": {
+                        "steps_executed": result.steps_executed,
+                        "success": result.success,
+                        "error": result.error
+                    },
+                    "execution_metadata": {
+                        "agent_execution_id": agent_execution_id,
+                        "parent_id": parent_id,
+                        "workflow_run_id": lineage_context.get("workflow_run_id"),
+                        "agent_id": self.agent_id,
+                        "agent_type": self._get_agent_name(),
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                },
+                error=result.error,
+                messages=None
+            )
+            
+        except Exception as e:
+            self.logger.error("execute_plan.failed", 
+                           agent_name=self._get_agent_name(),
+                           error=str(e),
+                           traceback=traceback.format_exc())
+            
+            return AgentResponse(
+                success=False,
+                data={},
+                error=f"Error executing plan: {str(e)}",
+                messages=None
+            )
 
     def _prepare_lineage_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
