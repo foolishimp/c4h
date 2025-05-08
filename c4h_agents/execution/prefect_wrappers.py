@@ -336,10 +336,14 @@ def execute_agent_task(
     event_logger_config: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Prefect task wrapper for executing a C4H agent.
+    Prefect task wrapper for executing a C4H agent with execution plan.
+    
+    This task executes an agent by:
+    1. Checking if the agent has an execution_plan in its configuration
+    2. Using the ExecutionPlanExecutor to run the plan
     
     Args:
-        agent_type: Type of agent to instantiate ("GenericLLMAgent", "GenericOrchestratorAgent", etc.)
+        agent_type: Type of agent to instantiate
         persona_config: Configuration for the agent's persona
         input_context: Input context for agent processing
         effective_config: The effective configuration for the system
@@ -375,27 +379,28 @@ def execute_agent_task(
                 }
             )
         
-        # Dynamically import and instantiate the agent class
-        try:
-            agents_module = importlib.import_module("c4h_agents.agents.generic")
-            agent_class = getattr(agents_module, agent_type)
-        except (ImportError, AttributeError) as e:
-            logger.error("prefect.task.execute_agent.import_failed",
-                       agent_type=agent_type,
-                       error=str(e))
-            raise ValueError(f"Failed to import agent type '{agent_type}': {str(e)}")
-        
-        # Prepare agent configuration
-        agent_config = deepcopy(persona_config)
-        agent_config["effective_config"] = effective_config
-        if event_logger:
-            agent_config["event_logger"] = event_logger
+        # Check for execution plan in the configuration
+        if "execution_plan" not in persona_config or not persona_config["execution_plan"].get("enabled", True):
+            error_msg = f"Agent does not have a valid execution_plan in its configuration"
+            logger.error(error_msg)
+            return {
+                "result": None,
+                "success": False,
+                "error": error_msg,
+                "duration": time.time() - start_time
+            }
             
-        # Instantiate the agent
-        agent_instance = agent_class(agent_config)
+        # Get the execution plan
+        execution_plan = persona_config["execution_plan"]
         
-        # Process the input context
-        result = agent_instance.process(input_context)
+        # Create executor
+        executor = ExecutionPlanExecutor(
+            effective_config=effective_config,
+            event_logger=event_logger
+        )
+        
+        # Execute the plan
+        execution_result = executor.execute_plan(execution_plan, input_context)
         
         # Calculate duration
         duration = time.time() - start_time
@@ -403,30 +408,28 @@ def execute_agent_task(
         # Log agent execution complete
         logger.info("prefect.task.execute_agent.complete",
                   agent_type=agent_type,
-                  duration=duration)
+                  duration=duration,
+                  success=execution_result.success)
                   
         if event_logger:
             event_logger.log_event(
                 event_type="agent_execution_complete",
                 data={
                     "agent_type": agent_type,
-                    "duration": duration
+                    "duration": duration,
+                    "success": execution_result.success
                 }
             )
         
-        # Convert result to dict for Prefect
-        if isinstance(result, dict):
-            result_dict = result
-        else:
-            # If result is not a dict, wrap it
-            result_dict = {
-                "result": result,
-                "duration": duration
-            }
-        
-        # Add execution metadata
-        result_dict["success"] = True
-        result_dict["duration"] = duration
+        # Convert ExecutionResult to dict
+        result_dict = {
+            "context": execution_result.context,
+            "result": execution_result.output,
+            "success": execution_result.success,
+            "error": execution_result.error,
+            "steps_executed": execution_result.steps_executed,
+            "duration": duration
+        }
         
         return result_dict
         
@@ -512,10 +515,8 @@ def execute_team_task(
     """
     Prefect task wrapper for executing a C4H team.
     
-    This task executes a team by:
-    1. Checking if the team has an execution_plan
-    2. If yes, using the ExecutionPlanExecutor to run the plan
-    3. If no, executing each agent in the team's agents list sequentially
+    This task executes a team by using the ExecutionPlanExecutor with the team's execution plan.
+    All teams must have an execution_plan in their configuration.
     
     Args:
         team_config: Team configuration dictionary
@@ -555,115 +556,37 @@ def execute_team_task(
             )
         
         # Check for execution plan in the team config
-        if "execution_plan" in team_config and team_config["execution_plan"].get("enabled", True):
-            # Team has an execution plan, use ExecutionPlanExecutor
-            execution_plan = team_config["execution_plan"]
-            
-            # Create executor
-            executor = ExecutionPlanExecutor(
-                effective_config=effective_config,
-                event_logger=event_logger
-            )
-            
-            # Execute the plan
-            execution_result = executor.execute_plan(execution_plan, input_context)
-            
-            # Convert ExecutionResult to dict
-            result = {
-                "context": execution_result.context,
-                "output": execution_result.output,
-                "success": execution_result.success,
-                "error": execution_result.error,
-                "steps_executed": execution_result.steps_executed
+        if "execution_plan" not in team_config or not team_config["execution_plan"].get("enabled", True):
+            error_msg = f"Team '{team_name}' does not have a valid execution_plan in its configuration"
+            logger.error(error_msg)
+            return {
+                "context": input_context,
+                "output": None,
+                "success": False,
+                "error": error_msg,
+                "duration": time.time() - start_time
             }
-        else:
-            # Team doesn't have an execution plan, execute agents sequentially
-            agents_list = team_config.get("agents", [])
-            if not agents_list:
-                # Check for tasks (legacy configuration)
-                agents_list = team_config.get("tasks", [])
-                
-            if not agents_list:
-                raise ValueError(f"Team '{team_name}' has no execution_plan and no agents/tasks list")
             
-            # Execute each agent and collect results
-            agent_results = []
-            current_context = deepcopy(input_context)
-            
-            for i, agent_config in enumerate(agents_list):
-                agent_name = agent_config.get("name", f"agent_{i}")
-                agent_type = agent_config.get("agent_type", "GenericLLMAgent")
-                persona_key = agent_config.get("persona_key")
-                
-                # Get persona config if persona_key is provided
-                persona_config = {}
-                if persona_key and "llm_config" in effective_config and "personas" in effective_config["llm_config"]:
-                    if persona_key in effective_config["llm_config"]["personas"]:
-                        persona_config = effective_config["llm_config"]["personas"][persona_key]
-                
-                # Merge agent config with persona config
-                merged_config = deepcopy(persona_config)
-                merged_config.update(agent_config)
-                
-                # Execute the agent
-                logger.info("prefect.task.execute_team.executing_agent",
-                          team_name=team_name,
-                          agent_name=agent_name,
-                          agent_type=agent_type)
-                
-                try:
-                    # Execute agent and update context with results
-                    agent_result = execute_agent_task(
-                        agent_type=agent_type,
-                        persona_config=merged_config,
-                        input_context=current_context,
-                        effective_config=effective_config,
-                        event_logger_config=event_logger_config if event_logger_config else None
-                    )
-                    
-                    # Update context for next agent
-                    if "context" in agent_result:
-                        current_context.update(agent_result["context"])
-                    elif isinstance(agent_result.get("result"), dict):
-                        # If agent returns direct result dict, use that to update context
-                        current_context.update(agent_result["result"])
-                    
-                    # Save agent result
-                    agent_results.append({
-                        "agent_name": agent_name,
-                        "agent_type": agent_type,
-                        "success": agent_result.get("success", True),
-                        "error": agent_result.get("error")
-                    })
-                    
-                except Exception as e:
-                    logger.error("prefect.task.execute_team.agent_execution_failed",
-                               team_name=team_name,
-                               agent_name=agent_name,
-                               error=str(e))
-                    
-                    agent_results.append({
-                        "agent_name": agent_name,
-                        "agent_type": agent_type,
-                        "success": False,
-                        "error": str(e)
-                    })
-                    
-                    # Check if we should continue or stop on error
-                    stop_on_failure = agent_config.get("stop_on_failure", True)
-                    if stop_on_failure:
-                        logger.warning("prefect.task.execute_team.stopping_on_failure",
-                                     team_name=team_name,
-                                     agent_name=agent_name)
-                        break
-            
-            # Create final result
-            result = {
-                "context": current_context,
-                "output": agent_results,
-                "success": all(r.get("success", True) for r in agent_results),
-                "agents_executed": len(agent_results)
-            }
+        # Team has an execution plan, use ExecutionPlanExecutor
+        execution_plan = team_config["execution_plan"]
+        
+        # Create executor
+        executor = ExecutionPlanExecutor(
+            effective_config=effective_config,
+            event_logger=event_logger
+        )
+        
+        # Execute the plan
+        execution_result = executor.execute_plan(execution_plan, input_context)
+        
+        # Convert ExecutionResult to dict
+        result = {
+            "context": execution_result.context,
+            "output": execution_result.output,
+            "success": execution_result.success,
+            "error": execution_result.error,
+            "steps_executed": execution_result.steps_executed
+        }
         
         # Calculate duration
         duration = time.time() - start_time

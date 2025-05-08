@@ -1171,14 +1171,16 @@ def execute_team_subflow(
     current_context: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Execute a team's tasks as defined in the effective configuration.
-    Supports regular team execution and loop-based iteration.
+    Execute a team's execution plan as defined in the effective configuration.
     
-    IMPORTANT: This function treats current_context as immutable/read-only.
-    It does not modify the input context directly. Any required context
-    updates are returned in the result object for the orchestrator to handle
-    according to REQ-DET-05.
-
+    This function uses the ExecutionPlanExecutor to execute teams with execution plans.
+    All teams must have an execution_plan in their configuration.
+    
+    Key features:
+    - Context immutability: current_context is treated as read-only
+    - Support for execution plans embedded in teams
+    - Comprehensive logging and error handling
+    
     Args:
         team_id: ID of the team to execute
         effective_config: The complete effective configuration snapshot
@@ -1188,7 +1190,7 @@ def execute_team_subflow(
         Dict with team execution results
     """
     run_logger = get_run_logger()
-    task_results = [] # Initialize outside try block
+    execution_start_time = datetime.now(timezone.utc)
 
     try:
         # Create config node for path-based access
@@ -1196,7 +1198,7 @@ def execute_team_subflow(
 
         # Look up team configuration in the effective config
         team_config = config_node.get_value(f"orchestration.teams.{team_id}")
-        if not team_config or not isinstance(team_config, dict): # Check if dict
+        if not team_config or not isinstance(team_config, dict):
             run_logger.error(f"Team configuration not found or invalid for team: {team_id}")
             return {
                 "success": False,
@@ -1205,275 +1207,105 @@ def execute_team_subflow(
                 "results": []
             }
 
-        # Check if this is a loop team
-        team_type = team_config.get("type", "standard")
-        if team_type == "loop":
-            # Execute as a loop team
-            return execute_loop_team(
-                team_id=team_id,
-                team_config=team_config,
+        # Add team_id and execution time to context for lineage tracking
+        updated_context = deepcopy(current_context)
+        if "execution_metadata" not in updated_context:
+            updated_context["execution_metadata"] = {}
+        updated_context["execution_metadata"]["team_id"] = team_id
+        updated_context["execution_metadata"]["start_time"] = execution_start_time.isoformat()
+            
+        # Initialize event logger if configured
+        lineage_config = config_node.get_value("llm_config.agents.lineage", {})
+        event_logger = None
+        if lineage_config.get("enabled", True):
+            try:
+                # Get workflow run ID from context
+                workflow_run_id = updated_context.get("workflow_run_id")
+                
+                # Initialize event logger
+                event_logger = EventLogger(
+                    lineage_config, 
+                    parent_id=workflow_run_id,
+                    namespace=f"team_{team_id}"
+                )
+                run_logger.debug("Initialized event logger for team", team_id=team_id)
+            except Exception as e:
+                run_logger.error("Failed to initialize event logger", error=str(e))
+                
+        # Check if this team has an execution plan
+        if "execution_plan" not in team_config:
+            error_msg = f"Team '{team_id}' does not have an execution_plan in its configuration"
+            run_logger.error(error_msg)
+            return {
+                "success": False,
+                "team_id": team_id,
+                "error": error_msg,
+                "execution_type": "error"
+            }
+            
+        run_logger.info(f"Executing team '{team_id}' with ExecutionPlanExecutor")
+        try:
+            # Import the ExecutionPlanExecutor
+            from c4h_agents.execution.executor import ExecutionPlanExecutor, ExecutionResult
+            
+            # Initialize skill registry for the executor
+            from c4h_agents.skills.registry import SkillRegistry
+            registry = SkillRegistry()
+            registry.register_builtin_skills()
+            registry.load_skills_from_config(effective_config)
+            
+            # Initialize the executor with the effective config
+            executor = ExecutionPlanExecutor(
                 effective_config=effective_config,
-                current_context=current_context
+                skill_registry=registry,
+                event_logger=event_logger
             )
-
-        # Standard team execution flow - get the team's tasks list
-        tasks = team_config.get("tasks", [])
-        if not tasks:
-            run_logger.warning(f"No tasks defined for team: {team_id}")
-            # Return success if no tasks, as the team technically completed
-            return { "success": True, "team_id": team_id, "results": [], "task_count": 0 }
-
-        # Execute each task in sequence
-        for i, task_config_def in enumerate(tasks):
-            # Ensure task_config_def is a dictionary
-            if not isinstance(task_config_def, dict):
-                 run_logger.error(f"Invalid task definition format in team {team_id}, task index {i}", task_def=task_config_def)
-                 # Decide how to handle: skip task or fail team? Failing team seems safer.
-                 return { "success": False, "error": f"Invalid task definition at index {i} for team {team_id}", "team_id": team_id, "results": task_results }
-
-            task_name = task_config_def.get('name', f'unnamed_task_{i}')
-            run_logger.info(f"Executing task {i+1}/{len(tasks)}: {task_name}")
-
-            # Add task_config to context for factory creation
-            # Use deepcopy to ensure true immutability by creating new copies of nested objects
-            from copy import deepcopy
-            task_context = deepcopy(current_context)
-            task_context["task_config"] = deepcopy(task_config_def)
-
-            # Execute the task using run_agent_task
-            # Pass the full effective_config snapshot
-            result = run_agent_task(
-                task_config=task_config_def, # Pass the specific task definition
-                context=task_context,
-                effective_config=effective_config
-            )
-
-            task_results.append(result)
-
-            # Stop on failure if configured to do so
-            stop_on_fail = team_config.get("stop_on_failure", True)
-            if not result.get("success", False) and stop_on_fail:
-                run_logger.warning(f"Task {task_name} failed, stopping team sequence based on stop_on_failure=True.")
-                break # Stop processing further tasks in this team
-
-        # Determine overall team success (all tasks succeeded OR failures were allowed)
-        all_succeeded = all(r.get("success", False) for r in task_results)
-        team_success = all_succeeded or not team_config.get("stop_on_failure", True)
-
-        # Return comprehensive team results
-        return {
-            "success": team_success,
-            "team_id": team_id,
-            "results": task_results, # Contains results for each task executed
-            "task_count": len(tasks)
-        }
+            
+            # Get the execution plan from the team config
+            execution_plan = team_config["execution_plan"]
+            
+            # Log execution plan details
+            run_logger.info(f"Executing team's execution plan - Team: {team_id}, Steps: {len(execution_plan.get('steps', []))}, Executor: {executor.execution_id}")
+                          
+            # Execute the plan
+            execution_result = executor.execute_plan(execution_plan, updated_context)
+            
+            # Calculate execution duration
+            execution_end_time = datetime.now(timezone.utc)
+            duration_seconds = (execution_end_time - execution_start_time).total_seconds()
+            
+            # Convert ExecutionResult to team result format
+            team_result = {
+                "success": execution_result.success,
+                "team_id": team_id,
+                "output": execution_result.output,
+                "context": execution_result.context,
+                "steps_executed": execution_result.steps_executed,
+                "error": execution_result.error,
+                "execution_type": "execution_plan",
+                "duration_seconds": duration_seconds,
+                "execution_id": executor.execution_id
+            }
+            
+            run_logger.info(f"Team execution plan completed - Team: {team_id}, Success: {execution_result.success}, Steps executed: {execution_result.steps_executed}, Duration: {duration_seconds:.2f}s")
+            
+            return team_result
+            
+        except Exception as e:
+            run_logger.error(f"Execution plan execution failed for team {team_id}: {str(e)}", exc_info=True)
+            return {
+                "success": False,
+                "team_id": team_id,
+                "error": f"Execution plan execution failed: {str(e)}",
+                "execution_type": "execution_plan_error"
+            }
 
     except Exception as e:
-        run_logger.error(f"Team execution failed unexpectedly for team {team_id}", error=str(e), exc_info=True) # Log traceback
+        run_logger.error(f"Team execution failed unexpectedly for team {team_id}: {str(e)}", exc_info=True)
         return {
             "success": False,
             "error": f"Unexpected error in team {team_id}: {str(e)}",
             "team_id": team_id,
-            "results": task_results # Include results up to the point of failure
+            "execution_type": "error"
         }
 
-@flow(name="execute_loop_team")
-def execute_loop_team(
-    team_id: str,
-    team_config: Dict[str, Any],
-    effective_config: Dict[str, Any],
-    current_context: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Execute a team's tasks in a loop over items in a collection.
-    
-    IMPORTANT: This function treats current_context as immutable/read-only.
-    It does not modify the input context directly. For each loop iteration,
-    a new iteration context is created by copying the current context and adding
-    iteration-specific variables. This follows the immutability principle required
-    by REQ-DET-05.
-
-    Args:
-        team_id: ID of the loop team
-        team_config: Configuration for the specific team
-        effective_config: The complete effective configuration
-        current_context: Current workflow context (treated as immutable read-only input)
-
-    Returns:
-        Dict with aggregated loop execution results
-    """
-    run_logger = get_run_logger()
-    iteration_results = []  # Track results for each iteration
-    
-    try:
-        # Validate and extract required loop configuration
-        iterate_on = team_config.get("iterate_on")
-        if not iterate_on:
-            error_msg = f"Missing required 'iterate_on' parameter for loop team: {team_id}"
-            run_logger.error(error_msg)
-            return {
-                "success": False,
-                "error": error_msg,
-                "team_id": team_id,
-                "results": []
-            }
-        
-        # Get iteration collection using path notation
-        context_node = create_config_node(current_context)
-        collection = context_node.get_value(iterate_on)
-        
-        # Validate collection
-        if not collection or not isinstance(collection, (list, dict)):
-            error_msg = f"Invalid or empty collection at path '{iterate_on}' for loop team: {team_id}"
-            run_logger.error(error_msg)
-            return {
-                "success": False,
-                "error": error_msg,
-                "team_id": team_id,
-                "results": []
-            }
-        
-        # Get loop variable name (default to "item")
-        loop_variable = team_config.get("loop_variable", "item")
-        
-        # Get loop body teams or tasks (data_context convention)
-        # Note: This section operates on the provided context as read-only input
-        # Any modifications are returned in the result, not made to the input context
-        body = team_config.get("body", []) 
-        if not body:
-            error_msg = f"Empty loop body for loop team: {team_id}"
-            run_logger.error(error_msg)
-            return {
-                "success": False,
-                "error": error_msg,
-                "team_id": team_id,
-                "results": []
-            }
-        
-        # Get stop_on_failure config (default to True)
-        stop_on_fail = team_config.get("stop_on_failure", True)
-        
-        # Convert body to list if it's not
-        if not isinstance(body, list):
-            body = [body]
-        
-        # Log loop execution start
-        run_logger.info(f"Executing loop team: {team_id} over {len(collection)} items")
-        
-        # Track index for debugging
-        for idx, item in enumerate(collection):
-            # Create iteration context with loop variable
-            # Use deepcopy to ensure true immutability by creating new copies of nested objects
-            from copy import deepcopy
-            iter_context = deepcopy(current_context)
-            
-            # Add iteration-specific variables
-            iter_context[loop_variable] = item
-            iter_context["loop_index"] = idx
-            iter_context["loop_count"] = len(collection)
-            
-            run_logger.info(f"Loop {team_id}: iteration {idx+1}/{len(collection)}")
-            
-            # Initialize iteration result
-            iter_result = {
-                "index": idx,
-                "item_key": loop_variable,
-                "success": True,
-                "results": []
-            }
-            
-            # Execute each body item (task or embedded team) with a new iteration context
-            # This follows the data_context convention by preserving the original context
-            # and creating new contexts for each iteration
-            for body_item in body:
-                # Check if this is a task or a team reference 
-                # (using read-only context pattern)
-                if isinstance(body_item, dict) and "agent_type" in body_item:
-                    # This is a task configuration
-                    task_name = body_item.get("name", f"loop_task_{idx}")
-                    run_logger.info(f"Executing loop task: {task_name} (iteration {idx+1})")
-                    
-                    # Create task context
-                    task_context = {**iter_context, "task_config": body_item}
-                    
-                    # Execute task
-                    result = run_agent_task(
-                        task_config=body_item,
-                        context=task_context,
-                        effective_config=effective_config
-                    )
-                    
-                    # Add to iteration results
-                    iter_result["results"].append(result)
-                    
-                    # Check for failure
-                    if not result.get("success", False) and stop_on_fail:
-                        iter_result["success"] = False
-                        iter_result["error"] = f"Task {task_name} failed in iteration {idx}"
-                        run_logger.warning(f"Loop {team_id}: task {task_name} failed in iteration {idx+1}, stopping iteration.")
-                        break
-                    
-                elif isinstance(body_item, str):
-                    # This is a reference to another team
-                    embedded_team_id = body_item
-                    run_logger.info(f"Executing embedded team: {embedded_team_id} (iteration {idx+1})")
-                    
-                    # Execute the referenced team (recursive)
-                    team_result = execute_team_subflow(
-                        team_id=embedded_team_id,
-                        effective_config=effective_config,
-                        current_context=iter_context
-                    )
-                    
-                    # Add to iteration results
-                    iter_result["results"].append(team_result)
-                    
-                    # Check for failure
-                    if not team_result.get("success", False) and stop_on_fail:
-                        iter_result["success"] = False
-                        iter_result["error"] = f"Team {embedded_team_id} failed in iteration {idx}"
-                        run_logger.warning(f"Loop {team_id}: embedded team {embedded_team_id} failed in iteration {idx+1}, stopping iteration.")
-                        break
-                    
-                else:
-                    # Invalid body item
-                    error_msg = f"Invalid body item in loop team {team_id}: {body_item}"
-                    run_logger.error(error_msg)
-                    iter_result["success"] = False
-                    iter_result["error"] = error_msg
-                    if stop_on_fail:
-                        break
-            
-            # Add iteration result to overall results
-            iteration_results.append(iter_result)
-            
-            # Check if we should stop the entire loop
-            if not iter_result.get("success", False) and team_config.get("break_on_failure", False):
-                run_logger.warning(f"Loop {team_id}: iteration {idx+1} failed, breaking loop due to break_on_failure=True.")
-                break
-        
-        # Determine overall success
-        all_succeeded = all(r.get("success", True) for r in iteration_results)
-        loop_success = all_succeeded or not team_config.get("stop_on_failure", True)
-        
-        # Return aggregated results
-        return {
-            "success": loop_success,
-            "team_id": team_id,
-            "type": "loop",
-            "iterations_count": len(iteration_results),
-            "iterations": iteration_results,
-            "collection_path": iterate_on,
-            "collection_size": len(collection)
-        }
-        
-    except Exception as e:
-        error_msg = str(e)
-        run_logger.error(f"Loop team execution failed unexpectedly: {error_msg}", exc_info=True)
-        return {
-            "success": False,
-            "error": error_msg,
-            "team_id": team_id,
-            "type": "loop",
-            "iterations": iteration_results
-        }

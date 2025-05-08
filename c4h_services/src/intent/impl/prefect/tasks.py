@@ -11,12 +11,15 @@ import os
 import json
 import re
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import time
+import copy
 
 from c4h_services.src.orchestration.factory import AgentFactory
 from c4h_agents.agents.base_agent import BaseAgent
 from c4h_agents.skills.semantic_iterator import SemanticIterator
 from c4h_agents.skills.shared.types import ExtractConfig
+from c4h_agents.lineage.event_logger import EventLogger, EventType
 from c4h_agents.config import create_config_node, deep_merge, load_config, load_persona_config, render_config, get_available_personas
 from c4h_services.src.utils.config_utils import validate_config_fragment, validate_config_fragments, ConfigValidationError
 from .models import AgentTaskConfig, EffectiveConfigInfo
@@ -31,8 +34,8 @@ def run_agent_task(
     task_name: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Prefect task wrapper for agent execution with factory-based instantiation.
-    Uses only the factory pattern for agent creation.
+    Prefect task wrapper for agent execution using ExecutionPlanExecutor.
+    Requires agents to have embedded execution plans.
 
     Context Structure Conventions:
     The context follows these conventions for separation of concerns:
@@ -66,116 +69,237 @@ def run_agent_task(
         Dict with agent execution results, including any context updates
     """
     prefect_logger = get_run_logger()
+    execution_start_time = datetime.now(timezone.utc)
+    
+    # Error response template with default fields
+    error_response_template = {
+        "success": False,
+        "result_data": {},
+        "error": "",
+        "input": {},
+        "raw_output": None,
+        "metrics": None,
+        "task_name": task_name or "unknown_task",
+        "execution_type": "error",
+        "duration_seconds": 0
+    }
     
     try:
+        # Validate required inputs
+        if task_config is None:
+            error_msg = "task_config cannot be None"
+            prefect_logger.error(f"Task failed: {error_msg}")
+            error_response = dict(error_response_template)
+            error_response["error"] = error_msg
+            return error_response
+            
+        if context is None:
+            context = {}  # Use empty dict as default
+            prefect_logger.warning("Empty context provided, using empty dict")
+            
+        if effective_config is None:
+            error_msg = "effective_config cannot be None"
+            prefect_logger.error(f"Task failed: {error_msg}")
+            error_response = dict(error_response_template)
+            error_response["error"] = error_msg
+            return error_response
+        
+        # Create deep copies to ensure immutability
+        task_config_copy = copy.deepcopy(task_config)
+        context_copy = copy.deepcopy(context)
+        effective_config_copy = copy.deepcopy(effective_config)
+        
         # Get task name from task config or parameter
-        task_name = task_name or task_config.get("name", "unnamed_task")
+        task_name = task_name or task_config_copy.get("name", "unnamed_task")
         prefect_logger.info(f"Running agent task: {task_name}")
         
         # Create configuration node for context
-        context_node = create_config_node(context)
+        context_node = create_config_node(context_copy)
         
         # Get run ID for tracking and lineage
         run_id = context_node.get_value("workflow_run_id") or str(flow_run.get_id())
         
         # Validate required task configuration - both agent_type and name are required now
-        if not task_config.get("agent_type") or not task_config.get("name"):
+        if not task_config_copy.get("agent_type") or not task_config_copy.get("name"):
             error_msg = "Missing required fields in task_config. Both 'agent_type' and 'name' are required."
             raise ValueError(error_msg)
             
-        if not task_config.get("name"):
+        if not task_config_copy.get("name"):
             # Set name from parameter or use a fallback
-            task_config["name"] = task_name or f"unnamed_task_{str(flow_run.get_id())[-6:]}"
-            prefect_logger.warning(f"Missing 'name' in task_config, using: {task_config['name']}")
+            task_config_copy["name"] = task_name or f"unnamed_task_{str(flow_run.get_id())[-6:]}"
+            prefect_logger.warning(f"Missing 'name' in task_config, using: {task_config_copy['name']}")
+        
+        # Update error template with task info
+        error_response_template["task_name"] = task_config_copy.get("name", task_name)
         
         # Log task configuration for transparency
-        persona_key = task_config.get("persona_key")
-        agent_info = f"agent_type={task_config['agent_type']}, name={task_config['name']}"
+        persona_key = task_config_copy.get("persona_key")
+        agent_info = f"agent_type={task_config_copy['agent_type']}, name={task_config_copy['name']}"
         if persona_key:
             agent_info += f", persona_key={persona_key}"
         prefect_logger.info(f"Task configuration: {agent_info}")
         
-        # Log that we're using the full effective config for agent creation
-        prefect_logger.info(f"Using effective config snapshot for agent creation")
-            
-        # Create agent using factory - ONLY supported pattern
-        factory = AgentFactory(effective_config)
-        
-        prefect_logger.info(f"Creating agent using factory: {task_config['agent_type']}, "
-                           f"name={task_config['name']}")
-        
-        # Create agent using factory
-        # Only pass the necessary fields needed by the factory
-        agent = factory.create_agent(task_config)
-            
         # Enhance context with task metadata, run ID, and configuration snapshot info
         enhanced_context = {
-            **context,
+            **context_copy,
             'workflow_run_id': run_id,
             'system': {'runid': run_id},  # Explicitly include system namespace
             'task_name': task_name,
         }
         
-        # Add configuration snapshot information if available in effective_config
-        if "runtime" in effective_config and "config_metadata" in effective_config["runtime"]:
-            config_metadata = effective_config["runtime"]["config_metadata"]
+        # Add configuration snapshot information if available in effective_config_copy
+        if "runtime" in effective_config_copy and "config_metadata" in effective_config_copy["runtime"]:
+            config_metadata = effective_config_copy["runtime"]["config_metadata"]
             if isinstance(config_metadata, dict):
-                enhanced_context["config_metadata"] = config_metadata
+                # Create a deep copy to avoid modifying the original
+                enhanced_context["config_metadata"] = copy.deepcopy(config_metadata)
                 
                 # Also add top-level snapshot path for backward compatibility
                 if "snapshot_path" in config_metadata:
                     enhanced_context["config_snapshot_path"] = config_metadata["snapshot_path"]
         
-        # Special handling for iterator
-        if isinstance(agent, SemanticIterator):
-            # Get extract config
-            extract_config = None
-            if 'config' in context:
-                extract_config = ExtractConfig(**context['config'])
-            
-            # Configure iterator if config provided
-            if extract_config:
-                agent.configure(
-                    content=context.get('content', ''),
-                    config=extract_config
+        # Initialize event logger if configured
+        event_logger = None
+        lineage_config = context_node.get_value("llm_config.agents.lineage", {})
+        if lineage_config.get("enabled", True):
+            try:
+                # Initialize event logger
+                event_logger = EventLogger(
+                    lineage_config,
+                    parent_id=run_id,
+                    namespace=f"agent_{task_config_copy.get('name')}"
                 )
-                
-            # Process with configured iterator
-            result = agent.process(enhanced_context)
-            
-        else:
-            # Standard agent execution
-            result = agent.process(enhanced_context)
+                prefect_logger.debug("Initialized event logger for agent", agent_name=task_config_copy.get('name'))
+            except Exception as e:
+                prefect_logger.error("Failed to initialize event logger", error=str(e))
         
-        # Capture complete agent response 
-        response = {
-            "success": result.success,
-            "result_data": result.data,
-            "error": result.error,
-            "input": {
-                "messages": result.messages.to_dict() if result.messages else None,
-                "context": enhanced_context
-            },
-            "raw_output": result.raw_output,
-            "metrics": result.metrics,
-            "run_id": run_id,
-            "task_name": task_config.get("name", task_name)
-        }
-
-        return response
+        # Get agent configuration by merging persona and agent-specific configs
+        agent_config = None
+        persona_config = None
+        merged_config = {}
+        
+        # First check if we have a persona key
+        if persona_key:
+            config_node = create_config_node(effective_config_copy)
+            persona_config = config_node.get_value(f"llm_config.personas.{persona_key}")
+            if persona_config:
+                prefect_logger.info(f"Found persona config for persona key: {persona_key}")
+                merged_config.update(copy.deepcopy(persona_config))
+        
+        # Then update with specific agent config if available
+        agent_name = task_config_copy.get("name")
+        if agent_name:
+            config_node = create_config_node(effective_config_copy)
+            agent_config = config_node.get_value(f"llm_config.agents.{agent_name}")
+            if agent_config:
+                prefect_logger.info(f"Found agent config for agent: {agent_name}")
+                merged_config.update(copy.deepcopy(agent_config))
+        
+        # Always merge in the task_config as it may have overrides
+        merged_config.update(copy.deepcopy(task_config_copy))
+        
+        # Check for execution_plan in the merged config
+        if "execution_plan" not in merged_config or not merged_config.get("execution_plan", {}).get("enabled", True):
+            error_msg = f"Agent '{agent_name}' does not have a valid execution_plan in its configuration"
+            prefect_logger.error(error_msg)
+            return {
+                "success": False,
+                "result_data": {},
+                "error": error_msg,
+                "execution_type": "error",
+                "run_id": run_id,
+                "task_name": task_config.get("name", task_name)
+            }
+        
+        # Execute using ExecutionPlanExecutor
+        prefect_logger.info("Agent has execution_plan, using ExecutionPlanExecutor", agent_name=task_name)
+        try:
+            # Import the ExecutionPlanExecutor
+            from c4h_agents.execution.executor import ExecutionPlanExecutor
+            
+            # Initialize skill registry for the executor
+            from c4h_agents.skills.registry import SkillRegistry
+            registry = SkillRegistry()
+            registry.register_builtin_skills()
+            registry.load_skills_from_config(effective_config)
+            
+            # Initialize the executor with the effective config
+            executor = ExecutionPlanExecutor(
+                effective_config=effective_config,
+                skill_registry=registry,
+                event_logger=event_logger
+            )
+            
+            # Get the execution plan from the merged config
+            execution_plan = merged_config["execution_plan"]
+            
+            # Log execution plan details
+            prefect_logger.info("Executing agent's execution plan", 
+                          agent_name=task_name,
+                          step_count=len(execution_plan.get("steps", [])),
+                          executor_id=executor.execution_id)
+                          
+            # Execute the plan
+            execution_result = executor.execute_plan(execution_plan, enhanced_context)
+            
+            # Calculate execution duration
+            execution_end_time = datetime.now(timezone.utc)
+            duration_seconds = (execution_end_time - execution_start_time).total_seconds()
+            
+            # Convert ExecutionResult to agent result format
+            response = {
+                "success": execution_result.success,
+                "result_data": execution_result.output or {},
+                "context": execution_result.context,
+                "error": execution_result.error,
+                "execution_type": "execution_plan",
+                "duration_seconds": duration_seconds,
+                "execution_id": executor.execution_id,
+                "steps_executed": execution_result.steps_executed,
+                "run_id": run_id,
+                "task_name": task_config.get("name", task_name)
+            }
+            
+            prefect_logger.info("Agent execution plan completed", 
+                          agent_name=task_name,
+                          success=execution_result.success,
+                          steps_executed=execution_result.steps_executed,
+                          duration_seconds=duration_seconds)
+            
+            return response
+            
+        except Exception as e:
+            prefect_logger.error("Execution plan execution failed", 
+                           agent_name=task_name,
+                           error=str(e),
+                           exc_info=True)
+            return {
+                "success": False,
+                "result_data": {},
+                "error": f"Execution plan execution failed: {str(e)}",
+                "execution_type": "execution_plan_error",
+                "run_id": run_id,
+                "task_name": task_config.get("name", task_name)
+            }
 
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Task failed: {error_msg}")
-        return {
-            "success": False,
-            "result_data": {},
+        
+        # Calculate duration even for errors
+        execution_end_time = datetime.now(timezone.utc)
+        duration_seconds = (execution_end_time - execution_start_time).total_seconds() 
+        
+        # Create consistent error response
+        error_response = dict(error_response_template)  # Use template for consistency
+        error_response.update({
             "error": error_msg,
-            "input": {"context": context},  # Preserve original context
-            "raw_output": None,
-            "metrics": None,
-            "task_name": task_name
-        }
+            "input": {"context": context},  # Preserve original context reference
+            "task_name": task_name or "unknown_task",
+            "duration_seconds": duration_seconds
+        })
+        
+        return error_response
 
 @task(retries=1, retry_delay_seconds=5)
 def materialise_config(

@@ -410,6 +410,9 @@ class ExecutionPlanExecutor:
         """
         Execute a skill_call step by invoking a registered skill.
         
+        This method uses the SkillRegistry to look up the skill and then uses
+        the Prefect task wrapper (execute_skill_task) to execute it.
+        
         Args:
             step: The skill_call step definition
             context: The current execution context
@@ -458,30 +461,62 @@ class ExecutionPlanExecutor:
             skill_context["execution_metadata"]["skill_name"] = skill_name
             skill_context["execution_metadata"]["step_name"] = step_name
             
-            # Instantiate and execute the skill
-            skill_instance = self.skill_registry.instantiate_skill(skill_name, self.config)
+            # Prepare event logger config for the skill execution
+            event_logger_config = None
+            if self.event_logger:
+                event_logger_config = {
+                    "parent_execution_id": self.execution_id,
+                    "namespace": f"skill_{skill_name}",
+                    "enabled": True
+                }
             
-            # Pass parameters as kwargs
-            if "input" not in params and context:
-                params["input"] = skill_context
+            # Import the execute_skill_task from the Prefect wrappers
+            try:
+                from c4h_agents.execution.prefect_wrappers import execute_skill_task
                 
-            # Execute the skill method
-            method_name = skill_config.get("method", "execute")
-            skill_method = getattr(skill_instance, method_name)
-            skill_result = skill_method(**params)
+                # Call the task directly (not as a flow) to keep execution in the current context
+                skill_result_dict = execute_skill_task(
+                    skill_name=skill_name,
+                    parameters=params,
+                    effective_config=self.config,
+                    event_logger_config=event_logger_config
+                )
+                
+                # Extract success, output, and error from the result
+                success = skill_result_dict.get("success", True)
+                data = skill_result_dict.get("result") 
+                error = skill_result_dict.get("error")
+                
+            except ImportError:
+                # Fallback to direct execution if Prefect wrappers are not available
+                self.logger.warning("skill_call.prefect_wrappers_not_available", 
+                                 skill_name=skill_name,
+                                 falling_back="direct_execution")
+                
+                # Instantiate and execute the skill
+                skill_instance = self.skill_registry.instantiate_skill(skill_name, self.config)
+                
+                # Pass parameters as kwargs
+                if "input" not in params and context:
+                    params["input"] = skill_context
+                    
+                # Execute the skill method
+                method_name = skill_config.get("method", "execute")
+                skill_method = getattr(skill_instance, method_name)
+                skill_result = skill_method(**params)
+                
+                # Process the result
+                if hasattr(skill_result, "success") and hasattr(skill_result, "value"):
+                    # Standard SkillResult type
+                    success = skill_result.success
+                    data = skill_result.value
+                    error = skill_result.error if hasattr(skill_result, "error") else None
+                else:
+                    # Non-standard result, treat as success with the whole result as data
+                    success = True
+                    data = skill_result
+                    error = None
             
-            # Process the result
-            if hasattr(skill_result, "success") and hasattr(skill_result, "value"):
-                # Standard SkillResult type
-                success = skill_result.success
-                data = skill_result.value
-                error = skill_result.error if hasattr(skill_result, "error") else None
-            else:
-                # Non-standard result, treat as success with the whole result as data
-                success = True
-                data = skill_result
-                error = None
-                
             self.logger.info("skill_call.completed", 
                           step_name=step_name,
                           skill=skill_name,
@@ -516,6 +551,12 @@ class ExecutionPlanExecutor:
     ) -> ExecutionResult:
         """
         Execute an agent_call step by invoking an agent instance.
+        
+        This method performs the following:
+        1. Resolves the target agent instance by name
+        2. Looks up its configuration/persona
+        3. If the agent's persona has an execution_plan, recursively calls execute_plan
+        4. Otherwise, invokes the agent's process() method via Prefect task wrapper
         
         Args:
             step: The agent_call step definition
@@ -559,27 +600,250 @@ class ExecutionPlanExecutor:
             if params:
                 agent_context.update(params)
             
-            # This step would normally use the Prefect task to run the agent
-            # For now, we'll delegate to the agent factory/task implementation
-            # that would be invoked via Prefect
+            # Look up the agent's configuration and persona
+            agent_config = None
+            persona_config = None
             
-            # Here, we'll just return a stub result for now
-            # The actual implementation in the Prefect tasks will handle this
-            self.logger.info("agent_call.delegated_to_prefect_task", 
-                          step_name=step_name,
-                          node=node_name)
-                          
-            return ExecutionResult(
-                success=True,
-                context={},
-                output={
-                    "message": "Agent call delegated to Prefect task execution",
-                    "agent_name": node_name,
-                    "agent_execution_id": agent_execution_id
-                },
-                step_name=step_name,
-                step_type="agent_call"
-            )
+            # First check in the current team's agents list
+            team_context = agent_context.get("team_context", {})
+            current_team_id = team_context.get("team_id")
+            if current_team_id:
+                # Look for the agent in the current team's agents list
+                team_config = self.config_node.get_value(f"orchestration.teams.{current_team_id}")
+                if team_config:
+                    # Check both "agents" and "tasks" (for backward compatibility)
+                    for agents_key in ["agents", "tasks"]:
+                        if agents_key in team_config:
+                            for agent in team_config[agents_key]:
+                                if agent.get("name") == node_name:
+                                    agent_config = agent
+                                    
+                                    # If agent has persona_key, get the persona config
+                                    persona_key = agent.get("persona_key")
+                                    if persona_key:
+                                        persona_config = self.config_node.get_value(f"llm_config.personas.{persona_key}")
+                                    
+                                    break
+                            
+                            # Break outer loop if agent found
+                            if agent_config:
+                                break
+            
+            # If not found in team, check global agents configuration
+            if not agent_config:
+                agent_config = self.config_node.get_value(f"llm_config.agents.{node_name}")
+                if agent_config:
+                    # If agent has persona_key, get the persona config
+                    persona_key = agent_config.get("persona_key")
+                    if persona_key:
+                        persona_config = self.config_node.get_value(f"llm_config.personas.{persona_key}")
+            
+            # If still not found, look for the agent in all teams
+            if not agent_config:
+                teams = self.config_node.get_value("orchestration.teams", {})
+                for team_id, team_config in teams.items():
+                    # Check both "agents" and "tasks" (for backward compatibility)
+                    for agents_key in ["agents", "tasks"]:
+                        if agents_key in team_config:
+                            for agent in team_config[agents_key]:
+                                if agent.get("name") == node_name:
+                                    agent_config = agent
+                                    
+                                    # If agent has persona_key, get the persona config
+                                    persona_key = agent.get("persona_key")
+                                    if persona_key:
+                                        persona_config = self.config_node.get_value(f"llm_config.personas.{persona_key}")
+                                    
+                                    break
+                            
+                            # Break outer loop if agent found
+                            if agent_config:
+                                break
+                    
+                    # Break teams loop if agent found
+                    if agent_config:
+                        break
+            
+            # If agent not found in configuration, log error and return
+            if not agent_config:
+                self.logger.error("agent_call.agent_not_found", 
+                               step_name=step_name,
+                               node=node_name)
+                return ExecutionResult(
+                    success=False,
+                    error=f"Agent '{node_name}' not found in configuration",
+                    step_name=step_name,
+                    step_type="agent_call"
+                )
+            
+            # Determine the agent_type for proper instantiation
+            agent_type = agent_config.get("agent_type")
+            
+            # If no agent_type in agent config, check persona config
+            if not agent_type and persona_config:
+                agent_type = persona_config.get("agent_type")
+                
+            # If still no agent_type, use GenericLLMAgent as default
+            if not agent_type:
+                agent_type = "GenericLLMAgent"
+                self.logger.warning("agent_call.agent_type_defaulted", 
+                                 step_name=step_name,
+                                 node=node_name,
+                                 agent_type=agent_type)
+            
+            # Merge agent_config and persona_config for complete configuration
+            # Persona is the base, agent config overrides it
+            merged_config = {}
+            if persona_config:
+                merged_config.update(persona_config)
+            if agent_config:
+                merged_config.update(agent_config)
+            
+            # Ensure agent_type is set
+            merged_config["agent_type"] = agent_type
+                                
+            # Check if the agent's persona has an execution_plan
+            if "execution_plan" in merged_config and merged_config.get("execution_plan", {}).get("enabled", True):
+                self.logger.info("agent_call.executing_plan", 
+                              step_name=step_name,
+                              node=node_name,
+                              agent_type=agent_type)
+                
+                # Extract the execution plan
+                execution_plan = merged_config["execution_plan"]
+                
+                # Recursively call execute_plan with this plan and the current context
+                result = self.execute_plan(execution_plan, agent_context)
+                
+                # Return the result as the step result
+                self.logger.info("agent_call.execution_plan_completed", 
+                              step_name=step_name,
+                              node=node_name,
+                              success=result.success)
+                              
+                return ExecutionResult(
+                    success=result.success,
+                    context=result.context,
+                    output=result.output,
+                    error=result.error,
+                    step_name=step_name,
+                    step_type="agent_call"
+                )
+            else:
+                # No execution plan, use Prefect task wrapper to execute the agent
+                self.logger.info("agent_call.using_prefect_task", 
+                              step_name=step_name,
+                              node=node_name,
+                              agent_type=agent_type)
+                
+                # Prepare event logger config
+                event_logger_config = None
+                if self.event_logger:
+                    event_logger_config = {
+                        "parent_execution_id": self.execution_id,
+                        "namespace": f"agent_{node_name}",
+                        "enabled": True
+                    }
+                
+                try:
+                    # Import the agent execution task
+                    from c4h_agents.execution.prefect_wrappers import execute_agent_task
+                    
+                    # Execute the agent using the Prefect task wrapper
+                    agent_result = execute_agent_task(
+                        agent_type=agent_type,
+                        persona_config=merged_config,
+                        input_context=agent_context,
+                        effective_config=self.config,
+                        event_logger_config=event_logger_config
+                    )
+                    
+                    # Extract results from the task output
+                    if isinstance(agent_result, dict):
+                        success = agent_result.get("success", True)
+                        output = agent_result.get("result") or agent_result.get("output")
+                        error = agent_result.get("error")
+                        context_updates = agent_result.get("context", {})
+                    else:
+                        success = True
+                        output = agent_result
+                        error = None
+                        context_updates = {}
+                        
+                    self.logger.info("agent_call.prefect_task_completed", 
+                                  step_name=step_name,
+                                  node=node_name,
+                                  success=success)
+                                  
+                    return ExecutionResult(
+                        success=success,
+                        context=context_updates,
+                        output=output,
+                        error=error,
+                        step_name=step_name,
+                        step_type="agent_call"
+                    )
+                
+                except ImportError:
+                    # Fallback to direct agent instantiation and execution
+                    self.logger.warning("agent_call.prefect_wrappers_not_available", 
+                                     step_name=step_name,
+                                     node=node_name,
+                                     falling_back="direct_execution")
+                    
+                    # Import the agent type dynamically
+                    try:
+                        agents_module = importlib.import_module("c4h_agents.agents.generic")
+                        agent_class = getattr(agents_module, agent_type)
+                    except (ImportError, AttributeError) as e:
+                        self.logger.error("agent_call.agent_type_import_failed", 
+                                       step_name=step_name,
+                                       node=node_name,
+                                       agent_type=agent_type,
+                                       error=str(e))
+                        return ExecutionResult(
+                            success=False,
+                            error=f"Failed to import agent type '{agent_type}': {str(e)}",
+                            step_name=step_name,
+                            step_type="agent_call"
+                        )
+                    
+                    # Add effective config to agent configuration
+                    merged_config["effective_config"] = self.config
+                    
+                    # Add event logger if available
+                    if self.event_logger:
+                        merged_config["event_logger"] = self.event_logger
+                    
+                    # Instantiate the agent
+                    agent_instance = agent_class(merged_config)
+                    
+                    # Process the input context
+                    result = agent_instance.process(agent_context)
+                    
+                    # Process the result
+                    if isinstance(result, dict):
+                        success = result.get("success", True)
+                        output = result
+                        error = result.get("error")
+                    else:
+                        success = True
+                        output = result
+                        error = None
+                    
+                    self.logger.info("agent_call.direct_execution_completed", 
+                                  step_name=step_name,
+                                  node=node_name,
+                                  success=success)
+                                  
+                    return ExecutionResult(
+                        success=success,
+                        context={},
+                        output=output,
+                        error=error,
+                        step_name=step_name,
+                        step_type="agent_call"
+                    )
             
         except Exception as e:
             self.logger.exception("agent_call.failed", 
@@ -600,6 +864,12 @@ class ExecutionPlanExecutor:
     ) -> ExecutionResult:
         """
         Execute a team_call step by invoking a team via its execution plan.
+        
+        This method performs the following:
+        1. Resolves the target team configuration by ID
+        2. Creates a team execution context with team-specific metadata
+        3. If the team has an execution_plan, recursively calls execute_plan
+        4. Otherwise, invokes each of the team's agents sequentially via Prefect task wrapper
         
         Args:
             step: The team_call step definition
@@ -628,6 +898,16 @@ class ExecutionPlanExecutor:
                       param_keys=list(params.keys()) if params else [])
         
         try:
+            # Look up the team configuration
+            team_config = self.config_node.get_value(f"orchestration.teams.{team_id}")
+            if not team_config:
+                return ExecutionResult(
+                    success=False,
+                    error=f"Team '{team_id}' not found in configuration",
+                    step_name=step_name,
+                    step_type="team_call"
+                )
+            
             # Create an immutable context for the team
             team_context = copy.deepcopy(context)
             
@@ -639,31 +919,185 @@ class ExecutionPlanExecutor:
             team_context["execution_metadata"]["team_id"] = team_id
             team_context["execution_metadata"]["step_name"] = step_name
             
+            # Add team context if not already present
+            if "team_context" not in team_context:
+                team_context["team_context"] = {}
+            team_context["team_context"]["team_id"] = team_id
+            team_context["team_context"]["team_name"] = team_config.get("name", team_id)
+            
             # Add input parameters to context
             if params:
                 team_context.update(params)
             
-            # This step would normally use the Prefect flow to run the team
-            # For now, we'll delegate to the team execution flow that 
-            # would be invoked via Prefect
-            
-            # Here, we'll just return a stub result for now
-            # The actual implementation in the Prefect workflows will handle this
-            self.logger.info("team_call.delegated_to_prefect_flow", 
-                          step_name=step_name,
-                          team_id=team_id)
-                          
-            return ExecutionResult(
-                success=True,
-                context={},
-                output={
-                    "message": "Team call delegated to Prefect flow execution",
-                    "team_id": team_id,
-                    "team_execution_id": team_execution_id
-                },
-                step_name=step_name,
-                step_type="team_call"
-            )
+            # Check if the team has an execution_plan
+            if "execution_plan" in team_config and team_config.get("execution_plan", {}).get("enabled", True):
+                self.logger.info("team_call.executing_plan", 
+                              step_name=step_name,
+                              team_id=team_id)
+                
+                # Extract the execution plan
+                execution_plan = team_config["execution_plan"]
+                
+                # Recursively call execute_plan with this plan and the current context
+                result = self.execute_plan(execution_plan, team_context)
+                
+                # Return the result as the step result
+                self.logger.info("team_call.execution_plan_completed", 
+                              step_name=step_name,
+                              team_id=team_id,
+                              success=result.success)
+                              
+                return ExecutionResult(
+                    success=result.success,
+                    context=result.context,
+                    output=result.output,
+                    error=result.error,
+                    step_name=step_name,
+                    step_type="team_call"
+                )
+                
+            else:
+                # No execution plan, use Prefect task wrapper to execute the team
+                self.logger.info("team_call.using_prefect_task", 
+                              step_name=step_name,
+                              team_id=team_id)
+                
+                # Prepare event logger config
+                event_logger_config = None
+                if self.event_logger:
+                    event_logger_config = {
+                        "parent_execution_id": self.execution_id,
+                        "namespace": f"team_{team_id}",
+                        "enabled": True
+                    }
+                
+                try:
+                    # Import the team execution task
+                    from c4h_agents.execution.prefect_wrappers import execute_team_task
+                    
+                    # Execute the team using the Prefect task wrapper
+                    team_result = execute_team_task(
+                        team_config=team_config,
+                        team_name=team_id,
+                        input_context=team_context,
+                        effective_config=self.config,
+                        event_logger_config=event_logger_config
+                    )
+                    
+                    # Extract results from the task output
+                    if isinstance(team_result, dict):
+                        success = team_result.get("success", True)
+                        output = team_result.get("output")
+                        error = team_result.get("error")
+                        context_updates = team_result.get("context", {})
+                    else:
+                        success = True
+                        output = team_result
+                        error = None
+                        context_updates = {}
+                        
+                    self.logger.info("team_call.prefect_task_completed", 
+                                  step_name=step_name,
+                                  team_id=team_id,
+                                  success=success)
+                                  
+                    return ExecutionResult(
+                        success=success,
+                        context=context_updates,
+                        output=output,
+                        error=error,
+                        step_name=step_name,
+                        step_type="team_call"
+                    )
+                    
+                except ImportError:
+                    # Fallback to direct team execution (execute agents sequentially)
+                    self.logger.warning("team_call.prefect_wrappers_not_available", 
+                                     step_name=step_name,
+                                     team_id=team_id,
+                                     falling_back="direct_execution")
+                    
+                    # Get the team's agents list
+                    agents_list = team_config.get("agents", [])
+                    if not agents_list:
+                        # Check for tasks (legacy configuration)
+                        agents_list = team_config.get("tasks", [])
+                        
+                    if not agents_list:
+                        return ExecutionResult(
+                            success=False,
+                            error=f"Team '{team_id}' has no execution_plan and no agents/tasks list",
+                            step_name=step_name,
+                            step_type="team_call"
+                        )
+                    
+                    # Execute each agent in sequence
+                    agent_results = []
+                    current_context = team_context  # Start with the team context
+                    
+                    for i, agent_config in enumerate(agents_list):
+                        agent_name = agent_config.get("name", f"agent_{i}")
+                        
+                        # Create a step definition for the agent call
+                        agent_step = {
+                            "name": f"{step_name}_agent_{agent_name}",
+                            "type": "agent_call",
+                            "node": agent_name,
+                            "input_params": {},  # No additional params, using current_context directly
+                            "stop_on_failure": agent_config.get("stop_on_failure", True)
+                        }
+                        
+                        # Execute the agent using the agent_call executor
+                        self.logger.info("team_call.executing_agent", 
+                                      step_name=step_name,
+                                      team_id=team_id,
+                                      agent_name=agent_name)
+                                      
+                        agent_result = self._execute_agent_call(agent_step, current_context)
+                        
+                        # Store the agent result
+                        agent_results.append({
+                            "agent_name": agent_name,
+                            "success": agent_result.success,
+                            "error": agent_result.error
+                        })
+                        
+                        # Update context for next agent if successful
+                        if agent_result.success and agent_result.context:
+                            # Create a new context merging the current with the agent result
+                            for key, value in agent_result.context.items():
+                                if key not in ["execution_metadata", "team_context"]:
+                                    current_context[key] = value
+                        
+                        # Check if we should stop on failure
+                        if not agent_result.success and agent_config.get("stop_on_failure", True):
+                            self.logger.warning("team_call.agent_failed_stopping", 
+                                             step_name=step_name,
+                                             team_id=team_id,
+                                             agent_name=agent_name)
+                            break
+                    
+                    # Create final result
+                    success = all(result["success"] for result in agent_results)
+                    
+                    self.logger.info("team_call.direct_execution_completed", 
+                                  step_name=step_name,
+                                  team_id=team_id,
+                                  agents_executed=len(agent_results),
+                                  success=success)
+                                  
+                    return ExecutionResult(
+                        success=success,
+                        context=current_context,
+                        output={
+                            "team_id": team_id,
+                            "agents_executed": len(agent_results),
+                            "agent_results": agent_results
+                        },
+                        error=None if success else f"Team execution failed: One or more agents failed",
+                        step_name=step_name,
+                        step_type="team_call"
+                    )
             
         except Exception as e:
             self.logger.exception("team_call.failed", 
@@ -685,6 +1119,10 @@ class ExecutionPlanExecutor:
         """
         Execute an llm_call step by directly invoking an LLM.
         
+        This method creates a BaseLLM instance to directly interact with
+        a language model provider without requiring a full agent instance.
+        It supports various LLM providers through configuration.
+        
         Args:
             step: The llm_call step definition
             context: The current execution context
@@ -704,51 +1142,215 @@ class ExecutionPlanExecutor:
             )
         
         # Get LLM parameters
-        provider = step.get("provider")
-        model = step.get("model")
-        temperature = step.get("temperature")
+        provider_name = step.get("provider")
+        model_name = step.get("model")
+        temperature = step.get("temperature", 0.7)  # Default temperature if not specified
         system_message = step.get("system_message")
         
         # Format prompt with context
         formatted_prompt = self._format_template(prompt, context)
         
+        # Check for required parameters
+        if not provider_name:
+            # Look for default provider in config
+            provider_name = self.config_node.get_value("llm_config.default_provider")
+            if not provider_name:
+                return ExecutionResult(
+                    success=False,
+                    error=f"Missing provider in step {step_name} and no default provider in config",
+                    step_name=step_name,
+                    step_type="llm_call"
+                )
+                
+        if not model_name:
+            # Look for default model in config
+            model_name = self.config_node.get_value("llm_config.default_model")
+            if not model_name:
+                return ExecutionResult(
+                    success=False,
+                    error=f"Missing model in step {step_name} and no default model in config",
+                    step_name=step_name,
+                    step_type="llm_call"
+                )
+        
         self.logger.info("llm_call.executing", 
                       step_name=step_name,
-                      provider=provider,
-                      model=model,
+                      provider=provider_name,
+                      model=model_name,
                       temperature=temperature,
                       prompt_length=len(formatted_prompt) if formatted_prompt else 0)
         
         try:
-            # This would normally use an LLM client to make the API call
-            # For now, we'll just delegate to a BaseLLM implementation
-            # that would be instantiated with the specified provider and model
+            # Import BaseLLM with dynamic import to avoid circular dependencies
+            try:
+                from c4h_agents.agents.base_llm import BaseLLM, LLMProvider
+                import importlib
+            except ImportError as e:
+                self.logger.error("llm_call.import_failed", 
+                               error=str(e))
+                return ExecutionResult(
+                    success=False,
+                    error=f"Failed to import BaseLLM: {str(e)}",
+                    step_name=step_name,
+                    step_type="llm_call"
+                )
             
-            # Here, we'll just return a stub result for now
-            # The actual implementation will handle this
-            self.logger.info("llm_call.delegated_to_llm_client", 
-                          step_name=step_name,
-                          provider=provider,
-                          model=model)
-                          
-            return ExecutionResult(
-                success=True,
-                context={},
-                output={
-                    "message": "LLM call delegated to LLM client",
-                    "provider": provider,
-                    "model": model,
-                    "temperature": temperature
-                },
-                step_name=step_name,
-                step_type="llm_call"
+            # Create messages array with system message if provided
+            messages = []
+            if system_message:
+                formatted_system = self._format_template(system_message, context)
+                messages.append({"role": "system", "content": formatted_system})
+            
+            # Add user message with formatted prompt
+            messages.append({"role": "user", "content": formatted_prompt})
+            
+            # Create BaseLLM instance
+            llm = BaseLLM()
+            
+            # Set provider and model
+            try:
+                llm.provider = LLMProvider(provider_name)
+            except (ValueError, TypeError) as e:
+                self.logger.error("llm_call.invalid_provider", 
+                               provider=provider_name,
+                               error=str(e))
+                return ExecutionResult(
+                    success=False,
+                    error=f"Invalid provider '{provider_name}': {str(e)}",
+                    step_name=step_name,
+                    step_type="llm_call"
+                )
+                
+            llm.model = model_name
+            llm.temperature = float(temperature)
+            
+            # Get provider configuration from effective config
+            provider_config = self.config_node.get_value(f"llm_config.providers.{provider_name}", {})
+            
+            # Set up BaseLLM configuration
+            # Manually configure important attributes that would normally be set in BaseAgent
+            llm.config_node = self.config_node
+            
+            # Set logging
+            llm.logger = self.logger.bind(
+                llm_call=step_name,
+                provider=provider_name,
+                model=model_name
             )
+            
+            # Get the appropriate model string for LiteLLM
+            try:
+                # Try using _get_model_str directly if it doesn't need config_node
+                llm.model_str = f"{provider_name}/{model_name}"
+                
+                # Set up LiteLLM if needed
+                if hasattr(llm, '_setup_litellm'):
+                    llm._setup_litellm(provider_config)
+            except Exception as config_e:
+                self.logger.error("llm_call.config_failed", 
+                               error=str(config_e))
+                return ExecutionResult(
+                    success=False,
+                    error=f"Failed to configure LLM: {str(config_e)}",
+                    step_name=step_name,
+                    step_type="llm_call"
+                )
+            
+            # Make the LLM call
+            try:
+                # Use litellm directly instead of _get_completion_with_continuation
+                # to avoid dependency on ContinuationHandler
+                from litellm import completion
+                
+                # Prepare completion parameters
+                completion_params = {
+                    "model": llm.model_str,
+                    "messages": messages,
+                    "temperature": llm.temperature
+                }
+                
+                # Add API base if present in provider config
+                if "api_base" in provider_config:
+                    completion_params["api_base"] = provider_config["api_base"]
+                
+                # Add model specific parameters if present
+                model_params = provider_config.get("model_params", {})
+                for key, value in model_params.items():
+                    if key not in completion_params:
+                        completion_params[key] = value
+                
+                # Execute the LLM call
+                self.logger.debug("llm_call.completion_params", 
+                               params={k: v for k, v in completion_params.items() if k != "messages"})
+                               
+                response = completion(**completion_params)
+                
+                # Process the response
+                if response and hasattr(response, 'choices') and response.choices:
+                    content = llm._get_llm_content(response)
+                    
+                    # Create result
+                    output = {
+                        "response": content
+                    }
+                    
+                    # Add usage information if available
+                    if hasattr(response, 'usage'):
+                        usage = response.usage
+                        output["usage"] = {
+                            "completion_tokens": getattr(usage, 'completion_tokens', 0),
+                            "prompt_tokens": getattr(usage, 'prompt_tokens', 0),
+                            "total_tokens": getattr(usage, 'total_tokens', 0)
+                        }
+                        
+                        self.logger.info("llm_call.token_usage",
+                                      completion_tokens=output["usage"]["completion_tokens"],
+                                      prompt_tokens=output["usage"]["prompt_tokens"],
+                                      total_tokens=output["usage"]["total_tokens"])
+                    
+                    self.logger.info("llm_call.completed",
+                                  step_name=step_name,
+                                  provider=provider_name,
+                                  model=model_name,
+                                  content_length=len(content) if content else 0)
+                                  
+                    return ExecutionResult(
+                        success=True,
+                        context={},
+                        output=output,
+                        step_name=step_name,
+                        step_type="llm_call"
+                    )
+                else:
+                    self.logger.error("llm_call.invalid_response",
+                                   step_name=step_name,
+                                   provider=provider_name,
+                                   model=model_name)
+                    return ExecutionResult(
+                        success=False,
+                        error=f"LLM call returned invalid response structure",
+                        step_name=step_name,
+                        step_type="llm_call"
+                    )
+                
+            except Exception as llm_e:
+                self.logger.exception("llm_call.completion_failed",
+                                   step_name=step_name,
+                                   provider=provider_name,
+                                   model=model_name,
+                                   error=str(llm_e))
+                return ExecutionResult(
+                    success=False,
+                    error=f"Error during LLM completion: {str(llm_e)}",
+                    step_name=step_name,
+                    step_type="llm_call"
+                )
             
         except Exception as e:
             self.logger.exception("llm_call.failed", 
                                step_name=step_name,
-                               provider=provider,
-                               model=model,
+                               provider=provider_name,
+                               model=model_name,
                                error=str(e))
             return ExecutionResult(
                 success=False,
@@ -765,6 +1367,11 @@ class ExecutionPlanExecutor:
         """
         Execute a loop step by iterating over a collection and executing child steps.
         
+        This method handles iteration over any iterable collection in the context,
+        executing a nested execution plan for each element and collecting results.
+        Supports loop control statements (break, continue) and context propagation
+        between iterations.
+        
         Args:
             step: The loop step definition
             context: The current execution context
@@ -777,6 +1384,7 @@ class ExecutionPlanExecutor:
         loop_variable = step.get("loop_variable")
         body = step.get("body", [])
         
+        # Validate required parameters
         if not iterate_on:
             return ExecutionResult(
                 success=False,
@@ -802,6 +1410,11 @@ class ExecutionPlanExecutor:
             )
         
         # Get the collection to iterate over
+        # First handle dynamic templates in the iterate_on path
+        if "${" in iterate_on and "}" in iterate_on:
+            # This is a template that needs resolving
+            iterate_on = self._format_template(iterate_on, context)
+            
         collection = self._get_context_value(context, iterate_on)
         if collection is None:
             return ExecutionResult(
@@ -826,13 +1439,41 @@ class ExecutionPlanExecutor:
                       collection_length=len(collection) if hasattr(collection, "__len__") else "unknown",
                       body_steps=len(body))
         
+        # Initialize aggregated context to collect all updates
+        aggregated_context = copy.deepcopy(context)
+        
         # Execute the loop
         iteration_results = []
+        aggregated_output = []
         loop_items = list(collection)  # Convert to list to ensure consistent iteration
         
-        for i, item in enumerate(loop_items):
+        # Get parameters for stopping iteration failures
+        stop_on_iteration_failure = step.get("stop_on_iteration_failure", step.get("stop_on_failure", True))
+        
+        # Additional parameters for ArchDocV3 support
+        max_iterations = step.get("max_iterations")
+        collection_filter = step.get("filter") # Optional filter to apply to items
+        limit_items = len(loop_items)
+        if max_iterations is not None and max_iterations > 0:
+            limit_items = min(limit_items, int(max_iterations))
+            
+        for i, item in enumerate(loop_items[:limit_items]):
+            # Apply filter if provided
+            if collection_filter:
+                # Create temporary context with item to evaluate filter condition
+                temp_context = copy.deepcopy(context)
+                temp_context[loop_variable] = item
+                
+                # Check if filter condition passes
+                filter_result = self._evaluate_condition(collection_filter, temp_context)
+                if not filter_result:
+                    self.logger.debug("loop.item_filtered_out", 
+                                   step_name=step_name, 
+                                   iteration=i)
+                    continue  # Skip this item
+            
             # Create a new context for this iteration
-            iteration_context = copy.deepcopy(context)
+            iteration_context = copy.deepcopy(aggregated_context)
             
             # Set the loop variable in the context
             iteration_context[loop_variable] = item
@@ -842,7 +1483,9 @@ class ExecutionPlanExecutor:
                 iteration_context["loop_metadata"] = {}
             iteration_context["loop_metadata"]["current_loop"] = step_name
             iteration_context["loop_metadata"]["current_index"] = i
+            iteration_context["loop_metadata"]["item_index"] = i
             iteration_context["loop_metadata"]["total_items"] = len(loop_items)
+            iteration_context["loop_metadata"]["iteration_count"] = i + 1
             
             # Log loop iteration start
             self.logger.debug("loop.iteration_start", 
@@ -869,13 +1512,22 @@ class ExecutionPlanExecutor:
             # Execute the body as a nested plan
             iteration_result = self.execute_plan(body_plan, iteration_context)
             
-            # Store the result
+            # Process the result data
+            item_output = iteration_result.output
+            if item_output is None:
+                item_output = {}
+                
+            # Store the iteration result
             iteration_results.append({
                 "iteration": i,
                 "success": iteration_result.success,
                 "error": iteration_result.error,
-                "data": iteration_result.data
+                "output": item_output 
             })
+            
+            # Add to aggregated output if this iteration succeeded
+            if iteration_result.success:
+                aggregated_output.append(item_output)
             
             # Log loop iteration end
             self.logger.debug("loop.iteration_end", 
@@ -894,37 +1546,87 @@ class ExecutionPlanExecutor:
                     }
                 )
             
+            # Check for special actions
+            if iteration_result.action:
+                if iteration_result.action == StepAction.BREAK_LOOP:
+                    self.logger.info("loop.break_encountered",
+                                  step_name=step_name,
+                                  iteration=i)
+                    break
+                elif iteration_result.action == StepAction.CONTINUE_LOOP:
+                    self.logger.info("loop.continue_encountered",
+                                  step_name=step_name,
+                                  iteration=i)
+                    # Use the iteration context up to this point, then continue to next iteration
+                    continue
+            
             # Check for failure
-            if not iteration_result.success and step.get("stop_on_iteration_failure", True):
+            if not iteration_result.success and stop_on_iteration_failure:
                 self.logger.warning("loop.iteration_failed", 
                                  step_name=step_name,
                                  iteration=i,
                                  error=iteration_result.error)
+                
+                # Check if we should return failures in the output
                 return ExecutionResult(
                     success=False,
-                    context={},
-                    output={"iterations": iteration_results},
+                    context=aggregated_context,  # Return the context as it was before the failed iteration
+                    output={
+                        "iterations": iteration_results,
+                        "aggregated_output": aggregated_output
+                    },
                     error=f"Loop iteration {i} failed in step {step_name}: {iteration_result.error}",
                     step_name=step_name,
                     step_type="loop"
                 )
             
-            # Use the final context from the iteration as input to the next iteration
+            # Update aggregated context with this iteration's context if successful
             if iteration_result.success and iteration_result.context:
-                # But only apply updates to the parent context, don't replace whole context
+                # But only apply updates to the parent context, don't replace loop-specific keys
                 parent_keys_to_update = set(iteration_result.context.keys()) - {loop_variable, "loop_metadata"}
                 for key in parent_keys_to_update:
-                    context[key] = iteration_result.context[key]
+                    aggregated_context[key] = iteration_result.context[key]
+        
+        # Check if we should aggregate the outputs into a specific structure
+        output_format = step.get("output_format", "list")
+        output_data = aggregated_output
+        
+        if output_format == "map" and loop_variable and step.get("key_field"):
+            # Convert output list to a map using a key field
+            key_field = step.get("key_field")
+            output_map = {}
+            
+            for idx, item_result in enumerate(output_data):
+                if isinstance(item_result, dict) and key_field in item_result:
+                    key = item_result[key_field]
+                    if isinstance(key, (str, int, float, bool)):  # Ensure key is a valid type
+                        output_map[str(key)] = item_result
+                else:
+                    # If key_field not found, use index as key
+                    output_map[f"item_{idx}"] = item_result
+                    
+            output_data = output_map
+        
+        # Add summary statistics
+        success_count = sum(1 for r in iteration_results if r.get("success", False))
         
         self.logger.info("loop.completed", 
                       step_name=step_name,
                       iterations_completed=len(iteration_results),
-                      successful_iterations=sum(1 for r in iteration_results if r["success"]))
+                      successful_iterations=success_count)
         
         return ExecutionResult(
             success=True,
-            context={},
-            output={"iterations": iteration_results},
+            context=aggregated_context,
+            output={
+                "iterations": iteration_results,
+                "output": output_data,
+                "stats": {
+                    "total": len(iteration_results),
+                    "success": success_count,
+                    "failure": len(iteration_results) - success_count
+                }
+            },
             step_name=step_name,
             step_type="loop"
         )
@@ -936,6 +1638,10 @@ class ExecutionPlanExecutor:
     ) -> ExecutionResult:
         """
         Execute a branch step by evaluating conditions and determining routing.
+        
+        This method evaluates a set of conditional branches and determines which
+        execution path to take. It supports complex conditions with AND/OR/NOT logic,
+        multiple branches, and explicit actions to take when a condition is true.
         
         Args:
             step: The branch step definition
@@ -955,25 +1661,41 @@ class ExecutionPlanExecutor:
                 step_type="branch"
             )
         
+        # Get default branch if specified
+        default_branch = step.get("default")
+        
         self.logger.info("branch.executing", 
                       step_name=step_name,
-                      branch_count=len(branches))
+                      branch_count=len(branches),
+                      has_default=default_branch is not None)
+        
+        # Check if we should execute a branch body directly instead of routing
+        execute_inline = step.get("execute_inline", False)
         
         # Evaluate each branch condition
         for branch_idx, branch in enumerate(branches):
+            branch_name = branch.get("name", f"branch_{branch_idx}")
             condition = branch.get("condition", {})
             target = branch.get("target")
+            action = branch.get("action")
             
+            # New in ArchDocV3: Support for branch inline execution
+            branch_body = branch.get("body", [])
+            
+            # Validate branch configuration
             if not condition:
                 self.logger.warning("branch.missing_condition", 
                                  step_name=step_name,
-                                 branch_idx=branch_idx)
+                                 branch_idx=branch_idx,
+                                 branch_name=branch_name)
                 continue
                 
-            if target is None:
+            # Check if we need a target
+            if not execute_inline and target is None and action is None and not branch_body:
                 self.logger.warning("branch.missing_target", 
                                  step_name=step_name,
-                                 branch_idx=branch_idx)
+                                 branch_idx=branch_idx,
+                                 branch_name=branch_name)
                 continue
             
             # Evaluate the condition
@@ -983,7 +1705,10 @@ class ExecutionPlanExecutor:
                 self.logger.info("branch.condition_true", 
                               step_name=step_name,
                               branch_idx=branch_idx,
-                              target=target)
+                              branch_name=branch_name,
+                              target=target,
+                              action=action,
+                              has_body=bool(branch_body))
                 
                 # Log routing event for lineage tracking
                 if self.event_logger:
@@ -991,29 +1716,128 @@ class ExecutionPlanExecutor:
                         event_type=EventType.ROUTING_EVALUATION,
                         payload={
                             "step_name": step_name,
+                            "branch_name": branch_name,
                             "branch_idx": branch_idx,
                             "condition": condition,
                             "result": True,
-                            "target": target
+                            "target": target,
+                            "action": action
                         }
                     )
                 
+                # Check if we have a branch body to execute inline
+                if execute_inline and branch_body:
+                    self.logger.info("branch.executing_inline_body", 
+                                  step_name=step_name,
+                                  branch_name=branch_name,
+                                  steps=len(branch_body))
+                    
+                    # Create a mini execution plan for the branch body
+                    branch_plan = {
+                        "enabled": True,
+                        "steps": branch_body
+                    }
+                    
+                    # Execute the branch body as a nested plan
+                    branch_result = self.execute_plan(branch_plan, context)
+                    
+                    # Return the result with routing information
+                    return ExecutionResult(
+                        success=branch_result.success,
+                        context=branch_result.context,
+                        output={
+                            "branch_idx": branch_idx,
+                            "branch_name": branch_name,
+                            "result": branch_result.output,
+                            "mode": "inline_execution"
+                        },
+                        error=branch_result.error,
+                        step_name=step_name,
+                        step_type="branch",
+                        action=branch_result.action  # Propagate any action from the branch body
+                    )
+                
+                # Check if we have a special action to take
+                if action:
+                    self.logger.info("branch.action_specified", 
+                                  step_name=step_name,
+                                  branch_name=branch_name,
+                                  action=action)
+                    
+                    # Map the action to StepAction enum
+                    action_map = {
+                        "exit_plan_with_success": StepAction.EXIT_PLAN_WITH_SUCCESS,
+                        "exit_plan_with_failure": StepAction.EXIT_PLAN_WITH_FAILURE,
+                        "break_loop": StepAction.BREAK_LOOP,
+                        "continue_loop": StepAction.CONTINUE_LOOP
+                    }
+                    
+                    if action in action_map:
+                        step_action = action_map[action]
+                        
+                        # Return with the specified action
+                        return ExecutionResult(
+                            success=action != "exit_plan_with_failure",
+                            context={},
+                            output={
+                                "branch_idx": branch_idx,
+                                "branch_name": branch_name,
+                                "action": action
+                            },
+                            step_name=step_name,
+                            step_type="branch",
+                            action=step_action
+                        )
+                    else:
+                        self.logger.warning("branch.unknown_action", 
+                                         step_name=step_name,
+                                         branch_name=branch_name,
+                                         action=action)
+                
+                # Normal routing to a target
                 return ExecutionResult(
                     success=True,
                     context={},
-                    output={"branch_idx": branch_idx, "target": target},
+                    output={
+                        "branch_idx": branch_idx, 
+                        "branch_name": branch_name,
+                        "target": target,
+                        "mode": "routing"
+                    },
                     step_name=step_name,
                     step_type="branch"
                 )
         
-        # No branch condition was true
+        # No branch condition was true, check for default
+        if default_branch is not None:
+            self.logger.info("branch.using_default", 
+                          step_name=step_name,
+                          default=default_branch)
+            
+            # Return the default branch target
+            return ExecutionResult(
+                success=True,
+                context={},
+                output={
+                    "branch_name": "default",
+                    "target": default_branch,
+                    "mode": "default_routing"
+                },
+                step_name=step_name,
+                step_type="branch"
+            )
+            
+        # No branch condition was true and no default
         self.logger.info("branch.no_condition_true", 
                       step_name=step_name)
         
         return ExecutionResult(
             success=True,
             context={},
-            output={"message": "No branch condition was true"},
+            output={
+                "message": "No branch condition was true",
+                "mode": "no_match"
+            },
             step_name=step_name,
             step_type="branch"
         )
@@ -1026,6 +1850,10 @@ class ExecutionPlanExecutor:
         """
         Execute a set_value step by setting a value in the context.
         
+        This method supports complex value setting, including template resolution
+        in both keys and values, recursive resolution of nested structures, and
+        special functions for value generation (timestamps, UUIDs, etc.)
+        
         Args:
             step: The set_value step definition
             context: The current execution context
@@ -1036,48 +1864,188 @@ class ExecutionPlanExecutor:
         step_name = step.get("name", "unnamed_set_value")
         field = step.get("field")
         value = step.get("value")
+        value_type = step.get("type")  # New in ArchDocV3: explicit type
         
-        if not field:
+        # Check for multiple fields/values
+        fields = step.get("fields", [])
+        
+        if not field and not fields:
             return ExecutionResult(
                 success=False,
-                error=f"Missing field in set_value step {step_name}",
+                error=f"Missing field(s) in set_value step {step_name}",
                 step_name=step_name,
                 step_type="set_value"
             )
-        
-        self.logger.info("set_value.executing", 
-                      step_name=step_name,
-                      field=field)
         
         try:
-            # Format the value if it's a template string
-            if isinstance(value, str) and "{{" in value and "}}" in value:
-                formatted_value = self._format_template(value, context)
-            else:
-                formatted_value = value
+            # First, handle single-field case
+            if field:
+                self.logger.info("set_value.executing.single_field", 
+                              step_name=step_name,
+                              field=field)
+                
+                # Format the field path if it's a template
+                if isinstance(field, str) and "${" in field and "}" in field:
+                    field = self._format_template(field, context)
+                    
+                # Process value based on type if specified
+                formatted_value = self._process_value_by_type(value, value_type, context)
+                
+                # Create a new context with the updated value
+                updated_context = self._set_context_value(context, field, formatted_value)
+                
+                return ExecutionResult(
+                    success=True,
+                    context=updated_context,
+                    output={"field": field, "value": formatted_value},
+                    step_name=step_name,
+                    step_type="set_value"
+                )
             
-            # Create a new context with the updated value
-            updated_context = self._set_context_value(context, field, formatted_value)
-            
-            return ExecutionResult(
-                success=True,
-                context=updated_context,
-                output={"field": field, "value": formatted_value},
-                step_name=step_name,
-                step_type="set_value"
-            )
+            # Handle multi-field case
+            if fields:
+                self.logger.info("set_value.executing.multi_field", 
+                              step_name=step_name,
+                              field_count=len(fields))
+                
+                updated_context = copy.deepcopy(context)
+                results = {}
+                
+                for field_def in fields:
+                    field_path = field_def.get("field")
+                    field_value = field_def.get("value")
+                    field_type = field_def.get("type")
+                    
+                    if not field_path:
+                        self.logger.warning("set_value.missing_field_in_item", 
+                                         step_name=step_name)
+                        continue
+                    
+                    # Format the field path if it's a template
+                    if isinstance(field_path, str) and "${" in field_path and "}" in field_path:
+                        field_path = self._format_template(field_path, updated_context)
+                    
+                    # Process value based on type if specified
+                    processed_value = self._process_value_by_type(field_value, field_type, updated_context)
+                    
+                    # Update the context
+                    updated_context = self._set_context_value(updated_context, field_path, processed_value)
+                    
+                    # Store the result
+                    results[field_path] = processed_value
+                    
+                    self.logger.debug("set_value.updated_field", 
+                                   step_name=step_name,
+                                   field=field_path)
+                
+                return ExecutionResult(
+                    success=True,
+                    context=updated_context,
+                    output={"fields": results},
+                    step_name=step_name,
+                    step_type="set_value"
+                )
             
         except Exception as e:
             self.logger.exception("set_value.failed", 
                                step_name=step_name,
-                               field=field,
+                               field=field if field else "multiple_fields",
                                error=str(e))
             return ExecutionResult(
                 success=False,
-                error=f"Error setting value at '{field}': {str(e)}",
+                error=f"Error in set_value step '{step_name}': {str(e)}",
                 step_name=step_name,
                 step_type="set_value"
             )
+    
+    def _process_value_by_type(
+        self, 
+        value: Any, 
+        value_type: Optional[str], 
+        context: Dict[str, Any]
+    ) -> Any:
+        """
+        Process a value based on its type and resolve any templates.
+        
+        Args:
+            value: The value to process
+            value_type: Optional type information to guide processing
+            context: The current execution context for template resolution
+            
+        Returns:
+            The processed value
+        """
+        # Handle template strings
+        if isinstance(value, str):
+            # Check for "{{ }}" style templates
+            if "{{" in value and "}}" in value:
+                value = self._format_template(value, context)
+            # Check for "${ }" style templates
+            elif "${" in value and "}" in value:
+                value = self._format_template(value, context)
+        
+        # Handle specific types if specified
+        if value_type:
+            if value_type == "timestamp":
+                from datetime import datetime, timezone
+                return datetime.now(timezone.utc).isoformat()
+            
+            elif value_type == "uuid":
+                import uuid
+                return str(uuid.uuid4())
+            
+            elif value_type == "integer":
+                if isinstance(value, str):
+                    return int(value)
+                return int(value)
+            
+            elif value_type == "float":
+                if isinstance(value, str):
+                    return float(value)
+                return float(value)
+            
+            elif value_type == "boolean":
+                if isinstance(value, str):
+                    return value.lower() in ["true", "yes", "1", "y"]
+                return bool(value)
+            
+            elif value_type == "string":
+                return str(value)
+            
+            elif value_type == "json":
+                if isinstance(value, str):
+                    import json
+                    return json.loads(value)
+                return value
+            
+            elif value_type == "template":
+                # Already processed above for strings
+                return value
+            
+            elif value_type == "path":
+                # For values that reference paths in the context
+                if isinstance(value, str):
+                    return self._get_context_value(context, value)
+                return value
+        
+        # Handle dictionaries (recursively resolve any template strings in values)
+        if isinstance(value, dict):
+            result = {}
+            for k, v in value.items():
+                # Process the key if it's a template
+                if isinstance(k, str) and "${" in k and "}" in k:
+                    k = self._format_template(k, context)
+                
+                # Recursively process the value
+                result[k] = self._process_value_by_type(v, None, context)
+            return result
+            
+        # Handle lists (recursively resolve any template strings in items)
+        if isinstance(value, list):
+            return [self._process_value_by_type(item, None, context) for item in value]
+        
+        # Default case: return the value as is
+        return value
     
     def _evaluate_condition(
         self, 
