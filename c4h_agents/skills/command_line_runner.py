@@ -70,6 +70,9 @@ class CommandLineRunner:
         1. Named command: Uses a pre-configured command from the skill config
         2. Direct command: Executes the specified command_line directly
         
+        Following the Total Functions principle (1.4), this method handles all expected error
+        conditions internally and always returns a structured SkillResult, even in error cases.
+        
         Args:
             input: Input context
             command_name: Name of pre-configured command to execute
@@ -79,42 +82,130 @@ class CommandLineRunner:
             output_to_file: Whether to write command output to a file
             
         Returns:
-            SkillResult with command output and metadata
+            SkillResult with command output and metadata (never raises exceptions for expected failures)
         """
-        try:
-            # Normalize input
-            input = input or {}
-            
-            # Resolve command to execute
-            cmd, cmd_type, script_path = self._resolve_command(command_name, command_line)
-            if not cmd:
-                self.logger.error("command_line_runner.no_command_specified")
-                return SkillResult(
-                    success=False,
-                    error="No command specified. Provide either command_name or command_line."
-                )
-            
-            # Resolve working directory
-            working_dir = self._resolve_working_dir(working_dir, input)
-            
-            # Prepare command arguments, including command_name for defaults
-            cmd_args = self._prepare_command_args(
-                cmd_type, 
-                command_args or {}, 
-                input,
-                command_name=command_name
+        # Normalize input to prevent NoneType errors
+        input = input or {}
+        command_args = command_args or {}
+        
+        # 1. Verify command specification
+        if not command_name and not command_line:
+            self.logger.error("command_line_runner.no_command_specified")
+            return SkillResult(
+                success=False,
+                error="No command specified. Provide either command_name or command_line.",
+                value={
+                    "provided_args": {
+                        "command_name": command_name,
+                        "command_line": command_line
+                    }
+                }
             )
             
-            # Generate output file path if needed
+        # 2. Check if named command exists in configuration
+        if command_name and command_name not in self.command_configs:
+            self.logger.error("command_line_runner.command_not_found", command_name=command_name)
+            available_commands = list(self.command_configs.keys())
+            return SkillResult(
+                success=False,
+                error=f"Command '{command_name}' not found in configuration. Available commands: {available_commands}",
+                value={
+                    "available_commands": available_commands
+                }
+            )
+            
+        try:
+            # 3. Resolve command to execute
+            cmd, cmd_type, script_path = self._resolve_command(command_name, command_line)
+            if not cmd:
+                # This shouldn't happen given the earlier checks, but handling as a precaution
+                return SkillResult(
+                    success=False,
+                    error="Failed to resolve command. Command resolution returned empty command.",
+                    value={
+                        "command_name": command_name,
+                        "command_line": command_line
+                    }
+                )
+            
+            # 4. Resolve working directory with error handling
+            try:
+                working_dir = self._resolve_working_dir(working_dir, input)
+                # Verify working directory exists
+                if not os.path.isdir(working_dir):
+                    self.logger.error("command_line_runner.invalid_working_dir", 
+                                   working_dir=working_dir)
+                    return SkillResult(
+                        success=False,
+                        error=f"Working directory does not exist: {working_dir}",
+                        value={
+                            "command": cmd,
+                            "working_dir": working_dir
+                        }
+                    )
+            except Exception as e:
+                self.logger.error("command_line_runner.working_dir_error", 
+                               error=str(e),
+                               working_dir=working_dir)
+                return SkillResult(
+                    success=False,
+                    error=f"Error resolving working directory: {str(e)}",
+                    value={
+                        "command": cmd,
+                        "working_dir_input": working_dir
+                    }
+                )
+            
+            # 5. Prepare command arguments, including command_name for defaults
+            try:
+                cmd_args = self._prepare_command_args(
+                    cmd_type, 
+                    command_args, 
+                    input,
+                    command_name=command_name
+                )
+            except Exception as e:
+                self.logger.error("command_line_runner.args_preparation_error", 
+                               error=str(e),
+                               command_args=command_args)
+                return SkillResult(
+                    success=False,
+                    error=f"Error preparing command arguments: {str(e)}",
+                    value={
+                        "command": cmd,
+                        "command_args": command_args
+                    }
+                )
+            
+            # 6. Generate output file path if needed
             output_file = None
             if output_to_file:
-                run_id = input.get("workflow_run_id") or input.get("execution_id") or str(uuid.uuid4())
-                output_dir = os.path.join(os.getcwd(), "workspaces")
-                os.makedirs(output_dir, exist_ok=True)
-                output_file = os.path.join(output_dir, f"cmd_output_{run_id}.txt")
+                try:
+                    run_id = input.get("workflow_run_id") or input.get("execution_id") or str(uuid.uuid4())
+                    output_dir = os.path.join(os.getcwd(), "workspaces")
+                    os.makedirs(output_dir, exist_ok=True)
+                    output_file = os.path.join(output_dir, f"cmd_output_{run_id}.txt")
+                    self.logger.debug("command_line_runner.output_file_created", 
+                                   output_file=output_file)
+                except Exception as e:
+                    self.logger.error("command_line_runner.output_file_error", 
+                                   error=str(e))
+                    # Continue without output file if it fails
+                    output_to_file = False
+                    output_file = None
             
-            # Execute the command based on its type
+            # 7. Execute the command based on its type
             if cmd_type == "python_module":
+                # Validate script path
+                if not script_path:
+                    return SkillResult(
+                        success=False,
+                        error="Missing script path for Python module execution",
+                        value={
+                            "command": cmd,
+                            "cmd_type": cmd_type
+                        }
+                    )
                 result = self._execute_python_module(script_path, cmd_args, working_dir, output_file)
             else:
                 result = self._execute_shell_command(cmd, cmd_args, working_dir, output_file)
@@ -122,10 +213,18 @@ class CommandLineRunner:
             return result
             
         except Exception as e:
-            self.logger.exception("command_line_runner.failed", error=str(e))
+            # Final fallback for any unhandled exceptions to ensure we never raise
+            self.logger.exception("command_line_runner.unhandled_error", 
+                              error=str(e),
+                              error_type=type(e).__name__)
             return SkillResult(
                 success=False,
-                error=f"Error executing command: {str(e)}"
+                error=f"Unhandled error executing command: {str(e)}",
+                value={
+                    "command_name": command_name,
+                    "command_line": command_line,
+                    "error_type": type(e).__name__
+                }
             )
     
     def _resolve_command(
@@ -136,6 +235,9 @@ class CommandLineRunner:
         """
         Resolve the command to execute based on command_name or command_line.
         
+        This method identifies the command to execute and determines whether it's
+        a shell command or Python module, extracting the appropriate parameters for each.
+        
         Args:
             command_name: Name of pre-configured command
             command_line: Direct command line to execute
@@ -145,9 +247,14 @@ class CommandLineRunner:
             - command is the resolved command as a list of strings
             - command_type is one of "shell_command" or "python_module"
             - script_path is the path to the Python script (for python_module type only)
+            
+        Note: 
+            If command resolution fails, the caller should handle the empty command list
+            by returning an appropriate SkillResult, not by raising an exception.
         """
+        # Case 1: Resolve from named command in configuration
         if command_name:
-            # Look up command in configuration
+            # Look up command in configuration (validation was done in the execute method)
             if command_name not in self.command_configs:
                 self.logger.error("command_line_runner.command_not_found", command_name=command_name)
                 return [], "", None
@@ -155,25 +262,38 @@ class CommandLineRunner:
             cmd_config = self.command_configs[command_name]
             cmd_type = cmd_config.get("type", "shell_command")
             
+            # Handle Python module type command
             if cmd_type == "python_module":
                 script_path = cmd_config.get("module_path")
                 if not script_path:
-                    self.logger.error("command_line_runner.missing_module_path", command_name=command_name)
-                    return [], "", None
+                    self.logger.error("command_line_runner.missing_module_path", 
+                                   command_name=command_name)
+                    # Return empty command to signal failure
+                    return [], "python_module", None
                     
                 # For Python modules, we'll execute through Python interpreter
-                cmd = [sys.executable, "-m" if "." in script_path else script_path]
+                # Check if it's a module path (contains dots) or a file path
+                if "." in script_path and not script_path.endswith(".py"):
+                    # It's a module path like "a.b.c", use -m flag
+                    cmd = [sys.executable, "-m", script_path]
+                else:
+                    # It's a file path, execute directly
+                    cmd = [sys.executable, script_path]
+                    
                 self.logger.debug("command_line_runner.using_python_module", 
                                module=script_path,
                                command=cmd)
                 return cmd, cmd_type, script_path
-                
+            
+            # Handle shell command type
             else:
-                # Shell command
+                # Get the command template
                 cmd_template = cmd_config.get("command", "")
                 if not cmd_template:
-                    self.logger.error("command_line_runner.missing_command_template", command_name=command_name)
-                    return [], "", None
+                    self.logger.error("command_line_runner.missing_command_template", 
+                                   command_name=command_name)
+                    # Return empty command to signal failure
+                    return [], "shell_command", None
                     
                 # Convert command template to list if it's a string
                 if isinstance(cmd_template, str):
@@ -185,37 +305,54 @@ class CommandLineRunner:
                                command=cmd,
                                command_name=command_name)
                 return cmd, "shell_command", None
-                
+        
+        # Case 2: Resolve from direct command line        
         elif command_line:
-            # Use direct command line
-            if isinstance(command_line, str):
-                cmd = command_line.split()
-            else:
-                cmd = list(command_line)
+            try:
+                # Convert command line to command list
+                if isinstance(command_line, str):
+                    cmd = command_line.split()
+                else:
+                    cmd = list(command_line)
                 
-            # Check if it's a Python script
-            if len(cmd) > 0 and (cmd[0].endswith(".py") or cmd[0] == sys.executable):
-                if cmd[0] == sys.executable and len(cmd) > 1 and cmd[1].endswith(".py"):
-                    script_path = cmd[1]
-                    cmd_type = "python_module"
-                elif cmd[0].endswith(".py"):
-                    script_path = cmd[0]
-                    cmd = [sys.executable, script_path] + cmd[1:]
-                    cmd_type = "python_module"
+                # Check if command list is valid
+                if not cmd or not any(cmd):
+                    self.logger.error("command_line_runner.empty_command_line")
+                    return [], "shell_command", None
+                    
+                # Check if it's a Python script execution
+                if len(cmd) > 0:
+                    # Case: python script.py
+                    if cmd[0] == sys.executable and len(cmd) > 1 and cmd[1].endswith(".py"):
+                        script_path = cmd[1]
+                        cmd_type = "python_module"
+                    # Case: script.py (convert to python script.py)
+                    elif cmd[0].endswith(".py"):
+                        script_path = cmd[0]
+                        cmd = [sys.executable, script_path] + cmd[1:]
+                        cmd_type = "python_module"
+                    # Case: Other executable
+                    else:
+                        script_path = None
+                        cmd_type = "shell_command"
                 else:
                     script_path = None
                     cmd_type = "shell_command"
-            else:
-                script_path = None
-                cmd_type = "shell_command"
-                
-            self.logger.debug("command_line_runner.using_direct_command", 
-                           command=cmd,
-                           command_type=cmd_type)
-            return cmd, cmd_type, script_path
+                    
+                self.logger.debug("command_line_runner.using_direct_command", 
+                               command=cmd,
+                               command_type=cmd_type)
+                return cmd, cmd_type, script_path
+            except Exception as e:
+                # Handle any errors parsing the command line
+                self.logger.error("command_line_runner.command_line_parse_error",
+                              error=str(e),
+                              command_line=command_line)
+                return [], "shell_command", None
             
+        # Case 3: No command specified (should be caught by execute method)
         else:
-            # No command specified
+            self.logger.error("command_line_runner.no_command_specified")
             return [], "", None
     
     def _resolve_working_dir(self, working_dir: Optional[str], input: Dict[str, Any]) -> str:

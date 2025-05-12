@@ -529,28 +529,42 @@ class BaseAgent(BaseConfig, BaseLLM):
         This method checks for system message in the agent's configuration, with overrides
         from the context taking precedence. This allows for runtime customization.
         
+        Following Total Functions principle (1.4), this method handles all expected error
+        conditions internally and always returns a valid system message string, even
+        in error cases.
+        
         Args:
             context: Optional context that may contain overrides
             
         Returns:
-            The system message string to use for the LLM
+            The system message string to use for the LLM (never raises exceptions)
         """
-        try:
-            # Try to get the persona key for this agent
+        # Default message as fallback for all error cases
+        default_system_message = "You are an AI assistant that helps with code analysis and transformation tasks."
+        
+        # First check for context override (highest priority)
+        if context and 'system_message' in context:
+            self.logger.debug("_get_system_message.using_context_override")
+            return str(context['system_message'])
+        
+        # Try to get the persona key for this agent
+        try:  
             persona_key = self.config_node.get_value(f"orchestration.teams.*.tasks[?name={self.unique_name}].persona_key")
             if not persona_key:
-                self.logger.warning("_get_system_message.persona_key_not_found", agent_name=self.unique_name)
-                persona_key = "default"
+                # Also try the direct path in case it's configured there
+                persona_key = self.config_node.get_value(f"llm_config.agents.{self.unique_name}.persona_key")
                 
-            # First check for context override (highest priority)
-            if context and 'system_message' in context:
-                self.logger.debug("_get_system_message.using_context_override")
-                return str(context['system_message'])
-                
+                if not persona_key:
+                    self.logger.warning("_get_system_message.persona_key_not_found", 
+                                     agent_name=self.unique_name)
+                    # Use "default" as fallback persona key
+                    persona_key = "default"
+                    
             # Next try persona configuration (normal path)
             system_message = self.config_node.get_value(f"llm_config.personas.{persona_key}.prompts.system")
             if system_message:
-                self.logger.debug("_get_system_message.using_persona_config", persona_key=persona_key)
+                self.logger.debug("_get_system_message.using_persona_config", 
+                                persona_key=persona_key)
                 return str(system_message)
                 
             # Fallback to legacy agent config structure
@@ -558,14 +572,35 @@ class BaseAgent(BaseConfig, BaseLLM):
             if system_message:
                 self.logger.debug("_get_system_message.using_legacy_agent_config")
                 return str(system_message)
-                
-            # Last resort - default message
-            self.logger.warning("_get_system_message.no_system_message_found", persona_key=persona_key, agent_name=self.unique_name)
-            return "You are an AI assistant that helps with code analysis and transformation tasks."
+            
+            # Try any self.persona_key if it exists on the instance
+            if hasattr(self, 'persona_key') and self.persona_key:
+                alt_system_message = self.config_node.get_value(f"llm_config.personas.{self.persona_key}.prompts.system")
+                if alt_system_message:
+                    self.logger.debug("_get_system_message.using_instance_persona_key", 
+                                    persona_key=self.persona_key)
+                    return str(alt_system_message)
+            
+            # Try default prompts location
+            default_system_message = self.config_node.get_value("llm_config.default_prompts.system")
+            if default_system_message:
+                self.logger.debug("_get_system_message.using_default_prompts")
+                return str(default_system_message)
+            
+            # Last resort - hardcoded default message
+            self.logger.warning("_get_system_message.no_system_message_found", 
+                             persona_key=persona_key, 
+                             agent_name=self.unique_name)
+            return default_system_message
             
         except Exception as e:
-            self.logger.error("_get_system_message.failed", error=str(e), exc_info=True)
-            return "You are an AI assistant that helps with code analysis and transformation tasks."
+            # Handle any errors during config access or processing
+            self.logger.error("_get_system_message.failed", 
+                           error=str(e), 
+                           agent_name=self.unique_name,
+                           exc_info=True)
+            # Always return a valid system message, never raise exceptions
+            return default_system_message
 
     def _get_prompt(self, prompt_type: str, context: Optional[Dict[str, Any]] = None) -> str:
         """
@@ -582,10 +617,14 @@ class BaseAgent(BaseConfig, BaseLLM):
             
         Returns:
             Prompt template string from context override or persona config
+            
+        Raises:
+            ValueError: When no prompt template could be found and a fallback isn't possible
         """
         # Initialize variables
         prompt = None
         prompt_key = prompt_type
+        agent_name = self._get_agent_name()
         
         # First check for override in context if provided
         if context:
@@ -597,7 +636,7 @@ class BaseAgent(BaseConfig, BaseLLM):
             if prompt_override_key in overrides:
                 prompt = overrides[prompt_override_key]
                 self.logger.debug("prompt.from_direct_override", 
-                                agent_name=self.unique_name,
+                                agent_name=agent_name,
                                 prompt_type=prompt_type,
                                 prompt_length=len(prompt) if prompt else 0)
                 
@@ -605,7 +644,7 @@ class BaseAgent(BaseConfig, BaseLLM):
             elif 'prompt_key' in overrides:
                 prompt_key = overrides['prompt_key']
                 self.logger.debug("prompt.using_key_override", 
-                                agent_name=self.unique_name,
+                                agent_name=agent_name,
                                 original_key=prompt_type,
                                 override_key=prompt_key)
         
@@ -614,14 +653,35 @@ class BaseAgent(BaseConfig, BaseLLM):
             persona_prompt_path = f"{self.persona_path}.prompts.{prompt_key}"
             prompt = self.config_node.get_value(persona_prompt_path)
             
+            # Check for fallbacks if persona prompt isn't found
             if prompt is None:
-                # Use self.logger which is initialized
-                agent_name = self._get_agent_name()
-                self.logger.error("prompt.template_not_found", 
-                               prompt_type=prompt_key, 
-                               agent=agent_name,
-                               persona_path=persona_prompt_path)
-                raise ValueError(f"No prompt template '{prompt_key}' found in persona '{self.persona_key}' for agent {agent_name}")
+                # Try legacy prompt location (in agent config)
+                legacy_prompt_path = f"llm_config.agents.{self.unique_name}.prompts.{prompt_key}"
+                prompt = self.config_node.get_value(legacy_prompt_path)
+                
+                if prompt is not None:
+                    self.logger.warning("prompt.using_legacy_location", 
+                                     agent_name=agent_name,
+                                     prompt_type=prompt_key,
+                                     path=legacy_prompt_path)
+                else:
+                    # Try default prompts as last resort
+                    default_prompt_path = f"llm_config.default_prompts.{prompt_key}"
+                    prompt = self.config_node.get_value(default_prompt_path)
+                    
+                    if prompt is not None:
+                        self.logger.warning("prompt.using_default_prompt", 
+                                         agent_name=agent_name,
+                                         prompt_type=prompt_key,
+                                         path=default_prompt_path)
+                    else:
+                        # No prompt found after exhausting all options
+                        self.logger.error("prompt.template_not_found", 
+                                       prompt_type=prompt_key, 
+                                       agent=agent_name,
+                                       persona_path=persona_prompt_path)
+                        # Still need to raise if no prompt found, as returning an empty string could cause issues
+                        raise ValueError(f"No prompt template '{prompt_key}' found in persona '{self.persona_key}' for agent {agent_name}")
             
         # Ensure prompt is a string before returning
         return str(prompt) if prompt is not None else ""
@@ -637,52 +697,72 @@ class BaseAgent(BaseConfig, BaseLLM):
         Returns:
             Formatted request string
         """
-        try:
-             # Check for a format template override in context
-             template = None
-             template_key = "user"  # Default template key
-             
-             # Check for overrides in context if provided
-             if context:
-                 overrides = context.get('agent_config_overrides', {}).get(self.unique_name, {})
-                 
-                 # Direct template override
-                 if 'template' in overrides:
-                     template = overrides['template']
-                     self.logger.debug("format_request.using_direct_template_override", 
-                                     agent_name=self.unique_name,
-                                     template_length=len(template) if template else 0)
-                 
-                 # Template key override
-                 elif 'template_key' in overrides:
-                     template_key = overrides['template_key']
-                     self.logger.debug("format_request.using_template_key_override", 
-                                     agent_name=self.unique_name,
-                                     template_key=template_key)
-             
-             # If no direct template override, get template from persona
-             if template is None:
-                 # Get template using updated _get_prompt method (which also handles overrides)
-                 template = self._get_prompt(template_key, context)
-             
-             # Format the template with data if it contains format placeholders
-             if isinstance(template, str) and '{' in template:
-                 try:
-                     return template.format(**data)
-                 except KeyError as e:
-                     self.logger.warning("format_request.missing_key_in_template", error=str(e))
-                     # Fall back to JSON format on template key error
-                     return json.dumps(data, indent=2, default=str)
-             elif template:
-                 # Template exists but doesn't need formatting
-                 return str(template)
-             else:
-                 # No template, use default JSON format
-                 self.logger.debug("format_request.using_default_json")
-                 return json.dumps(data, indent=2, default=str)
-        except Exception as e:
-             self.logger.error("format_request.failed", error=str(e))
-             return str(data) # Ultimate fallback
+        # Initialize variables with safe defaults
+        template = None
+        template_key = "user"  # Default template key
+         
+        # Check for overrides in context if provided
+        if context:
+            overrides = context.get('agent_config_overrides', {}).get(self.unique_name, {})
+            
+            # Direct template override
+            if 'template' in overrides:
+                template = overrides['template']
+                self.logger.debug("format_request.using_direct_template_override", 
+                                agent_name=self.unique_name,
+                                template_length=len(template) if template else 0)
+            
+            # Template key override
+            elif 'template_key' in overrides:
+                template_key = overrides['template_key']
+                self.logger.debug("format_request.using_template_key_override", 
+                                agent_name=self.unique_name,
+                                template_key=template_key)
+        
+        # If no direct template override, get template from persona
+        if template is None:
+            try:
+                # Get template using updated _get_prompt method (which also handles overrides)
+                template = self._get_prompt(template_key, context)
+            except ValueError as e:
+                # Handle value errors (missing templates) with a log and fallback
+                self.logger.warning("format_request.prompt_not_found", 
+                                  error=str(e),
+                                  template_key=template_key)
+                # Set template to None - will be handled below
+                template = None
+            except Exception as e:
+                # Handle other errors getting the prompt
+                self.logger.error("format_request.get_prompt_failed", 
+                                error=str(e),
+                                template_key=template_key)
+                template = None
+        
+        # Format the template with data if it contains format placeholders
+        if isinstance(template, str) and '{' in template:
+            try:
+                return template.format(**data)
+            except KeyError as e:
+                # Handle missing keys with a warning and fallback
+                self.logger.warning("format_request.missing_key_in_template", 
+                                  error=str(e), 
+                                  template_key=template_key,
+                                  missing_key=str(e))
+                # Fall back to JSON format on template key error
+                return json.dumps(data, indent=2, default=str)
+            except Exception as e:
+                # Handle other formatting errors
+                self.logger.error("format_request.template_format_failed", 
+                                error=str(e))
+                # Provide informative fallback
+                return json.dumps(data, indent=2, default=str)
+        elif template:
+            # Template exists but doesn't need formatting
+            return str(template)
+        else:
+            # No template, use default JSON format
+            self.logger.debug("format_request.using_default_json")
+            return json.dumps(data, indent=2, default=str)
              
     def _get_agent_name(self) -> str:
         """
@@ -757,116 +837,182 @@ class BaseAgent(BaseConfig, BaseLLM):
         """
         Invoke a registered skill with the specified parameters.
         
+        This method handles various expected error conditions in skill execution:
+        - Missing skill configuration
+        - Invalid skill configuration (missing module/class)
+        - Module import errors 
+        - Skill instantiation errors
+        - Method not found errors
+        - Execution errors within the skill
+        
         Args:
             skill_name: The name of the skill to invoke (registered in config under llm_config.skills)
             params: Parameters to pass to the skill
             context: Optional context to use for lineage tracking and other metadata
             
         Returns:
-            The result from the skill execution
+            The result from the skill execution as a SkillResult object (always a structured response,
+            never raises exceptions for expected failure conditions)
         """
-        try:
-            # 1. Attempt to locate the skill configuration
-            skill_config = self.config_node.get_value(f"llm_config.skills.{skill_name}")
-            if not skill_config:
-                error_msg = f"Skill '{skill_name}' not found in llm_config.skills configuration"
-                self.logger.error("_invoke_skill.skill_not_found", skill_name=skill_name)
-                return SkillResult(success=False, error=error_msg)
-                
-            # 2. Extract module, class, and method information
-            module_path = skill_config.get("module")
-            class_name = skill_config.get("class")
-            method_name = skill_config.get("method", "execute")
+        # 1. Attempt to locate the skill configuration
+        skill_config = self.config_node.get_value(f"llm_config.skills.{skill_name}")
+        if not skill_config:
+            error_msg = f"Skill '{skill_name}' not found in llm_config.skills configuration"
+            self.logger.error("_invoke_skill.skill_not_found", skill_name=skill_name)
+            return SkillResult(success=False, error=error_msg)
             
-            if not module_path or not class_name:
-                error_msg = f"Skill '{skill_name}' configuration is missing module or class"
-                self.logger.error("_invoke_skill.invalid_config", 
-                                skill_name=skill_name, 
-                                has_module=bool(module_path), 
-                                has_class=bool(class_name))
-                return SkillResult(success=False, error=error_msg)
-                
-            # 3. Prepare lineage context for the skill
-            if context is None:
-                context = {}
-                
-            skill_exec_context = self.call_skill(skill_name, context)
-            
-            # 4. Import the skill module and get the class
-            self.logger.debug("_invoke_skill.importing", 
+        # 2. Extract module, class, and method information
+        module_path = skill_config.get("module")
+        class_name = skill_config.get("class")
+        method_name = skill_config.get("method", "execute")
+        
+        if not module_path or not class_name:
+            error_msg = f"Skill '{skill_name}' configuration is missing module or class"
+            self.logger.error("_invoke_skill.invalid_config", 
                             skill_name=skill_name, 
-                            module_path=module_path, 
-                            class_name=class_name)
+                            has_module=bool(module_path), 
+                            has_class=bool(class_name))
+            return SkillResult(success=False, error=error_msg)
             
+        # 3. Prepare lineage context for the skill
+        if context is None:
+            context = {}
+            
+        try:
+            skill_exec_context = self.call_skill(skill_name, context)
+        except Exception as e:
+            self.logger.warning("_invoke_skill.lineage_context_creation_failed", 
+                             skill_name=skill_name, 
+                             error=str(e))
+            # Continue with original context if lineage context creation fails
+            skill_exec_context = context
+        
+        # 4. Import the skill module and get the class
+        self.logger.debug("_invoke_skill.importing", 
+                        skill_name=skill_name, 
+                        module_path=module_path, 
+                        class_name=class_name)
+        
+        try:
             import importlib
             skill_module = importlib.import_module(module_path)
-            skill_class = getattr(skill_module, class_name)
-            
-            # 5. Create configuration for the skill to inherit our config
-            # Clone our configuration
-            skill_full_config = dict(self.config) if self.config else {}
-            
-            # Ensure the config has llm_config.agents.{skill_name} with a persona_key
-            if 'llm_config' not in skill_full_config:
-                skill_full_config['llm_config'] = {}
-            if 'agents' not in skill_full_config['llm_config']:
-                skill_full_config['llm_config']['agents'] = {}
-            
-            # Set a persona_key for the skill if it doesn't have one
-            agent_config = self.config_node.get_value(f"llm_config.agents.{skill_name}")
-            if not agent_config or 'persona_key' not in agent_config:
-                self.logger.debug("_invoke_skill.setting_persona_for_skill",
-                                skill_name=skill_name,
-                                persona_key=self.persona_key)
-                
-                skill_full_config['llm_config']['agents'][skill_name] = {
-                    'persona_key': self.persona_key  # Use our own persona
-                }
-            
-            # 6. Instantiate the skill with our config
-            skill_instance = skill_class(skill_full_config)
-            
-            # 7. Call the skill method with the parameters
-            self.logger.info("_invoke_skill.executing", 
+        except ModuleNotFoundError as e:
+            error_msg = f"Module '{module_path}' for skill '{skill_name}' not found"
+            self.logger.error("_invoke_skill.module_not_found", 
                            skill_name=skill_name, 
-                           skill_method=method_name,  # Changed from method_name to skill_method to avoid conflict
-                           param_keys=list(params.keys()))
-            
-            skill_method = getattr(skill_instance, method_name)
-            result = skill_method(**params)
-            
-            # 8. Process the result
-            self.logger.info("_invoke_skill.completed", 
-                           skill_name=skill_name,
-                           success=getattr(result, 'success', None))
-            
-            # Ensure result is of correct type (SkillResult)
-            if not isinstance(result, SkillResult):
-                self.logger.warning("_invoke_skill.invalid_result_type", 
-                                  skill_name=skill_name, 
-                                  result_type=type(result).__name__)
-                # Try to convert to SkillResult if possible
-                if hasattr(result, 'success'):
-                    return SkillResult(
-                        success=result.success,
-                        value=getattr(result, 'value', None) or getattr(result, 'data', None),
-                        error=getattr(result, 'error', None)
-                    )
-                # Default
-                return SkillResult(
-                    success=True, 
-                    value=result
-                )
-                
-            return result
-            
-        except Exception as e:
-            error_msg = f"Error executing skill {skill_name}: {str(e)}"
-            self.logger.error("_invoke_skill.failed", 
-                            skill_name=skill_name, 
-                            error=str(e), 
-                            exc_info=True)
+                           module_path=module_path, 
+                           error=str(e))
             return SkillResult(success=False, error=error_msg)
+        except ImportError as e:
+            error_msg = f"Error importing module '{module_path}' for skill '{skill_name}': {str(e)}"
+            self.logger.error("_invoke_skill.import_error", 
+                           skill_name=skill_name, 
+                           module_path=module_path, 
+                           error=str(e))
+            return SkillResult(success=False, error=error_msg)
+            
+        try:
+            skill_class = getattr(skill_module, class_name)
+        except AttributeError:
+            error_msg = f"Class '{class_name}' not found in module '{module_path}' for skill '{skill_name}'"
+            self.logger.error("_invoke_skill.class_not_found", 
+                           skill_name=skill_name,
+                           module_path=module_path,
+                           class_name=class_name)
+            return SkillResult(success=False, error=error_msg)
+        
+        # 5. Create configuration for the skill to inherit our config
+        # Clone our configuration
+        skill_full_config = dict(self.config) if self.config else {}
+        
+        # Ensure the config has llm_config.agents.{skill_name} with a persona_key
+        if 'llm_config' not in skill_full_config:
+            skill_full_config['llm_config'] = {}
+        if 'agents' not in skill_full_config['llm_config']:
+            skill_full_config['llm_config']['agents'] = {}
+        
+        # Set a persona_key for the skill if it doesn't have one
+        agent_config = self.config_node.get_value(f"llm_config.agents.{skill_name}")
+        if not agent_config or 'persona_key' not in agent_config:
+            self.logger.debug("_invoke_skill.setting_persona_for_skill",
+                            skill_name=skill_name,
+                            persona_key=self.persona_key)
+            
+            skill_full_config['llm_config']['agents'][skill_name] = {
+                'persona_key': self.persona_key  # Use our own persona
+            }
+        
+        # 6. Instantiate the skill with our config
+        try:
+            skill_instance = skill_class(skill_full_config)
+        except Exception as e:
+            error_msg = f"Error instantiating skill '{skill_name}': {str(e)}"
+            self.logger.error("_invoke_skill.instantiation_failed", 
+                           skill_name=skill_name, 
+                           error=str(e), 
+                           exc_info=True)
+            return SkillResult(success=False, error=error_msg)
+        
+        # 7. Get the skill method
+        try:
+            skill_method = getattr(skill_instance, method_name)
+        except AttributeError:
+            error_msg = f"Method '{method_name}' not found in skill '{skill_name}'"
+            self.logger.error("_invoke_skill.method_not_found", 
+                           skill_name=skill_name, 
+                           method_name=method_name)
+            return SkillResult(success=False, error=error_msg)
+        
+        # 8. Call the skill method with the parameters
+        self.logger.info("_invoke_skill.executing", 
+                       skill_name=skill_name, 
+                       skill_method=method_name,
+                       param_keys=list(params.keys()))
+        
+        try:
+            result = skill_method(**params)
+        except TypeError as e:
+            # Handle parameter mismatch errors
+            error_msg = f"Invalid parameters for skill '{skill_name}.{method_name}': {str(e)}"
+            self.logger.error("_invoke_skill.parameter_mismatch", 
+                           skill_name=skill_name, 
+                           method_name=method_name, 
+                           error=str(e))
+            return SkillResult(success=False, error=error_msg)
+        except Exception as e:
+            # Handle other execution errors
+            error_msg = f"Error executing skill '{skill_name}.{method_name}': {str(e)}"
+            self.logger.error("_invoke_skill.execution_failed", 
+                           skill_name=skill_name, 
+                           method_name=method_name, 
+                           error=str(e), 
+                           exc_info=True)
+            return SkillResult(success=False, error=error_msg)
+        
+        # 9. Process the result
+        self.logger.info("_invoke_skill.completed", 
+                       skill_name=skill_name,
+                       success=getattr(result, 'success', None))
+        
+        # Ensure result is of correct type (SkillResult)
+        if not isinstance(result, SkillResult):
+            self.logger.warning("_invoke_skill.invalid_result_type", 
+                              skill_name=skill_name, 
+                              result_type=type(result).__name__)
+            # Try to convert to SkillResult if possible
+            if hasattr(result, 'success'):
+                return SkillResult(
+                    success=result.success,
+                    value=getattr(result, 'value', None) or getattr(result, 'data', None),
+                    error=getattr(result, 'error', None)
+                )
+            # Default
+            return SkillResult(
+                success=True, 
+                value=result
+            )
+            
+        return result
     
     def _extract_data_from_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """

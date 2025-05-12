@@ -230,18 +230,37 @@ class Orchestrator:
             # Store team result
             team_results[current_team_id] = team_result
 
-            # Update context with team result data
+            # Update context with team result data (following immutability principle 1.3)
             if team_result.get("success", False):
+                # Create a new context dictionary by making a deep copy of the current context
+                # and then applying the team result data (instead of modifying the original context)
+                # This adheres to principle 1.3 (Immutability) from Agent_Design_Principles_v2.md
+                logger.debug("orchestrator.creating_immutable_context", 
+                           team_id=current_team_id, 
+                           context_keys=list(context.keys()))
+                new_context = deepcopy(context)
+                
                 # Handle standard data
                 if "data" in team_result:
-                    context.update(team_result["data"])
+                    # Update the new context instead of modifying the original
+                    for key, value in team_result["data"].items():
+                        new_context[key] = value
                     final_result["data"].update(team_result["data"])
 
                 # Handle special structured input_data for team-to-team communication
                 if "input_data" in team_result:
-                    if "input_data" not in context:
-                        context["input_data"] = {}
-                    context["input_data"] = team_result["input_data"]
+                    # Initialize input_data dictionary if it doesn't exist in the new context
+                    if "input_data" not in new_context:
+                        new_context["input_data"] = {}
+                    # Replace input_data with the team result's input_data
+                    new_context["input_data"] = team_result["input_data"]
+                
+                # Use the new context for subsequent operations
+                context = new_context
+                logger.debug("orchestrator.using_new_immutable_context", 
+                           team_id=current_team_id, 
+                           next_team=team_result.get("next_team"),
+                           updated_context_keys=list(context.keys()))
 
             # Check for failure
             if not team_result.get("success", False):

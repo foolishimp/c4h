@@ -77,6 +77,9 @@ class GenericLLMAgent(BaseAgent):
         3. Formats it using data variables
         4. Returns the formatted prompt
         
+        Following the Total Functions principle (1.4), this method handles all expected error
+        conditions internally and always returns a valid string, even in error cases.
+        
         REMOVED: Special handling for discovery agent with tartxt.py execution.
         This functionality is now available via the tartxt_runner skill.
         
@@ -85,7 +88,7 @@ class GenericLLMAgent(BaseAgent):
             context: Optional runtime context that may contain overrides
             
         Returns:
-            Formatted request string
+            Formatted request string (never raises exceptions)
         """
         # Make a copy of data to avoid modifying the original
         data_copy = dict(data)
@@ -96,135 +99,225 @@ class GenericLLMAgent(BaseAgent):
         
         # Check for overrides in context
         if context:
-            overrides = context.get('agent_config_overrides', {}).get(self.unique_name, {})
-            
-            # Direct template override
-            if 'template' in overrides:
-                template = overrides['template']
-                self.logger.debug("format_request.using_direct_template_override", 
-                               template_length=len(template) if template else 0)
-            
-            # Or template key override
-            elif 'template_key' in overrides:
-                template_key = overrides['template_key']
-                self.logger.debug("format_request.using_template_key_override", template_key=template_key)
+            try:
+                overrides = context.get('agent_config_overrides', {}).get(self.unique_name, {})
+                
+                # Direct template override
+                if 'template' in overrides:
+                    template = overrides['template']
+                    self.logger.debug("format_request.using_direct_template_override", 
+                                   template_length=len(template) if template else 0)
+                
+                # Or template key override
+                elif 'template_key' in overrides:
+                    template_key = overrides['template_key']
+                    self.logger.debug("format_request.using_template_key_override", template_key=template_key)
+            except Exception as e:
+                # Handle errors accessing context overrides
+                self.logger.warning("format_request.context_override_error", 
+                                  error=str(e),
+                                  error_type=type(e).__name__)
+                # Continue with default values
         
         # If no direct template override, check persona config for template_name
         if template is None:
-            # First try to get the template_name from persona config
-            persona_template_name = self.config_node.get_value(f"{self.persona_path}.prompts.template_name")
-            if persona_template_name:
-                template_key = persona_template_name
-                self.logger.debug("format_request.using_persona_template_name", template_key=template_key)
+            try:
+                # First try to get the template_name from persona config
+                persona_template_name = self.config_node.get_value(f"{self.persona_path}.prompts.template_name")
+                if persona_template_name:
+                    template_key = persona_template_name
+                    self.logger.debug("format_request.using_persona_template_name", template_key=template_key)
+            except Exception as e:
+                self.logger.warning("format_request.error_getting_template_name",
+                                  error=str(e),
+                                  persona_path=self.persona_path)
+                # Continue with default template_key
         
         # If still no template, get it from persona prompts using template_key
         if template is None:
-            template = self.config_node.get_value(f"{self.persona_path}.prompts.{template_key}")
-            
-            if not template:
-                self.logger.warning("prompt_template.not_found", 
-                                  template_key=template_key,
-                                  persona_key=self.persona_key,
-                                  persona_path=f"{self.persona_path}.prompts.{template_key}")
-                # Fallback to simple JSON string if template not found
-                return json.dumps(data_copy, indent=2)
+            try:
+                template = self.config_node.get_value(f"{self.persona_path}.prompts.{template_key}")
+                
+                if not template:
+                    # Try common alternative location
+                    template = self.config_node.get_value(f"llm_config.prompts.{template_key}")
+                    
+                    if template:
+                        self.logger.debug("format_request.found_template_in_llm_config", 
+                                       template_key=template_key)
+                    else:
+                        # Log warning if no template found after all attempts
+                        self.logger.warning("prompt_template.not_found", 
+                                          template_key=template_key,
+                                          persona_key=self.persona_key,
+                                          persona_path=f"{self.persona_path}.prompts.{template_key}")
+                        # Fallback to simple JSON string if template not found
+                        return json.dumps(data_copy, indent=2, default=str)
+            except Exception as e:
+                self.logger.error("format_request.error_accessing_template", 
+                               error=str(e),
+                               template_key=template_key)
+                # Fallback to simple JSON string on config access error
+                return json.dumps(data_copy, indent=2, default=str)
         
-        try:
-            # Format the template with context variables
-            # Handle both string templates with format() and direct values
-            if isinstance(template, str) and "{" in template:
+        # Format the template with context variables
+        if isinstance(template, str) and "{" in template:
+            try:
                 formatted_prompt = template.format(**data_copy)
-            else:
-                formatted_prompt = str(template)
                 
-            if self._should_log(LogDetail.DEBUG):
-                self.logger.debug("prompt.formatted", 
-                                template_key=template_key,
-                                prompt_length=len(formatted_prompt))
+                if self._should_log(LogDetail.DEBUG):
+                    self.logger.debug("prompt.formatted", 
+                                    template_key=template_key,
+                                    prompt_length=len(formatted_prompt))
                 
-            return formatted_prompt
-            
-        except KeyError as e:
-            self.logger.error("prompt.format_key_error", 
-                            error=str(e), 
-                            template_key=template_key)
-            # Fall back to sending the context directly as JSON
-            return json.dumps(data_copy, indent=2)
-        except Exception as e:
-            self.logger.error("prompt.format_error", 
-                            error=str(e), 
-                            template_key=template_key)
-            return json.dumps(data_copy, indent=2)
+                return formatted_prompt
+            except KeyError as e:
+                # Handle missing keys with specific error message
+                missing_key = str(e).strip("'")
+                self.logger.error("prompt.format_key_error", 
+                               error=str(e), 
+                               template_key=template_key,
+                               missing_key=missing_key,
+                               available_keys=list(data_copy.keys()))
+                
+                # Fall back to sending the context directly as JSON with error info
+                return f"Error: Template requires key '{missing_key}' which is not available.\nData: {json.dumps(data_copy, indent=2, default=str)}"
+            except Exception as e:
+                # Handle other formatting errors
+                self.logger.error("prompt.format_error", 
+                               error=str(e),
+                               template_key=template_key,
+                               error_type=type(e).__name__)
+                
+                # Fall back to sending the context directly as JSON with error info
+                return f"Error formatting template: {str(e)}\nData: {json.dumps(data_copy, indent=2, default=str)}"
+        else:
+            # Template exists but doesn't need formatting or is None
+            return str(template or "")
 
     def process(self, context: Dict[str, Any]) -> AgentResponse:
         """
         Process a request using a single LLM interaction or skill invocation.
         Checks for skill configuration before falling back to LLM.
         
+        Following the Total Functions principle (1.4), this method handles all expected error
+        conditions internally and always returns a structured AgentResponse, even in error cases.
+        
         Args:
             context: Input context containing data for processing
             
         Returns:
-            Standard AgentResponse with results
+            Standard AgentResponse with results (never raises exceptions for expected failures)
         """
-        # Check if a skill is configured for this agent
-        agent_config = self.config_node.get_value(self.config_path)
-        skill_identifier = None
-        skill_params = {}
-        
-        if agent_config and isinstance(agent_config, dict):
-            skill_identifier = agent_config.get('skill')
-            skill_params = agent_config.get('skill_params', {})
+        try:
+            # Check if a skill is configured for this agent
+            skill_identifier = None
+            skill_params = {}
             
-        # Also check persona config for skill configuration
-        if not skill_identifier and self.persona_key:
-            persona_config = self.config_node.get_value(self.persona_path)
-            if persona_config and isinstance(persona_config, dict):
-                skill_identifier = persona_config.get('skill')
-                skill_params = persona_config.get('skill_params', {})
+            try:
+                # First check agent config
+                agent_config = self.config_node.get_value(self.config_path)
+                if agent_config and isinstance(agent_config, dict):
+                    skill_identifier = agent_config.get('skill')
+                    skill_params = agent_config.get('skill_params', {})
                 
-        # If a skill is configured, invoke it
-        if skill_identifier:
-            self.logger.info("agent.using_skill", 
-                           skill=skill_identifier, 
-                           agent_name=self.unique_name)
-                           
-            # Prepare skill parameters from context
-            # Start with any configured parameters
-            execution_params = dict(skill_params) if skill_params else {}
-            
-            # Add context as input if not already present
-            if 'input' not in execution_params:
-                execution_params['input'] = context
+                # Also check persona config for skill configuration
+                if not skill_identifier and self.persona_key:
+                    persona_config = self.config_node.get_value(self.persona_path)
+                    if persona_config and isinstance(persona_config, dict):
+                        skill_identifier = persona_config.get('skill')
+                        skill_params = persona_config.get('skill_params', {})
+            except Exception as e:
+                # Handle configuration errors
+                self.logger.error("agent.config_access_error", 
+                               error=str(e),
+                               agent_name=self.unique_name)
+                # Continue with skill_identifier=None (will fall back to LLM)
                 
-            # Add agent information
-            execution_params['agent_name'] = self.unique_name
-            execution_params['agent_id'] = self.agent_id
+            # If a skill is configured, invoke it
+            if skill_identifier:
+                self.logger.info("agent.using_skill", 
+                               skill=skill_identifier, 
+                               agent_name=self.unique_name)
+                               
+                try:
+                    # Prepare skill parameters from context
+                    # Start with any configured parameters
+                    execution_params = dict(skill_params) if skill_params else {}
+                    
+                    # Add context as input if not already present
+                    if 'input' not in execution_params:
+                        execution_params['input'] = context
+                        
+                    # Add agent information
+                    execution_params['agent_name'] = self.unique_name
+                    execution_params['agent_id'] = self.agent_id
+                    
+                    # Invoke the skill (this already has error handling internally)
+                    skill_result = self._invoke_skill(skill_identifier, execution_params)
+                    
+                    # Convert to AgentResponse
+                    if isinstance(skill_result, SkillResult):
+                        # Use the built-in conversion
+                        return skill_result.to_agent_response()
+                    else:
+                        # Handle unexpected result type
+                        self.logger.warning("agent.unexpected_skill_result_type", 
+                                         type=type(skill_result).__name__)
+                        
+                        # Attempt to create a valid AgentResponse
+                        success = getattr(skill_result, 'success', True)
+                        error = getattr(skill_result, 'error', None)
+                        
+                        return AgentResponse(
+                            success=success,
+                            data={"skill_result": skill_result},
+                            error=error
+                        )
+                except Exception as e:
+                    # Handle any errors in skill parameter preparation or result processing
+                    # Note: _invoke_skill already handles most errors internally
+                    self.logger.error("agent.skill_wrapper_error", 
+                                   skill=skill_identifier,
+                                   error=str(e),
+                                   error_type=type(e).__name__,
+                                   exc_info=True)
+                    
+                    return AgentResponse(
+                        success=False,
+                        data={},
+                        error=f"Error in skill execution wrapper: {str(e)}"
+                    )
             
-            # Invoke the skill
-            skill_result = self._invoke_skill(skill_identifier, execution_params)
-            
-            # Convert to AgentResponse
-            if isinstance(skill_result, SkillResult):
-                # Use the built-in conversion
-                return skill_result.to_agent_response()
-            else:
-                # Handle unexpected result type
-                self.logger.warning("agent.unexpected_skill_result_type", 
-                                  type=type(skill_result).__name__)
-                
-                # Attempt to create a valid AgentResponse
-                success = getattr(skill_result, 'success', True)
-                error = getattr(skill_result, 'error', None)
+            # No skill configured or skill not found, fall back to LLM processing
+            try:
+                return super().process(context)
+            except Exception as e:
+                # Handle any errors from the base agent process method
+                self.logger.error("agent.base_process_error", 
+                               error=str(e),
+                               error_type=type(e).__name__,
+                               exc_info=True)
                 
                 return AgentResponse(
-                    success=success,
-                    data={"skill_result": skill_result},
-                    error=error
+                    success=False,
+                    data={},
+                    error=f"Error in LLM processing: {str(e)}"
                 )
-        
-        # No skill configured or skill invocation failed, fall back to LLM
-        return super().process(context)
+            
+        except Exception as e:
+            # Final fallback for any unhandled exceptions
+            self.logger.error("agent.process_unhandled_error", 
+                           agent_name=self.unique_name,
+                           error=str(e),
+                           error_type=type(e).__name__,
+                           exc_info=True)
+            
+            return AgentResponse(
+                success=False,
+                data={},
+                error=f"Unhandled error in agent processing: {str(e)}"
+            )
 
 # Legacy class that inherits from GenericLLMAgent for backward compatibility
 class GenericSingleShotAgent(GenericLLMAgent):
