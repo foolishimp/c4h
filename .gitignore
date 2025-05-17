@@ -49,6 +49,7 @@ tests/regulatory_calculations
 backup_txt/
 .cache/
 .claude/
+backup_txt
 .DS_Store/
 .DS_Store
 tests/.DS_Store
