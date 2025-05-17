@@ -40,6 +40,7 @@ data/assets/*
 !data/assets/.gitkeep
 workspaces/
 test_output/
+ai_dev/
 
 # Environment variables
 .env
@@ -47,6 +48,7 @@ tests/test_projects
 tests/regulatory_calculations
 backup_txt/
 .cache/
+.claude/
 .DS_Store/
 .DS_Store
 tests/.DS_Store
