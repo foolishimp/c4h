@@ -152,10 +152,6 @@ llm_config:
         include_token_usage: true
         record_timestamps: true
 
-# Define agents config for discovery phase
-llm_config:
-  default_provider: "anthropic"
-  default_model: "claude-3-opus-20240229"
   # Define skills for the orchestration
   skills:
     semantic_iterator:
@@ -174,6 +170,12 @@ llm_config:
       module: "c4h_agents.skills.semantic_merge"
       class: "SemanticMerge"
       description: "Intelligently merges changes into existing files"
+      method: "execute"
+    
+    command_line_runner:
+      module: "c4h_agents.skills.command_line_runner"
+      class: "CommandLineRunner"
+      description: "Executes command line tools and scripts"
       method: "execute"
   
   personas:
@@ -269,6 +271,55 @@ llm_config:
           ===CHANGE_END===
           
           No analysis or explanations outside these blocks.
+      # Add execution plan for the task runner
+      execution_plan:
+        enabled: true
+        steps:
+          - name: "design_solution"
+            type: "llm_call"
+            system_message: |
+              You are a code modification solution designer that returns modifications in a clearly structured text format.
+              Return your response in the following format, with no additional explanation:
+
+              ===CHANGE_BEGIN===
+              FILE: path/to/file
+              TYPE: create|modify|delete
+              DESCRIPTION: one line description
+              DIFF:
+              --- a/existing_file.py
+              +++ b/existing_file.py
+              @@ -1,3 +1,4 @@
+              context line
+              -removed line
+              +added line
+              context line
+              ===CHANGE_END===
+              
+              IMPORTANT: You MUST use the format above. Never return any explanations or analysis outside the ===CHANGE_BEGIN=== and ===CHANGE_END=== blocks.
+              Your entire response should only contain one or more of these blocks.
+            prompt: |
+              Based on the discovery data, create a solution design for adding logging and lineage tracking to the codebase. 
+              
+              EXTREMELY IMPORTANT: Use the EXACT file paths as shown in the discovery data. Do not create files with paths like 'logging/logger.py' or 'utils/logging.py'. Instead, modify the existing files directly.
+              
+              Discovery data:
+              {{context.response}}
+              
+              Intent:
+              {{context.intent}}
+              
+              Use the EXACT format as specified in the system prompt instructions. Your response must consist ONLY of properly formatted change blocks:
+              
+              ===CHANGE_BEGIN===
+              FILE: /exact/path/to/file
+              TYPE: create|modify|delete
+              DESCRIPTION: one line description
+              DIFF:
+              [diff content here]
+              ===CHANGE_END===
+              
+              No analysis or explanations outside these blocks.
+            output_field: "response"
 
     coder_v1:
       provider: "anthropic"
@@ -279,27 +330,26 @@ llm_config:
         enabled: true
         steps:
           - name: "extract_changes"
-            type: "skill"
+            type: "skill_call"
             skill: "semantic_iterator"
             params:
-              content: "{{context.input_data.response}}"
+              content: "{{context.response}}"
               format: "solution_design"
             output_field: "iterator_result"
           
           - name: "process_changes"
             type: "loop"
-            iterate_on: "iterator_result.value"
+            iterate_on: "iterator_result"
             loop_variable: "current_change"
             body:
-              - name: "apply_single_change" 
-                type: "skill"
-                skill: "asset_manager"
-                params:
+              - name: "log_change" 
+                type: "set_value"
+                field: "results.changes.{{loop.index}}"
+                value:
                   file_path: "{{current_change.file_path}}"
-                  content: "{{current_change.content}}"
                   type: "{{current_change.type}}"
                   description: "{{current_change.description}}"
-                output_field: "results.changes.{{loop.index}}"
+                  status: "logged_not_applied"
       prompts:
         system: |
           You are an expert code modification agent. Your task is to safely and precisely apply code changes.
@@ -331,6 +381,41 @@ llm_config:
           {content}
           
           For each change, verify it carefully and apply it exactly as specified.
+
+    discovery_by_skill_v1:
+      description: "Performs project discovery using the command_line_runner skill to execute tartxt."
+      agent_type: GenericSkillAgent # Explicitly for GenericSkillAgent
+      skill: "command_line_runner"  # Specifies the skill to run
+      allow_llm_fallback: false # Explicitly disable LLM fallback
+      # Since the task runner requires an execution plan, provide one
+      execution_plan:
+        enabled: true
+        steps:
+          - name: "run_tartxt"
+            type: "skill_call"
+            skill: "command_line_runner"
+            params:
+              command_line: "python -m c4h_agents.skills.tartxt"
+              command_args:
+                # Use positional args to pass the directory 
+                positional_args: ["."]
+                exclude: "**/node_modules/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/package-lock.json,**/dist/**,**/.DS_Store,**/README.md,**/workspaces/**,**/backup_txt/**"
+                history: 0
+                o: true  # Output to stdout
+              # Don't pass project_path in input to avoid it being added as --project_path
+              input: {}
+              output_to_file: true
+            output_field: "response"
+      prompts:
+        system: |
+          You are a project discovery agent.
+          You analyze project structure and files to understand:
+          1. Project organization
+          2. File relationships
+          3. Code dependencies
+          4. Available functionality
+          
+          Your analysis will be used to inform code changes and recommendations.
 
   agents:
     # Define all agent configurations with persona keys

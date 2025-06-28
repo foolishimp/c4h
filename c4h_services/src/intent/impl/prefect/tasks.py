@@ -114,10 +114,26 @@ def run_agent_task(
         prefect_logger.info(f"Running agent task: {task_name}")
         
         # Create configuration node for context
-        context_node = create_config_node(context_copy)
+        try:
+            context_node = create_config_node(context_copy)
+        except Exception as e:
+            error_msg = f"Failed to create context node: {str(e)}"
+            prefect_logger.error(error_msg)
+            return {
+                "success": False,
+                "result_data": {},
+                "error": error_msg,
+                "execution_type": "error",
+                "run_id": "unknown",
+                "task_name": task_config.get("name", task_name)
+            }
         
         # Get run ID for tracking and lineage
-        run_id = context_node.get_value("workflow_run_id") or str(flow_run.get_id())
+        try:
+            run_id = context_node.get_value("workflow_run_id") or str(flow_run.get_id())
+        except Exception as e:
+            prefect_logger.error(f"Failed to get run_id: {str(e)}")
+            run_id = str(flow_run.get_id())
         
         # Validate required task configuration - both agent_type and name are required now
         if not task_config_copy.get("agent_type") or not task_config_copy.get("name"):
@@ -160,18 +176,23 @@ def run_agent_task(
         
         # Initialize event logger if configured
         event_logger = None
-        lineage_config = context_node.get_value("llm_config.agents.lineage", {})
-        if lineage_config.get("enabled", True):
-            try:
-                # Initialize event logger
-                event_logger = EventLogger(
-                    lineage_config,
-                    parent_id=run_id,
-                    namespace=f"agent_{task_config_copy.get('name')}"
-                )
-                prefect_logger.debug("Initialized event logger for agent", agent_name=task_config_copy.get('name'))
-            except Exception as e:
-                prefect_logger.error("Failed to initialize event logger", error=str(e))
+        try:
+            # Create config node for effective config - not context!
+            config_node = create_config_node(effective_config_copy)
+            lineage_config = config_node.get_value("llm_config.agents.lineage", {})
+            if lineage_config and lineage_config.get("enabled", True):
+                try:
+                    # Initialize event logger
+                    event_logger = EventLogger(
+                        lineage_config,
+                        parent_id=run_id,
+                        namespace=f"agent_{task_config_copy.get('name')}"
+                    )
+                    prefect_logger.debug("Initialized event logger for agent", agent_name=task_config_copy.get('name'))
+                except Exception as e:
+                    prefect_logger.error("Failed to initialize event logger", error=str(e))
+        except Exception as e:
+            prefect_logger.error("Failed to get lineage config", error=str(e))
         
         # Get agent configuration by merging persona and agent-specific configs
         agent_config = None
@@ -180,7 +201,7 @@ def run_agent_task(
         
         # First check if we have a persona key
         if persona_key:
-            config_node = create_config_node(effective_config_copy)
+            # config_node already created above for effective_config_copy
             persona_config = config_node.get_value(f"llm_config.personas.{persona_key}")
             if persona_config:
                 prefect_logger.info(f"Found persona config for persona key: {persona_key}")
@@ -189,7 +210,7 @@ def run_agent_task(
         # Then update with specific agent config if available
         agent_name = task_config_copy.get("name")
         if agent_name:
-            config_node = create_config_node(effective_config_copy)
+            # config_node already created above for effective_config_copy
             agent_config = config_node.get_value(f"llm_config.agents.{agent_name}")
             if agent_config:
                 prefect_logger.info(f"Found agent config for agent: {agent_name}")
@@ -199,7 +220,8 @@ def run_agent_task(
         merged_config.update(copy.deepcopy(task_config_copy))
         
         # Check for execution_plan in the merged config
-        if "execution_plan" not in merged_config or not merged_config.get("execution_plan", {}).get("enabled", True):
+        execution_plan = merged_config.get("execution_plan")
+        if execution_plan is None or not isinstance(execution_plan, dict) or not execution_plan.get("enabled", True):
             error_msg = f"Agent '{agent_name}' does not have a valid execution_plan in its configuration"
             prefect_logger.error(error_msg)
             return {
@@ -212,7 +234,8 @@ def run_agent_task(
             }
         
         # Execute using ExecutionPlanExecutor
-        prefect_logger.info("Agent has execution_plan, using ExecutionPlanExecutor", agent_name=task_name)
+        logger.info("agent.using_execution_plan_executor", agent_name=task_name)
+        prefect_logger.info(f"Agent has execution_plan, using ExecutionPlanExecutor for {task_name}")
         try:
             # Import the ExecutionPlanExecutor
             from c4h_agents.execution.executor import ExecutionPlanExecutor
@@ -234,10 +257,11 @@ def run_agent_task(
             execution_plan = merged_config["execution_plan"]
             
             # Log execution plan details
-            prefect_logger.info("Executing agent's execution plan", 
-                          agent_name=task_name,
-                          step_count=len(execution_plan.get("steps", [])),
-                          executor_id=executor.execution_id)
+            logger.info("agent.execution_plan.starting", 
+                        agent_name=task_name,
+                        step_count=len(execution_plan.get("steps", [])),
+                        executor_id=executor.execution_id)
+            prefect_logger.info(f"Executing agent's execution plan for {task_name}")
                           
             # Execute the plan
             execution_result = executor.execute_plan(execution_plan, enhanced_context)
@@ -260,11 +284,12 @@ def run_agent_task(
                 "task_name": task_config.get("name", task_name)
             }
             
-            prefect_logger.info("Agent execution plan completed", 
-                          agent_name=task_name,
-                          success=execution_result.success,
-                          steps_executed=execution_result.steps_executed,
-                          duration_seconds=duration_seconds)
+            logger.info("agent.execution_plan.completed", 
+                        agent_name=task_name,
+                        success=execution_result.success,
+                        steps_executed=execution_result.steps_executed,
+                        duration_seconds=duration_seconds)
+            prefect_logger.info(f"Agent execution plan completed for {task_name}")
             
             return response
             
@@ -355,8 +380,10 @@ def materialise_config(
         
         # Scan for all available personas first to enable reporting on what's available
         available_personas = get_available_personas(personas_base_path)
-        prefect_logger.info(f"Found {len(available_personas)} personas available", 
-                          persona_keys=list(available_personas.keys()))
+        logger.info("personas.available", 
+                    count=len(available_personas),
+                    persona_keys=list(available_personas.keys()))
+        prefect_logger.info(f"Found {len(available_personas)} personas available")
         
         # Create a set to track loaded personas (avoid duplicate loading)
         loaded_personas = set()
@@ -418,8 +445,10 @@ def materialise_config(
         for persona_key, persona_config in persona_configs.items():
             config_fragments.append(persona_config)
             fragment_sources.append(f"persona_{persona_key}")
-            prefect_logger.info(f"Added persona {persona_key} to configuration fragments", 
-                              persona_keys=list(persona_config.keys()))
+            logger.info("persona.added_to_fragments", 
+                        persona_key=persona_key,
+                        config_keys=list(persona_config.keys()))
+            prefect_logger.info(f"Added persona {persona_key} to configuration fragments")
         
         # Add job-specific config as final override
         if "config" in context:

@@ -326,9 +326,11 @@ class ExecutionPlanExecutor:
             current_context["execution_metadata"]["end_time"] = datetime.now(timezone.utc).isoformat()
             current_context["execution_metadata"]["steps_executed"] = len(execution_path)
             
-        # Extract response if present
+        # Extract output - prefer 'results' over 'response'
         output = None
-        if "response" in current_context:
+        if "results" in current_context:
+            output = current_context["results"]
+        elif "response" in current_context:
             output = current_context["response"]
             
         return ExecutionResult(

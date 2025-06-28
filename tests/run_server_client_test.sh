@@ -21,8 +21,8 @@ else
     echo "WARNING: .env file not found at $REPO_ROOT/.env" | tee -a $LOG_FILE
 fi
 
-# Use the python from .pyenv where uvicorn is installed
-PYTHON_CMD=/Users/jim/.pyenv/versions/3.11.5/bin/python
+# Use the python from virtual environment
+PYTHON_CMD=$REPO_ROOT/venv/bin/python
 
 # Print environment setup
 echo "===========================================" > $LOG_FILE

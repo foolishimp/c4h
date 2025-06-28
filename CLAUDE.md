@@ -33,6 +33,9 @@ The repository is organized into several packages:
 └── workspaces/     # Runtime workspaces for code processing
 ```
 
+ai_dev folder contains the master_doc documents and coding guidlines and constraints
+ai_scrpts are any temporary or utility scripts created by claude need to go
+
 ## Common Development Commands
 
 ### Setup and Installation
@@ -94,7 +97,7 @@ python -m c4h_services.src.bootstrap.prefect_runner client \
 
 ### Agent System
 
-The agent system is built around specialized agents that perform specific tasks:
+The agent system is built around generic agents that perform specific tasks when configured with a persona:
 
 - **Discovery Agent**: Analyzes project structure to identify relevant files
 - **Solution Designer**: Plans code changes based on intent and discovered files
