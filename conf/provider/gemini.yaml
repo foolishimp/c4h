@@ -1,0 +1,24 @@
+gemini:
+  # IMPORTANT: Use the base API endpoint WITHOUT /models
+  # LiteLLM will construct this incorrectly, which is why we need this specific format
+  api_base: "https://generativelanguage.googleapis.com/v1beta"
+  context_length: 32000
+  env_var: "GEMINI_API_KEY"
+  default_model: "gemini-1.5-pro-latest"
+  valid_models:
+    - "gemini-2.5-pro-preview-03-25"  # Exact model name that works with curl
+  # Set model parameters specific to Gemini
+  model_params:
+    # Use camelCase format for params as required by Google API
+    maxOutputTokens: 8192
+    temperature: 0.7
+  litellm_params:
+    # Skip LiteLLM's Gemini handling with a custom call
+    custom_gemini_call: true  # We'll add this flag in our code
+    retry: true
+    max_retries: 3
+    timeout: 60
+    backoff:
+      initial_delay: 2
+      max_delay: 30
+      exponential: true

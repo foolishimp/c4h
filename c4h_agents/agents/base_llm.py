@@ -8,6 +8,7 @@ import traceback
 from datetime import datetime, timezone # Ensure timezone is imported
 import litellm
 from litellm import completion
+from omegaconf import OmegaConf
 from c4h_agents.agents.types import LLMProvider, LogDetail
 from c4h_agents.utils.logging import get_logger
 # Import ContinuationHandler for type hint, but initialize lazily
@@ -26,7 +27,7 @@ class BaseLLM:
         self.provider: Optional[LLMProvider] = None
         self.model: Optional[str] = None
         self.model_str: Optional[str] = None
-        # self.config_node = None # <<< REMOVED THIS LINE
+        self.config = None  # Will be set by BaseAgent
         self.metrics: Dict[str, Any] = {}
         self.log_level: LogDetail = LogDetail.BASIC
         # Initialize _continuation_handler here to ensure it exists
@@ -291,15 +292,16 @@ class BaseLLM:
     def _get_model_str(self) -> str:
         """Get the appropriate model string for the provider, formatted for LiteLLM."""
         logger_to_use = getattr(self, 'logger', logger)
-        # Ensure self.provider and self.model are initialized
-        config_node_to_use = getattr(self, 'config_node', None) # Get config_node safely
-        if not config_node_to_use: raise ValueError("config_node not available in _get_model_str (BaseLLM)")
+        # Ensure self.config is available
+        if not self.config:
+            raise ValueError("config not available in _get_model_str (BaseLLM)")
 
         if not hasattr(self, 'provider') or not self.provider:
             logger_to_use.warning("_get_model_str called before provider was set.")
             agent_name = self._get_agent_name()
-            provider_name = config_node_to_use.get_value(f"llm_config.agents.{agent_name}.provider") or \
-                            config_node_to_use.get_value("llm_config.default_provider")
+            # Use OmegaConf.select for safe navigation with fallback
+            provider_name = OmegaConf.select(self.config, f"llm_config.agents.{agent_name}.provider") or \
+                            OmegaConf.select(self.config, "llm_config.default_provider")
             if not provider_name:
                 raise ValueError("Provider is not set on the agent instance or in config.")
             self.provider = LLMProvider(provider_name)
@@ -308,8 +310,8 @@ class BaseLLM:
         if not hasattr(self, 'model') or not self.model:
             logger_to_use.warning("_get_model_str called before model was set.")
             agent_name = self._get_agent_name()
-            self.model = config_node_to_use.get_value(f"llm_config.agents.{agent_name}.model") or \
-                        config_node_to_use.get_value("llm_config.default_model")
+            self.model = OmegaConf.select(self.config, f"llm_config.agents.{agent_name}.model") or \
+                        OmegaConf.select(self.config, "llm_config.default_model")
             if not self.model:
                 raise ValueError("Model is not set on the agent instance or in config.")
             logger_to_use.debug("_get_model_str resolved model from config", model=self.model)
@@ -348,10 +350,10 @@ class BaseLLM:
     def _build_completion_params(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
         """Build parameters for LLM completion request."""
         try:
-            # Get config_node safely from parent BaseAgent
-            config_node_to_use = getattr(self.parent, 'config_node', None)
-            if not config_node_to_use:
-                raise ValueError("config_node not available in parent BaseAgent")
+            # Get config from parent BaseAgent
+            parent_config = getattr(self.parent, 'config', None)
+            if not parent_config:
+                raise ValueError("config not available in parent BaseAgent")
                 
             # Get agent config path from parent BaseAgent
             agent_config_path = getattr(self.parent, 'config_path', None)
@@ -361,15 +363,15 @@ class BaseLLM:
             # Get provider from parent (was resolved during init)
             provider = getattr(self.parent, 'provider', None)
             if not provider:
-                provider_name = config_node_to_use.get_value(f"{agent_config_path}.provider") or "anthropic"
+                provider_name = OmegaConf.select(parent_config, f"{agent_config_path}.provider") or "anthropic"
                 provider = LLMProvider(provider_name)
             
             params = {"model": self.model_str, "messages": messages}
             if provider and provider.value != "openai": 
                 params["temperature"] = self.temperature
 
-            # Get provider config directly from effective config snapshot
-            provider_config = config_node_to_use.get_value(f"llm_config.providers.{provider.value}") or {}
+            # Get provider config directly from effective config
+            provider_config = OmegaConf.select(parent_config, f"llm_config.providers.{provider.value}") or {}
 
             # Get model parameters from provider config
             model_params = provider_config.get("model_params", {})
@@ -403,8 +405,8 @@ class BaseLLM:
 
             # Handle Claude 3.7 Sonnet extended thinking if present
             if provider and self.model and provider.value == "anthropic" and "claude-3-7-sonnet" in self.model:
-                # Get extended thinking config directly from effective config snapshot
-                agent_thinking_config = config_node_to_use.get_value(f"{agent_config_path}.extended_thinking")
+                # Get extended thinking config directly from effective config
+                agent_thinking_config = OmegaConf.select(parent_config, f"{agent_config_path}.extended_thinking")
                 if not agent_thinking_config:
                     agent_thinking_config = provider_config.get("extended_thinking", {})
                 if agent_thinking_config and agent_thinking_config.get("enabled", False) is True:
@@ -444,8 +446,8 @@ class BaseLLM:
             agent_config_path = getattr(self.parent, 'config_path', '') if hasattr(self, 'parent') else ''
 
             if provider and self.model and provider.value == "anthropic" and "claude-3-7-sonnet" in self.model:
-                config_node_to_use = getattr(self.parent, 'config_node', None) if hasattr(self, 'parent') else None
-                agent_thinking_config = config_node_to_use.get_value(f"{agent_config_path}.extended_thinking") if config_node_to_use else None
+                parent_config = getattr(self.parent, 'config', None) if hasattr(self, 'parent') else None
+                agent_thinking_config = OmegaConf.select(parent_config, f"{agent_config_path}.extended_thinking") if parent_config else None
 
                 if not agent_thinking_config:
                     agent_thinking_config = provider_config.get("extended_thinking", {})

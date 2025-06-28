@@ -5,7 +5,6 @@ Path: c4h_services/src/orchestration/orchestrator.py
 
 from typing import Dict, Any, List, Optional, Set, Union, Tuple
 from c4h_services.src.utils.logging import get_logger
-from c4h_agents.utils.logging import log_config_node
 from pathlib import Path
 from datetime import datetime, timezone
 from copy import deepcopy
@@ -13,7 +12,7 @@ import uuid
 import yaml
 import json
 
-from c4h_agents.config import create_config_node, deep_merge
+from omegaconf import OmegaConf
 from c4h_services.src.intent.impl.prefect.models import AgentTaskConfig
 from c4h_services.src.orchestration.team import Team
 # --- REMOVED THIS IMPORT BLOCK ---
@@ -43,7 +42,7 @@ class Orchestrator:
         self.logger.info("orchestrator.__init__.start", config_keys=list(config.keys()) if config else "None")
 
         self.config = config if config else {} # Ensure self.config is always a dict
-        self.config_node = create_config_node(self.config)
+        self.config_node = OmegaConf.create(self.config)
         self.teams = {}
         self.loaded_teams = set()
 
@@ -69,7 +68,9 @@ class Orchestrator:
         # ... (rest of _load_teams method remains the same,
         #      it should already be using agent_type/persona_key from system_config.yml) ...
         # Access config via the instance attribute self.config_node
-        teams_config = self.config_node.get_value("orchestration.teams") or {}
+        teams_config = OmegaConf.select(self.config_node, "orchestration.teams")
+        if teams_config is None:
+            teams_config = {}
 
         # Add detailed logging about what config _load_teams is seeing
         self.logger.debug("_load_teams.config_check",
@@ -159,7 +160,7 @@ class Orchestrator:
             if updated_config != self.config:
                 # Config has changed, reload teams with the new config
                 self.config = updated_config
-                self.config_node = create_config_node(updated_config)
+                self.config_node = OmegaConf.create(updated_config)
                 # Reload teams with the new configuration
                 self.teams = {}
                 self._load_teams()
@@ -336,9 +337,9 @@ class Orchestrator:
 
             # Generate workflow ID with embedded timestamp if not already present
             # Use config_node for safer access
-            config_node = create_config_node(prepared_config)
-            workflow_id = config_node.get_value("workflow_run_id") or \
-                          config_node.get_value("system.runid")
+            config_node = OmegaConf.create(prepared_config)
+            workflow_id = OmegaConf.select(config_node, "workflow_run_id") or \
+                          OmegaConf.select(config_node, "system.runid")
             if not workflow_id:
                 time_str = datetime.now().strftime('%H%M')
                 workflow_id = f"wf_{time_str}_{uuid.uuid4()}"
@@ -376,17 +377,24 @@ class Orchestrator:
             if 'agents' not in prepared_config['llm_config']: prepared_config['llm_config']['agents'] = {}
             # Ensure discovery persona config path exists
             discovery_agent_path = "llm_config.agents.discovery_phase" # Example unique name
-            if not config_node.get_value(discovery_agent_path):
+            if not OmegaConf.select(config_node, discovery_agent_path):
                 prepared_config['llm_config']['agents']['discovery_phase'] = {} # Create if missing
 
-            discovery_config = config_node.get_value(discovery_agent_path) or {} # Get the node data
+            discovery_config = OmegaConf.select(config_node, discovery_agent_path)
+            if discovery_config is None:
+                discovery_config = OmegaConf.create({})  # Create empty OmegaConf object
             instance_logger.debug("initialize_workflow.discovery_config_retrieved", config_keys=list(discovery_config.keys()))
 
             if 'tartxt_config' not in discovery_config:
-                discovery_config['tartxt_config'] = {}
+                # For modifying nested configs in OmegaConf, we need to ensure the parent is mutable
+                # Since we're modifying prepared_config directly, this should work
+                prepared_config['llm_config']['agents']['discovery_phase']['tartxt_config'] = {}
+                discovery_config = OmegaConf.select(config_node, discovery_agent_path)  # Re-select after modification
                 instance_logger.warning("initialize_workflow.created_empty_tartxt_config") # Added logging
 
-            tartxt_config = discovery_config['tartxt_config']
+            # Work directly with prepared_config for consistency
+            tartxt_config_path = ['llm_config', 'agents', 'discovery_phase', 'tartxt_config']
+            tartxt_config = prepared_config.get('llm_config', {}).get('agents', {}).get('discovery_phase', {}).get('tartxt_config', {})
             instance_logger.debug("initialize_workflow.tartxt_config_retrieved", config_keys=list(tartxt_config.keys()), current_script_path=tartxt_config.get('script_path')) # Added logging
 
             # Ensure script_path is set (handle both possible key names)
@@ -397,9 +405,10 @@ class Orchestrator:
             if not script_path_valid:
                 instance_logger.warning("initialize_workflow.script_path_missing_or_invalid", current_value=current_script_path) # Added logging
                 # Fallback 1: Check script_base_path
-                script_base = tartxt_config.get('script_base_path')
+                script_base = prepared_config.get('llm_config', {}).get('agents', {}).get('discovery_phase', {}).get('tartxt_config', {}).get('script_base_path')
                 if isinstance(script_base, str) and script_base.strip():
-                     tartxt_config['script_path'] = f"{script_base}/tartxt.py"
+                     # Modify the original prepared_config dict instead of the OmegaConf view
+                     prepared_config['llm_config']['agents']['discovery_phase']['tartxt_config']['script_path'] = f"{script_base}/tartxt.py"
                      instance_logger.info("initialize_workflow.script_path_set_from_base", new_path=tartxt_config['script_path']) # Added logging
                 else:
                     # Fallback 2: Try to locate the script in the package
@@ -417,15 +426,17 @@ class Orchestrator:
                          instance_logger.warning("initialize_workflow.package_lookup_failed", error=str(pkg_err)) # Added logging
 
                     if script_path_found_in_package:
-                         tartxt_config['script_path'] = script_path_found_in_package
+                         # Modify the original prepared_config dict
+                         prepared_config['llm_config']['agents']['discovery_phase']['tartxt_config']['script_path'] = script_path_found_in_package
                     else:
                         # Fallback 3: Use a default relative path if nothing else worked
                         default_relative = "c4h_agents/skills/tartxt.py"
-                        tartxt_config['script_path'] = default_relative
+                        # Modify the original prepared_config dict
+                        prepared_config['llm_config']['agents']['discovery_phase']['tartxt_config']['script_path'] = default_relative
                         instance_logger.warning("initialize_workflow.using_default_relative_path", path=default_relative) # Added logging
 
             # Final check of the script path before exiting
-            final_script_path = tartxt_config.get('script_path')
+            final_script_path = prepared_config.get('llm_config', {}).get('agents', {}).get('discovery_phase', {}).get('tartxt_config', {}).get('script_path')
             instance_logger.debug("initialize_workflow.final_script_path_check", path=final_script_path, type=type(final_script_path).__name__) # Added logging
 
             # Check if the final path is None or empty string AFTER all attempts
@@ -435,8 +446,9 @@ class Orchestrator:
                  raise ValueError(f"Could not determine a valid script_path for tartxt. Final value was: {final_script_path}")
 
             # Ensure input_paths is set
-            if 'input_paths' not in tartxt_config:
-                tartxt_config['input_paths'] = ["./"]
+            if 'input_paths' not in prepared_config.get('llm_config', {}).get('agents', {}).get('discovery_phase', {}).get('tartxt_config', {}):
+                # Modify the original prepared_config dict
+                prepared_config['llm_config']['agents']['discovery_phase']['tartxt_config']['input_paths'] = ["./"]
                 instance_logger.debug("initialize_workflow.set_default_input_paths") # Added logging
             # --- END OF TARTXT CONFIG LOGGING ---
 
@@ -454,8 +466,8 @@ class Orchestrator:
             instance_logger.info("workflow.initialized",
                         workflow_id=workflow_id,
                         project_path=project_path,
-                        tartxt_script_path=tartxt_config.get('script_path'), # Log final path used
-                        tartxt_config_keys=list(tartxt_config.keys()))
+                        tartxt_script_path=prepared_config.get('llm_config', {}).get('agents', {}).get('discovery_phase', {}).get('tartxt_config', {}).get('script_path'), # Log final path used
+                        tartxt_config_keys=list(prepared_config.get('llm_config', {}).get('agents', {}).get('discovery_phase', {}).get('tartxt_config', {}).keys()))
 
             return prepared_config, context
 

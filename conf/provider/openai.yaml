@@ -1,0 +1,24 @@
+openai:
+  api_base: "https://api.openai.com/v1"
+  env_var: "OPENAI_API_KEY"
+  default_model: "gpt-4o"
+  valid_models:
+    - "gpt-4o"
+    - "gpt-4o-mini"
+    - "gpt-4"
+    - "gpt-4-turbo"
+    - "o1"
+    - "o1-mini"
+    - "o3-mini"
+  litellm_params:
+    retry: true
+    max_retries: 3
+    timeout: 30
+    rate_limit_policy:
+      tokens: 4000
+      requests: 200
+      period: 60
+    backoff:
+      initial_delay: 1
+      max_delay: 20
+      exponential: true

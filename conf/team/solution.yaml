@@ -1,0 +1,11 @@
+name: "Solution Design Team"
+tasks:
+  - name: "solution_design_phase" # Unique instance name
+    agent_type: "GenericLLMAgent" # Updated to new type format
+    persona_key: "solution_designer_v1" # References personas/solution_designer_v1.yml
+    description: "Create solution design and code changes" # Optional description
+    requires_approval: false
+    max_retries: 1
+routing:
+  # Always go to coder team next - simplified for automatic test execution
+  default: "coder"

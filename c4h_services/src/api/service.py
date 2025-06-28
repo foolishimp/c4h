@@ -1,9 +1,7 @@
 # File: /Users/jim/src/apps/c4h_ai_dev/c4h_services/src/api/service.py
-# Correction: Removed module-level config loading and app instantiation
 
-from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel
-from typing import Dict, Any, Optional, Callable, List, Union
+from fastapi import FastAPI, HTTPException
+from typing import Dict, Any, Optional, List
 
 # Import get_logger from the shared utility
 from c4h_services.src.utils.logging import get_logger
@@ -11,17 +9,19 @@ from c4h_agents.utils.logging import log_config_node # Import directly
 from pathlib import Path
 import uuid
 import os
-import json
 import logging # Import standard logging
-from datetime import datetime, timezone # Ensure timezone is imported
+from datetime import datetime
 
-from c4h_agents.config import deep_merge, load_config, create_config_node, deepcopy
-from c4h_agents.core.project import Project
 from c4h_services.src.api.models import (WorkflowRequest, WorkflowResponse,
-                                         JobRequest, JobResponse, JobStatus,
-                                         MultiConfigJobRequest, MergeRequest, MergeResponse, JobRequestUnion)
+                                         JobResponse, JobStatus,
+                                         MultiConfigJobRequest, MergeRequest, MergeResponse)
 from c4h_services.src.orchestration.orchestrator import Orchestrator
 from c4h_services.src.utils.lineage_utils import load_lineage_file, prepare_context_from_lineage
+
+# Hydra imports for configuration management
+from hydra import initialize, compose
+from hydra.core.global_hydra import GlobalHydra
+from omegaconf import OmegaConf
 
 # --- Logger Setup ---
 logger = get_logger() # Initialize logger at module level is fine
@@ -30,162 +30,10 @@ logger = get_logger() # Initialize logger at module level is fine
 workflow_storage: Dict[str, Dict[str, Any]] = {}
 job_storage: Dict[str, Dict[str, Any]] = {}
 job_to_workflow_map: Dict[str, str] = {}
-# Define the default path, but don't load it here
-system_config_path_default = Path("config/system_config.yml")
+# Define the Hydra configuration path
+hydra_config_path = Path("/Users/jim/src/apps/c4h_ai_dev/conf")
 
 # --- Helper Functions ---
-# ... (map_job_to_workflow_request, extract_from_merged_config, map_workflow_to_job_changes remain the same) ...
-def map_job_to_workflow_request(job_request: JobRequest) -> WorkflowRequest:
-    """
-    Map JobRequest to WorkflowRequest format.
-    Transforms the structured job configuration to flat workflow configuration.
-    """
-    try:
-        # Get project path from workorder
-        project_path = job_request.workorder.project.path # cite: 1762
-
-        # Get intent from workorder - convert to dictionary with exclude_none
-        intent_dict = job_request.workorder.intent.dict(exclude_none=True) # cite: 1762
-
-        # Initialize app_config with project settings
-        app_config = {
-            "project": job_request.workorder.project.dict(exclude_none=True), # cite: 1763
-            "intent": intent_dict
-        }
-
-        # Track what's being extracted for logging
-        extracted_sections = ["workorder.project", "workorder.intent"]
-
-        # Add team configuration if provided
-        if job_request.team:
-            team_dict = job_request.team.dict(exclude_none=True) # cite: 1764
-            for key, value in team_dict.items():
-                if value:
-                    app_config[key] = value # cite: 1765
-                    extracted_sections.append(f"team.{key}")
-
-        # Add runtime configuration if provided
-        if job_request.runtime:
-            runtime_dict = job_request.runtime.dict(exclude_none=True) # cite: 1766
-            for key, value in runtime_dict.items():
-                if value:
-                    app_config[key] = value
-                    extracted_sections.append(f"runtime.{key}") # cite: 1766
-
-        # Extract lineage information from runtime if available
-        lineage_file = None # cite: 1767
-        stage = None
-        keep_runid = True
-
-        if job_request.runtime and job_request.runtime.runtime:
-            runtime_config = job_request.runtime.runtime # cite: 1767
-            if isinstance(runtime_config, dict):
-                lineage_file = runtime_config.get("lineage_file") # cite: 1768
-                stage = runtime_config.get("stage") # cite: 1768
-                keep_runid = runtime_config.get("keep_runid", True) # cite: 1768
-
-                if lineage_file:
-                    extracted_sections.append("runtime.runtime.lineage_file") # cite: 1769
-                if stage:
-                    extracted_sections.append("runtime.runtime.stage")
-                if "keep_runid" in runtime_config:
-                    extracted_sections.append("runtime.runtime.keep_runid") # cite: 1769
-
-        # Create workflow request with all parameters
-        workflow_request = WorkflowRequest(
-            project_path=project_path, # cite: 1770
-            intent=intent_dict,
-            app_config=app_config,
-            lineage_file=lineage_file, # cite: 1771
-            stage=stage,
-            keep_runid=keep_runid
-        )
-
-        logger.debug("jobs.mapping.job_to_workflow",
-                project_path=project_path,
-                extracted_sections=extracted_sections,
-                app_config_keys=list(app_config.keys()), # cite: 1772
-                lineage_file=lineage_file,
-                stage=stage)
-
-        return workflow_request
-
-    except Exception as e:
-        logger.error("jobs.mapping.failed",
-                 error=str(e),
-                 error_type=type(e).__name__) # cite: 1773
-        raise ValueError(f"Failed to map job request to workflow request: {str(e)}")
-
-def extract_from_merged_config(merged_config: Dict[str, Any]) -> WorkflowRequest:
-    """
-    Extract necessary fields from a merged configuration and create a WorkflowRequest.
-    This function handles the extraction step after all configs have been merged.
-
-    Args:
-        merged_config: The fully merged configuration dictionary
-
-    Returns:
-        WorkflowRequest object with properly mapped fields
-    """
-    try:
-        # Create a config node for easier path-based access
-        config_node = create_config_node(merged_config)
-
-        # Extract project path - first check common paths
-        project_path = config_node.get_value("project.path")
-        if not project_path:
-            # Fallback to workorder path
-            project_path = config_node.get_value("workorder.project.path")
-
-        if not project_path:
-            logger.warning("config_extraction.missing_project_path", config_keys=list(merged_config.keys()))
-            raise ValueError("Required field 'project_path' not found in configuration")
-
-        # Extract intent
-        intent_dict = config_node.get_value("intent")
-        if not intent_dict:
-            # Fallback to workorder intent
-            intent_dict = config_node.get_value("workorder.intent")
-
-        if not intent_dict:
-            logger.warning("config_extraction.missing_intent", config_keys=list(merged_config.keys()))
-            raise ValueError("Required field 'intent' not found in configuration")
-
-        # Extract lineage information from runtime if available
-        lineage_file = None
-        stage = None
-        keep_runid = True
-
-        # Check common paths for lineage/stage info
-        runtime_config = config_node.get_value("runtime.runtime")
-        if isinstance(runtime_config, dict):
-            lineage_file = runtime_config.get("lineage_file")
-            stage = runtime_config.get("stage")
-            keep_runid = runtime_config.get("keep_runid", True)
-
-        # Create the workflow request
-        workflow_request = WorkflowRequest(
-            project_path=project_path,
-            intent=intent_dict,
-            app_config=merged_config, # Pass the full merged config as app_config
-            lineage_file=lineage_file,
-            stage=stage,
-            keep_runid=keep_runid
-        )
-
-        logger.debug("config.extraction_complete",
-                    project_path=project_path,
-                    has_intent=bool(intent_dict),
-                    app_config_keys=list(merged_config.keys()),
-                    lineage_file=lineage_file,
-                    stage=stage)
-
-        return workflow_request
-
-    except Exception as e:
-        logger.error("config.extraction_failed", error=str(e), error_type=type(e).__name__)
-        raise ValueError(f"Failed to extract workflow request from merged configuration: {str(e)}")
-
 def map_workflow_to_job_changes(workflow_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Map workflow storage data to job changes format.
@@ -270,7 +118,7 @@ def map_workflow_to_job_changes(workflow_data: Dict[str, Any]) -> List[Dict[str,
 
 # --- FastAPI App Creation Function ---
 
-def create_app(config: Dict[str, Any]) -> FastAPI: # Changed signature: now requires config
+def create_app(config: Optional[Dict[str, Any]] = None) -> FastAPI: # Changed signature: now requires config
     """
     Create FastAPI application with team-based orchestration.
     Args:
@@ -285,15 +133,19 @@ def create_app(config: Dict[str, Any]) -> FastAPI: # Changed signature: now requ
         version="0.2.1" # Incremented version
     )
 
+    # If no config provided, load default using Hydra
+    if config is None:
+        # Clear any existing Hydra instance
+        if GlobalHydra.instance().is_initialized():
+            GlobalHydra.instance().clear()
+        
+        with initialize(version_base=None, config_path=str(hydra_config_path)):
+            cfg = compose(config_name="config")
+            config = OmegaConf.to_container(cfg, resolve=True)
+    
     # Store the provided config in app state
     app.state.config = config
-    # Store the default system config path for reference if needed (e.g., by merge endpoint)
-    app.state.system_config_path_default = system_config_path_default
-
-    # Create orchestrator using the provided config
-    app.state.orchestrator = Orchestrator(app.state.config)
-    logger.info("api.orchestrator_initialized_with_config",
-               teams=len(app.state.orchestrator.teams))
+    app.state.hydra_config_path = hydra_config_path
 
     # Configure API logger
     api_logger = logging.getLogger("api.requests")
@@ -302,6 +154,8 @@ def create_app(config: Dict[str, Any]) -> FastAPI: # Changed signature: now requ
     log_level = getattr(logging, log_level_str, logging.INFO)
     api_logger.setLevel(log_level)
     api_logger.propagate = True # Propagate to main logger setup by get_logger
+    
+    # Note: Orchestrator is now created per-request in create_job endpoint
 
     # --- run_workflow and get_workflow functions remain the same ---
     # They will use the orchestrator stored in app.state which was initialized
@@ -312,17 +166,26 @@ def create_app(config: Dict[str, Any]) -> FastAPI: # Changed signature: now requ
         Configuration from the request is merged with the app's base configuration.
         """
         try:
-            # --- Start with a clean copy of the app's config ---
-            # This prevents mutation of the shared app.state.config
-            # The orchestrator was already initialized with this config.
-            current_run_config = deepcopy(app.state.config)
-
-            # --- Merge system_config and app_config from the request ---
-            # This allows overriding parts of the config for a specific run
-            if request.system_config:
-                 current_run_config = deep_merge(current_run_config, request.system_config)
-            if request.app_config:
-                 current_run_config = deep_merge(current_run_config, request.app_config)
+            # --- Start with a clean copy of the app's config using Hydra ---
+            # Clear any existing Hydra instance
+            if GlobalHydra.instance().is_initialized():
+                GlobalHydra.instance().clear()
+            
+            with initialize(version_base=None, config_path=str(app.state.hydra_config_path)):
+                # Load base configuration
+                current_run_cfg = compose(config_name="config")
+                
+                # --- Merge system_config and app_config from the request ---
+                # This allows overriding parts of the config for a specific run
+                if request.system_config:
+                    system_cfg = OmegaConf.create(request.system_config)
+                    current_run_cfg = OmegaConf.merge(current_run_cfg, system_cfg)
+                if request.app_config:
+                    app_cfg = OmegaConf.create(request.app_config)
+                    current_run_cfg = OmegaConf.merge(current_run_cfg, app_cfg)
+                
+                # Convert to container for use with existing code
+                current_run_config = OmegaConf.to_container(current_run_cfg, resolve=True)
 
             # Check if lineage file is provided for workflow continuation
             if request.lineage_file and request.stage:
@@ -349,7 +212,7 @@ def create_app(config: Dict[str, Any]) -> FastAPI: # Changed signature: now requ
                     )
                     workflow_id = context["workflow_run_id"]
 
-                    # --- Re-initialize orchestrator for this specific run with potentially modified config ---
+                    # --- Initialize orchestrator for this specific run with potentially modified config ---
                     # This ensures the lineage continuation uses the correct merged config
                     current_orchestrator = Orchestrator(current_run_config)
 
@@ -386,9 +249,11 @@ def create_app(config: Dict[str, Any]) -> FastAPI: # Changed signature: now requ
                      raise HTTPException(status_code=500, detail=f"Lineage processing failed: {str(e)}")
 
             # --- Standard workflow initialization ---
-            # Use the main orchestrator instance initialized with app's config
+            # Create orchestrator for this request with the merged config
+            request_orchestrator = Orchestrator(current_run_config)
+            
             # initialize_workflow uses the config passed to it (current_run_config)
-            prepared_config, context = app.state.orchestrator.initialize_workflow(
+            prepared_config, context = request_orchestrator.initialize_workflow(
                 project_path=request.project_path,
                 intent_desc=request.intent,
                 config=current_run_config # Pass the potentially overridden config
@@ -410,9 +275,9 @@ def create_app(config: Dict[str, Any]) -> FastAPI: # Changed signature: now requ
             try:
                 entry_team = prepared_config.get("orchestration", {}).get("entry_team", "discovery")
 
-                # Execute using the main orchestrator instance, but pass the prepared context
+                # Execute using the request-specific orchestrator instance
                 # which contains the potentially run-specific prepared_config
-                result = app.state.orchestrator.execute_workflow(
+                result = request_orchestrator.execute_workflow(
                     entry_team=entry_team,
                     context=context
                 )
@@ -474,12 +339,12 @@ def create_app(config: Dict[str, Any]) -> FastAPI: # Changed signature: now requ
             "status": "healthy",
             "workflows_tracked": len(workflow_storage),
             "jobs_tracked": len(job_storage),
-            "teams_available": len(app.state.orchestrator.teams)
+            "teams_available": len(app.state.config.get("orchestration", {}).get("teams", {}))
         }
 
     @app.post("/api/v1/jobs", response_model=JobResponse)
-    async def create_job(request: JobRequestUnion):
-        # ... (create_job logic remains the same, it calls run_workflow) ...
+    async def create_job(request: MultiConfigJobRequest):
+        """Create a new job from multiple configuration fragments that will be merged."""
         job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}"
         merged_config = None
         project_path = None
@@ -487,22 +352,27 @@ def create_app(config: Dict[str, Any]) -> FastAPI: # Changed signature: now requ
         workflow_request = None
 
         try:
-            if isinstance(request, MultiConfigJobRequest):
-                logger.info("jobs.multi_config_request_received",
-                        job_id=job_id,
-                        configs_count=len(request.configs))
+            logger.info("jobs.multi_config_request_received",
+                    job_id=job_id,
+                    configs_count=len(request.configs))
 
-                # Start with a deep copy of the default config from app state
-                base_config = deepcopy(app.state.config) # Use app state config
-                if not isinstance(base_config, dict):
-                    logger.warning("App state config is not a dictionary, starting merge with empty dict.", job_id=job_id)
-                    base_config = {}
-                merged_config = base_config
-
-                # Merge fragments onto the base config
+            # Use Hydra Compose API to merge configurations
+            # Clear any existing Hydra instance
+            if GlobalHydra.instance().is_initialized():
+                GlobalHydra.instance().clear()
+            
+            with initialize(version_base=None, config_path=str(app.state.hydra_config_path)):
+                # Load base configuration
+                base_cfg = compose(config_name="config")
+                
+                # Merge each config fragment using OmegaConf
                 for i, config_fragment in enumerate(request.configs):
                     logger.debug("jobs.merging_fragment", job_id=job_id, fragment_index=i, fragment_keys=list(config_fragment.keys()))
-                    merged_config = deep_merge(merged_config, config_fragment)
+                    fragment_cfg = OmegaConf.create(config_fragment)
+                    base_cfg = OmegaConf.merge(base_cfg, fragment_cfg)
+                
+                # Convert to container for use with existing code
+                merged_config = OmegaConf.to_container(base_cfg, resolve=True)
 
                 log_config_node(logger, merged_config, "workorder", log_prefix=f"jobs.final_merged.{job_id}")
                 log_config_node(logger, merged_config, "team", log_prefix=f"jobs.final_merged.{job_id}")
@@ -513,40 +383,55 @@ def create_app(config: Dict[str, Any]) -> FastAPI: # Changed signature: now requ
                         job_id=job_id,
                         merged_config_keys=list(merged_config.keys()))
 
-                try:
-                    workflow_request = extract_from_merged_config(merged_config)
-                    logger.info("jobs.workflow_request_created_from_merged_config",
-                               job_id=job_id,
-                               project_path=workflow_request.project_path,
-                               has_intent=bool(workflow_request.intent))
-                    project_path = workflow_request.project_path
-                    intent = workflow_request.intent
-                except Exception as e:
-                    logger.error("jobs.extract_from_merged_config_failed",
-                               job_id=job_id, error=str(e), error_type=type(e).__name__, exc_info=True)
-                    raise HTTPException(status_code=400, detail=f"Invalid merged configuration: {str(e)}")
-
-            elif isinstance(request, JobRequest):
-                logger.info("jobs.traditional_request_received",
-                        job_id=job_id, project_path=request.workorder.project.path,
-                        has_team_config=request.team is not None, has_runtime_config=request.runtime is not None)
-                try:
-                    workflow_request = map_job_to_workflow_request(request)
-                    project_path = workflow_request.project_path
-                    intent = workflow_request.intent
-                    merged_config = workflow_request.app_config
-
-                    log_config_node(logger, merged_config, "workorder", log_prefix=f"jobs.mapped.{job_id}")
-                    log_config_node(logger, merged_config, "team", log_prefix=f"jobs.mapped.{job_id}")
-                    log_config_node(logger, merged_config, "runtime", log_prefix=f"jobs.mapped.{job_id}")
-
-                    logger.debug("jobs.request_mapped", job_id=job_id, workflow_request_keys=list(workflow_request.dict().keys()))
-                except Exception as e:
-                    logger.error("jobs.request_mapping_failed", job_id=job_id, error=str(e), exc_info=True)
-                    raise HTTPException(status_code=400, detail=f"Invalid job configuration: {str(e)}")
-            else:
-                logger.error("jobs.unknown_request_type", job_id=job_id, request_type=type(request).__name__)
-                raise HTTPException(status_code=400, detail="Unknown job request format")
+                # Extract project path and intent from merged config
+                # Check for project path in various locations
+                project_path = None
+                if 'project' in merged_config and 'path' in merged_config['project']:
+                    project_path = merged_config['project']['path']
+                elif 'workorder' in merged_config and 'project' in merged_config['workorder'] and 'path' in merged_config['workorder']['project']:
+                    project_path = merged_config['workorder']['project']['path']
+                
+                if not project_path:
+                    logger.error("jobs.missing_project_path", job_id=job_id, config_keys=list(merged_config.keys()))
+                    raise HTTPException(status_code=400, detail="Project path not found in configuration")
+                
+                # Extract intent
+                intent = None
+                if 'intent' in merged_config:
+                    intent = merged_config['intent']
+                elif 'workorder' in merged_config and 'intent' in merged_config['workorder']:
+                    intent = merged_config['workorder']['intent']
+                
+                if not intent:
+                    logger.error("jobs.missing_intent", job_id=job_id, config_keys=list(merged_config.keys()))
+                    raise HTTPException(status_code=400, detail="Intent not found in configuration")
+                
+                # Extract lineage info if present
+                lineage_file = None
+                stage = None
+                keep_runid = True
+                
+                if 'runtime' in merged_config and 'runtime' in merged_config['runtime']:
+                    runtime_config = merged_config['runtime']['runtime']
+                    if isinstance(runtime_config, dict):
+                        lineage_file = runtime_config.get('lineage_file')
+                        stage = runtime_config.get('stage')
+                        keep_runid = runtime_config.get('keep_runid', True)
+                
+                # Create workflow request
+                workflow_request = WorkflowRequest(
+                    project_path=project_path,
+                    intent=intent,
+                    app_config=merged_config,
+                    lineage_file=lineage_file,
+                    stage=stage,
+                    keep_runid=keep_runid
+                )
+                
+                logger.info("jobs.workflow_request_created_from_merged_config",
+                           job_id=job_id,
+                           project_path=project_path,
+                           has_intent=bool(intent))
 
             if not workflow_request:
                  logger.error("jobs.workflow_request_creation_failed", job_id=job_id)
@@ -673,22 +558,27 @@ def create_app(config: Dict[str, Any]) -> FastAPI: # Changed signature: now requ
     async def merge_configs(request: MergeRequest):
         # ... (merge_configs remains the same) ...
         try:
-            if request.include_system_config:
-                try:
-                    # Use the default path stored in app state
-                    system_config = load_config(app.state.system_config_path_default)
-                    merged_config = system_config.copy()
-                    logger.debug("configs.merge.using_system_config", system_config_keys=list(system_config.keys()))
-                except Exception as e:
-                    logger.warning("configs.merge.system_config_load_failed", error=str(e))
-                    # Fall back to app's current config if default load fails
-                    merged_config = deepcopy(app.state.config)
-            else:
-                merged_config = {}
+            # Clear any existing Hydra instance
+            if GlobalHydra.instance().is_initialized():
+                GlobalHydra.instance().clear()
+            
+            with initialize(version_base=None, config_path=str(app.state.hydra_config_path)):
+                if request.include_system_config:
+                    # Load the base configuration using Hydra
+                    merged_cfg = compose(config_name="config")
+                    logger.debug("configs.merge.using_system_config")
+                else:
+                    # Start with empty config
+                    merged_cfg = OmegaConf.create({})
 
-            for i, config in enumerate(reversed(request.configs)):
-                 merged_config = deep_merge(merged_config, config)
-                 logger.debug(f"configs.merge.step_{i+1}", config_keys=list(config.keys()))
+                # Merge each config in reverse order (as per original logic)
+                for i, config in enumerate(reversed(request.configs)):
+                    config_cfg = OmegaConf.create(config)
+                    merged_cfg = OmegaConf.merge(merged_cfg, config_cfg)
+                    logger.debug(f"configs.merge.step_{i+1}", config_keys=list(config.keys()))
+
+                # Convert to container
+                merged_config = OmegaConf.to_container(merged_cfg, resolve=True)
 
             return MergeResponse(merged_config=merged_config)
 

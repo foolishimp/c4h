@@ -13,7 +13,9 @@ setup(
         "c4h_agents",  # Depend on the agents package
         "prefect",
         "rich",
-        "PyYAML"
+        "PyYAML",
+        "hydra-core>=1.3.0",
+        "omegaconf>=2.3.0"
     ],
     python_requires=">=3.11",
 )

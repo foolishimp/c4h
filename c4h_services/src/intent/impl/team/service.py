@@ -9,7 +9,11 @@ from c4h_services.src.utils.logging import get_logger
 from datetime import datetime
 import uuid
 
-from c4h_agents.config import load_config, load_with_app_config
+# Hydra imports for configuration management
+from hydra import initialize, compose
+from hydra.core.global_hydra import GlobalHydra
+from omegaconf import OmegaConf
+
 from c4h_services.src.orchestration.orchestrator import Orchestrator
 from c4h_services.src.intent.core.service import IntentService
 
@@ -24,12 +28,24 @@ class TeamIntentService(IntentService):
     def __init__(self, config_path: Optional[Path] = None):
         """Initialize service with configuration"""
         try:
-            # Load config using existing patterns
-            system_path = Path("config/system_config.yml")
-            if config_path:
-                self.config = load_with_app_config(system_path, config_path)
-            else:
-                self.config = load_config(system_path)
+            # Define the Hydra configuration path
+            hydra_config_path = Path("/Users/jim/src/apps/c4h_ai_dev/conf")
+            
+            # Clear any existing Hydra instance
+            if GlobalHydra.instance().is_initialized():
+                GlobalHydra.instance().clear()
+            
+            # Load configuration using Hydra
+            with initialize(version_base=None, config_path=str(hydra_config_path)):
+                if config_path:
+                    # If a specific config path is provided, load it as an override
+                    cfg = compose(config_name="config", overrides=[f"config_path={config_path}"])
+                else:
+                    # Load default configuration
+                    cfg = compose(config_name="config")
+                
+                # Convert to container for use with existing code
+                self.config = OmegaConf.to_container(cfg, resolve=True)
             
             # Create orchestrator
             self.orchestrator = Orchestrator(self.config)

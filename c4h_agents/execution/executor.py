@@ -15,7 +15,7 @@ from enum import Enum
 import structlog
 
 from c4h_agents.lineage.event_logger import EventLogger, EventType
-from c4h_agents.config import create_config_node, ConfigNode
+from omegaconf import OmegaConf
 from c4h_agents.skills.registry import SkillRegistry
 
 # Configure logger
@@ -98,7 +98,7 @@ class ExecutionPlanExecutor:
             event_logger: Optional event logger to use for lineage tracking
         """
         self.config = effective_config
-        self.config_node = create_config_node(effective_config)
+        self.config_node = OmegaConf.create(effective_config) if isinstance(effective_config, dict) else effective_config
         self.skill_registry = skill_registry or SkillRegistry()
         self.event_logger = event_logger
         self.execution_id = str(uuid.uuid4())
@@ -611,7 +611,7 @@ class ExecutionPlanExecutor:
             current_team_id = team_context.get("team_id")
             if current_team_id:
                 # Look for the agent in the current team's agents list
-                team_config = self.config_node.get_value(f"orchestration.teams.{current_team_id}")
+                team_config = OmegaConf.select(self.config_node, f"orchestration.teams.{current_team_id}")
                 if team_config:
                     # Check both "agents" and "tasks" (for backward compatibility)
                     for agents_key in ["agents", "tasks"]:
@@ -623,7 +623,7 @@ class ExecutionPlanExecutor:
                                     # If agent has persona_key, get the persona config
                                     persona_key = agent.get("persona_key")
                                     if persona_key:
-                                        persona_config = self.config_node.get_value(f"llm_config.personas.{persona_key}")
+                                        persona_config = OmegaConf.select(self.config_node, f"llm_config.personas.{persona_key}")
                                     
                                     break
                             
@@ -633,16 +633,16 @@ class ExecutionPlanExecutor:
             
             # If not found in team, check global agents configuration
             if not agent_config:
-                agent_config = self.config_node.get_value(f"llm_config.agents.{node_name}")
+                agent_config = OmegaConf.select(self.config_node, f"llm_config.agents.{node_name}")
                 if agent_config:
                     # If agent has persona_key, get the persona config
                     persona_key = agent_config.get("persona_key")
                     if persona_key:
-                        persona_config = self.config_node.get_value(f"llm_config.personas.{persona_key}")
+                        persona_config = OmegaConf.select(self.config_node, f"llm_config.personas.{persona_key}")
             
             # If still not found, look for the agent in all teams
             if not agent_config:
-                teams = self.config_node.get_value("orchestration.teams", {})
+                teams = OmegaConf.select(self.config_node, "orchestration.teams") or {}
                 for team_id, team_config in teams.items():
                     # Check both "agents" and "tasks" (for backward compatibility)
                     for agents_key in ["agents", "tasks"]:
@@ -654,7 +654,7 @@ class ExecutionPlanExecutor:
                                     # If agent has persona_key, get the persona config
                                     persona_key = agent.get("persona_key")
                                     if persona_key:
-                                        persona_config = self.config_node.get_value(f"llm_config.personas.{persona_key}")
+                                        persona_config = OmegaConf.select(self.config_node, f"llm_config.personas.{persona_key}")
                                     
                                     break
                             
@@ -901,7 +901,7 @@ class ExecutionPlanExecutor:
         
         try:
             # Look up the team configuration
-            team_config = self.config_node.get_value(f"orchestration.teams.{team_id}")
+            team_config = OmegaConf.select(self.config_node, f"orchestration.teams.{team_id}")
             if not team_config:
                 return ExecutionResult(
                     success=False,
@@ -1155,7 +1155,7 @@ class ExecutionPlanExecutor:
         # Check for required parameters
         if not provider_name:
             # Look for default provider in config
-            provider_name = self.config_node.get_value("llm_config.default_provider")
+            provider_name = OmegaConf.select(self.config_node, "llm_config.default_provider")
             if not provider_name:
                 return ExecutionResult(
                     success=False,
@@ -1166,7 +1166,7 @@ class ExecutionPlanExecutor:
                 
         if not model_name:
             # Look for default model in config
-            model_name = self.config_node.get_value("llm_config.default_model")
+            model_name = OmegaConf.select(self.config_node, "llm_config.default_model")
             if not model_name:
                 return ExecutionResult(
                     success=False,
@@ -1227,7 +1227,7 @@ class ExecutionPlanExecutor:
             llm.temperature = float(temperature)
             
             # Get provider configuration from effective config
-            provider_config = self.config_node.get_value(f"llm_config.providers.{provider_name}", {})
+            provider_config = OmegaConf.select(self.config_node, f"llm_config.providers.{provider_name}") or {}
             
             # Set up BaseLLM configuration
             # Manually configure important attributes that would normally be set in BaseAgent

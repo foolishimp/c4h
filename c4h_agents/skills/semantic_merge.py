@@ -8,7 +8,6 @@ from pathlib import Path
 from c4h_agents.agents.base_agent import BaseAgent, AgentResponse
 from c4h_agents.skills.base_skill import BaseSkill, SkillProtocol
 from c4h_agents.agents.types import SkillResult
-from c4h_agents.config import locate_config
 from c4h_agents.utils.logging import get_logger
 
 logger = get_logger()
@@ -44,9 +43,9 @@ class SemanticMerge(BaseAgent):
         
         # The unique_name is now stored by BaseAgent
         
-        # Get merge-specific configs
-        merge_config = locate_config(self.config or {}, self._get_agent_name())
-        merge_config = merge_config.get('merge_config', {})
+        # Get merge-specific configs using inherited method
+        agent_config = self._get_agent_config()  # Gets llm_config.agents.semantic_merge
+        merge_config = agent_config.get('merge_config', {})
         self.preserve_formatting = merge_config.get('preserve_formatting', True)
         self.allow_partial = merge_config.get('allow_partial', False)
         

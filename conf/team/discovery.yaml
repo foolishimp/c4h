@@ -1,0 +1,10 @@
+name: "Discovery Team"
+tasks:
+  - name: "discovery_phase" # Unique instance name
+    agent_type: "GenericSkillAgent" # Changed to GenericSkillAgent
+    persona_key: "discovery_by_skill_v1" # References the new personas/discovery_by_skill_v1.yml
+    description: "Analyze project structure and files using tartxt_runner skill" # Updated description
+    requires_approval: false
+    max_retries: 2
+routing:
+  default: "solution"

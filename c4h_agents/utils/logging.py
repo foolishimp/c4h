@@ -6,7 +6,7 @@ Path: c4h_agents/utils/logging.py
 from typing import Any, Dict, Optional
 import structlog
 import json
-from c4h_agents.config import create_config_node, get_by_path
+from omegaconf import OmegaConf
 
 # Default truncation values
 DEFAULT_PREFIX_LENGTH = 150
@@ -46,20 +46,20 @@ def truncate_log_string(
     """
     # Get config values if not provided
     if config:
-        config_node = create_config_node(config)
+        cfg = OmegaConf.create(config)
         if prefix_len is None:
-            prefix_len = config_node.get_value("logging.truncate.prefix_length") or DEFAULT_PREFIX_LENGTH
+            prefix_len = OmegaConf.select(cfg, "logging.truncate.prefix_length") or DEFAULT_PREFIX_LENGTH
         if suffix_len is None:
-            suffix_len = config_node.get_value("logging.truncate.suffix_length") or DEFAULT_SUFFIX_LENGTH
+            suffix_len = OmegaConf.select(cfg, "logging.truncate.suffix_length") or DEFAULT_SUFFIX_LENGTH
     else:
         # Use global config if available, otherwise use defaults
         global _global_config
         if _global_config:
-            config_node = create_config_node(_global_config)
+            cfg = OmegaConf.create(_global_config)
             if prefix_len is None:
-                prefix_len = config_node.get_value("logging.truncate.prefix_length") or DEFAULT_PREFIX_LENGTH
+                prefix_len = OmegaConf.select(cfg, "logging.truncate.prefix_length") or DEFAULT_PREFIX_LENGTH
             if suffix_len is None:
-                suffix_len = config_node.get_value("logging.truncate.suffix_length") or DEFAULT_SUFFIX_LENGTH
+                suffix_len = OmegaConf.select(cfg, "logging.truncate.suffix_length") or DEFAULT_SUFFIX_LENGTH
         else:
             # Default values if no config provided
             prefix_len = prefix_len or DEFAULT_PREFIX_LENGTH
@@ -144,9 +144,9 @@ def log_config_node(
         return
 
     try:
-        # Use get_by_path or ConfigNode to access the node
-        path_parts = node_path.split('.')
-        node_data = get_by_path(config, path_parts) # Using the existing helper
+        # Use OmegaConf to access the node
+        cfg = OmegaConf.create(config)
+        node_data = OmegaConf.select(cfg, node_path)
 
         if node_data is None:
             logger_instance.debug(f"{log_prefix}.node_not_found", node_path=node_path)

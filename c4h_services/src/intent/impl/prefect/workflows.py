@@ -17,10 +17,10 @@ import yaml
 
 from c4h_agents.lineage.event_logger import EventLogger, EventType
 
-from c4h_agents.config import create_config_node
+from omegaconf import OmegaConf
 from c4h_agents.agents.lineage_context import LineageContext
 # Import evaluate_routing_task from the tasks module
-from .tasks import run_agent_task, materialise_config, evaluate_routing_task
+from .tasks import run_agent_task, evaluate_routing_task
 # Remove unused factory imports if run_basic_workflow was deleted
 # from .factories import (...)
 
@@ -47,9 +47,9 @@ def prepare_workflow_config(base_config: Dict[str, Any]) -> Dict[str, Any]:
 
         # If no Prefect context, check base_config or generate new ID
         if not workflow_id:
-             config_node_temp = create_config_node(base_config)
-             workflow_id = config_node_temp.get_value("workflow_run_id") or \
-                           config_node_temp.get_value("system.runid")
+             config_node_temp = OmegaConf.create(base_config)
+             workflow_id = OmegaConf.select(config_node_temp, "workflow_run_id") or \
+                           OmegaConf.select(config_node_temp, "system.runid")
 
         if not workflow_id:
             workflow_id = f"wf_standalone_{str(uuid.uuid4())[:8]}" # Generate ID if still missing
@@ -195,7 +195,7 @@ def run_declarative_workflow(
             effective_config['runtime'] = {}
             
         # Get lineage configuration from effective config
-        lineage_config = config_node.get_value("llm_config.agents.lineage", {})
+        lineage_config = OmegaConf.select(effective_config, "llm_config.agents.lineage") or {}
         if not lineage_config.get("enabled", True):
             run_logger.info("Lineage tracking is disabled in configuration")
 
@@ -221,17 +221,17 @@ def run_declarative_workflow(
         }
 
         # Create config node for path-based access
-        config_node = create_config_node(effective_config)
+        config_node = OmegaConf.create(effective_config)
 
         # Get workflow run ID for tracking (should be embedded in snapshot)
-        workflow_id = config_node.get_value("system.runid") or str(config_info.run_id)
+        workflow_id = OmegaConf.select(config_node, "system.runid") or str(config_info.run_id)
         run_logger.info(f"Workflow Run ID: {workflow_id}") # Log the ID being used
 
         # Get global safety limits from effective config, overridden by args if provided
-        config_max_total = config_node.get_value("orchestration.max_total_teams", default=30)
+        config_max_total = OmegaConf.select(config_node, "orchestration.max_total_teams") or 30
         final_max_total_teams = max_total_teams if max_total_teams is not None else config_max_total
 
-        config_max_recursion = config_node.get_value("orchestration.max_recursion_depth", default=5)
+        config_max_recursion = OmegaConf.select(config_node, "orchestration.max_recursion_depth") or 5
         final_max_recursion_depth = max_recursion_depth if max_recursion_depth is not None else config_max_recursion
 
         run_logger.info("Workflow limits", max_total_teams=final_max_total_teams, max_recursion_depth=final_max_recursion_depth)
@@ -241,7 +241,7 @@ def run_declarative_workflow(
         team_execution_counts = {}  # Track execution count per team
 
         # Get entry team from config or use default
-        entry_team_id = config_node.get_value("orchestration.entry_team") or "discovery"
+        entry_team_id = OmegaConf.select(config_node, "orchestration.entry_team") or "discovery"
         run_logger.info(f"Starting workflow with entry team: {entry_team_id}")
 
         # Initialize current state
@@ -271,7 +271,7 @@ def run_declarative_workflow(
             
             try:
                 # Get per-team recursion depth limit (if specified in config)
-                team_max_depth = config_node.get_value(f"orchestration.teams.{team_id}.max_recursion_depth", default=final_max_recursion_depth)
+                team_max_depth = OmegaConf.select(config_node, f"orchestration.teams.{team_id}.max_recursion_depth") or final_max_recursion_depth
                 
                 # Check team-specific recursion depth
                 current_team_count = team_execution_counts.get(team_id, 0)
@@ -359,16 +359,16 @@ def run_declarative_workflow(
                 break
 
             # Get per-team recursion depth limit (if specified in config)
-            team_max_depth = config_node.get_value(f"orchestration.teams.{current_team_id}.max_recursion_depth", default=final_max_recursion_depth)
+            team_max_depth = OmegaConf.select(config_node, f"orchestration.teams.{current_team_id}.max_recursion_depth") or final_max_recursion_depth
 
             # Check if the current team is a concentrator
-            team_type = config_node.get_value(f"orchestration.teams.{current_team_id}.type", default="standard")
+            team_type = OmegaConf.select(config_node, f"orchestration.teams.{current_team_id}.type") or "standard"
             
             if team_type == "concentrator":
                 run_logger.info(f"Executing concentrator team: {current_team_id}")
                 
                 # Get concentrator configuration
-                concentrator_config = config_node.get_value(f"orchestration.teams.{current_team_id}")
+                concentrator_config = OmegaConf.select(config_node, f"orchestration.teams.{current_team_id}")
                 
                 # Extract concentrator parameters
                 source_teams = concentrator_config.get("source_teams", [])
@@ -884,7 +884,9 @@ def run_declarative_workflow(
                         error_detail = team_result.get('error', 'Unknown team error')
                         run_logger.error(f"Team {current_team_id} execution failed: {error_detail}")
                         # Check if workflow should stop on failure for this team
-                        stop_on_fail = config_node.get_value(f"orchestration.teams.{current_team_id}.stop_on_failure", default=True)
+                        stop_on_fail = OmegaConf.select(config_node, f"orchestration.teams.{current_team_id}.stop_on_failure")
+                        if stop_on_fail is None:
+                            stop_on_fail = True
                         # Log error event if team failed
                         event_logger.log_event(
                             event_type=EventType.ERROR_EVENT,
@@ -1045,7 +1047,7 @@ def run_declarative_workflow(
                         effective_config = new_effective_config
                         
                         # Create a new config node
-                        config_node = create_config_node(effective_config)
+                        config_node = OmegaConf.create(effective_config)
                         
                         # Add snapshot metadata to context
                         current_context["config_snapshot"] = {
@@ -1194,10 +1196,10 @@ def execute_team_subflow(
 
     try:
         # Create config node for path-based access
-        config_node = create_config_node(effective_config)
+        config_node = OmegaConf.create(effective_config)
 
         # Look up team configuration in the effective config
-        team_config = config_node.get_value(f"orchestration.teams.{team_id}")
+        team_config = OmegaConf.select(config_node, f"orchestration.teams.{team_id}")
         if not team_config or not isinstance(team_config, dict):
             run_logger.error(f"Team configuration not found or invalid for team: {team_id}")
             return {
@@ -1215,7 +1217,7 @@ def execute_team_subflow(
         updated_context["execution_metadata"]["start_time"] = execution_start_time.isoformat()
             
         # Initialize event logger if configured
-        lineage_config = config_node.get_value("llm_config.agents.lineage", {})
+        lineage_config = OmegaConf.select(config_node, "llm_config.agents.lineage") or {}
         event_logger = None
         if lineage_config.get("enabled", True):
             try:

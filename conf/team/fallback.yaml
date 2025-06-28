@@ -1,0 +1,11 @@
+name: "Fallback Team"
+tasks:
+  - name: "fallback_coding_phase" # Unique instance name
+    agent_type: "GenericFallbackAgent" # Updated to specific fallback agent
+    persona_key: "coder_v1" # Reuse coder persona or have a specific fallback persona
+    description: "Implement code changes with conservative approach" # Optional description
+    config: # Task-specific override for the persona
+      temperature: 0 # Make fallback more conservative
+routing:
+  # End workflow after fallback
+  default: null # End workflow after fallback

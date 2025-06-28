@@ -1,0 +1,94 @@
+# Default composition for the C4H system
+defaults:
+  - team: discovery
+  - persona: discovery_v1
+  - provider: anthropic
+  - _self_
+
+# Placeholder for runtime-injected project path and intent
+project:
+  path: ???
+
+intent:
+  description: ???
+
+# Global settings moved from the old system_config.yml
+logging:
+  level: "debug"
+  format: "structured"
+  agent_level: "debug"
+  providers:
+    anthropic:
+      level: "debug"
+    openai:
+      level: "debug"
+  truncate:
+    prefix_length: 2000
+    suffix_length: 1000
+
+runtime:
+  workflow:
+    storage:
+      enabled: true
+      root_dir: "workspaces/workflows"
+      format: "yymmdd_hhmm_{workflow_id}"
+      retention:
+        max_runs: 10
+        max_days: 30
+      error_handling:
+        ignore_storage_errors: true
+        log_level: "ERROR"
+  lineage:
+    enabled: true
+    namespace: "c4h_agents"
+    separate_input_output: true
+    backend:
+      type: "file"
+      path: "workspaces/lineage"
+    error_handling:
+      ignore_failures: true
+      log_level: "ERROR"
+    context:
+      include_metrics: true
+      include_token_usage: true
+      record_timestamps: true
+    retry:
+      enabled: true
+      max_attempts: 3
+      initial_delay: 1
+      max_delay: 30
+      backoff_factor: 2
+      retry_on:
+        - "overloaded_error"
+        - "rate_limit_error"
+        - "timeout_error"
+
+backup:
+  enabled: true
+  path: "workspaces/backups"
+
+llm_config:
+  default_provider: "anthropic"
+  default_model: "claude-3-5-sonnet-20241022"
+  providers:
+    # Use interpolation to include the provider configs
+    anthropic: ${provider.anthropic}
+    openai: ${provider.openai}
+    gemini: ${provider.gemini}
+    xai: ${provider.xai}
+
+orchestration:
+  enabled: true
+  entry_team: "discovery"
+  max_total_teams: 30
+  max_recursion_depth: 5
+  error_handling:
+    retry_teams: true
+    max_retries: 2
+    log_level: "ERROR"
+  teams:
+    # Use interpolation to compose teams
+    discovery: ${team.discovery}
+    solution: ${team.solution}
+    coder: ${team.coder}
+    fallback: ${team.fallback}

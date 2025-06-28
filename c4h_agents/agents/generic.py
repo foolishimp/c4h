@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 
+from omegaconf import OmegaConf
 from c4h_agents.agents.base_agent import BaseAgent, AgentResponse
 from c4h_agents.agents.types import LLMMessages, LogDetail, AgentType, SkillResult
 from c4h_agents.utils.logging import get_logger
@@ -123,7 +124,7 @@ class GenericLLMAgent(BaseAgent):
         if template is None:
             try:
                 # First try to get the template_name from persona config
-                persona_template_name = self.config_node.get_value(f"{self.persona_path}.prompts.template_name")
+                persona_template_name = OmegaConf.select(self.config, f"{self.persona_path}.prompts.template_name")
                 if persona_template_name:
                     template_key = persona_template_name
                     self.logger.debug("format_request.using_persona_template_name", template_key=template_key)
@@ -136,11 +137,11 @@ class GenericLLMAgent(BaseAgent):
         # If still no template, get it from persona prompts using template_key
         if template is None:
             try:
-                template = self.config_node.get_value(f"{self.persona_path}.prompts.{template_key}")
+                template = OmegaConf.select(self.config, f"{self.persona_path}.prompts.{template_key}")
                 
                 if not template:
                     # Try common alternative location
-                    template = self.config_node.get_value(f"llm_config.prompts.{template_key}")
+                    template = OmegaConf.select(self.config, f"llm_config.prompts.{template_key}")
                     
                     if template:
                         self.logger.debug("format_request.found_template_in_llm_config", 
@@ -216,14 +217,14 @@ class GenericLLMAgent(BaseAgent):
             
             try:
                 # First check agent config
-                agent_config = self.config_node.get_value(self.config_path)
+                agent_config = OmegaConf.select(self.config, self.config_path)
                 if agent_config and isinstance(agent_config, dict):
                     skill_identifier = agent_config.get('skill')
                     skill_params = agent_config.get('skill_params', {})
                 
                 # Also check persona config for skill configuration
                 if not skill_identifier and self.persona_key:
-                    persona_config = self.config_node.get_value(self.persona_path)
+                    persona_config = OmegaConf.select(self.config, self.persona_path)
                     if persona_config and isinstance(persona_config, dict):
                         skill_identifier = persona_config.get('skill')
                         skill_params = persona_config.get('skill_params', {})
@@ -395,10 +396,10 @@ class GenericOrchestratorAgent(BaseAgent):
                                   "Use ExecutionPlanExecutor with agents that have an execution_plan in their persona instead.")
         
         # Get execution plan from persona configuration
-        self.execution_plan = self.config_node.get_value(f"{self.persona_path}.execution_plan")
+        self.execution_plan = OmegaConf.select(self.config, f"{self.persona_path}.execution_plan")
         
         # Also check for execution_plan in the agent's own config
-        agent_config = self.config_node.get_value(self.config_path)
+        agent_config = OmegaConf.select(self.config, self.config_path)
         if agent_config and isinstance(agent_config, dict) and "execution_plan" in agent_config:
             self.logger.info("execution_plan.using_agent_config",
                            agent_name=self.unique_name,
@@ -1002,18 +1003,18 @@ class GenericSkillAgent(BaseAgent):
         self.logger.info("generic_agent.initialized", agent_type=self.agent_type.value)
         
         # Get primary skill configuration
-        self.primary_skill = self.config_node.get_value(f"{self.persona_path}.skill")
+        self.primary_skill = OmegaConf.select(self.config, f"{self.persona_path}.skill")
         if not self.primary_skill:
             self.logger.warning("skill_agent.no_primary_skill", 
                               persona_key=self.persona_key,
                               persona_path=f"{self.persona_path}.skill")
             
         # Get skill parameters from configuration
-        self.skill_params = self.config_node.get_value(f"{self.persona_path}.skill_params") or {}
+        self.skill_params = OmegaConf.select(self.config, f"{self.persona_path}.skill_params") or {}
         
         # Get LLM fallback configuration
-        self.allow_llm_fallback = self.config_node.get_value(f"{self.persona_path}.allow_llm_fallback") or False
-        self.fallback_prompt_key = self.config_node.get_value(f"{self.persona_path}.fallback_prompt_key") or "process"
+        self.allow_llm_fallback = OmegaConf.select(self.config, f"{self.persona_path}.allow_llm_fallback") or False
+        self.fallback_prompt_key = OmegaConf.select(self.config, f"{self.persona_path}.fallback_prompt_key") or "process"
 
     def _get_agent_name(self) -> str:
         """Return the unique name for this agent instance."""
@@ -1222,12 +1223,12 @@ class GenericFallbackAgent(GenericLLMAgent):
         self.logger.info("fallback_agent.initialized", agent_type=self.agent_type.value)
         
         # Get fallback-specific configuration with conservative defaults
-        self.max_retries = self.config_node.get_value(f"{self.persona_path}.max_retries") or 2
-        self.retry_delay = self.config_node.get_value(f"{self.persona_path}.retry_delay") or 1.0
-        self.validation_level = self.config_node.get_value(f"{self.persona_path}.validation_level") or "strict"
+        self.max_retries = OmegaConf.select(self.config, f"{self.persona_path}.max_retries") or 2
+        self.retry_delay = OmegaConf.select(self.config, f"{self.persona_path}.retry_delay") or 1.0
+        self.validation_level = OmegaConf.select(self.config, f"{self.persona_path}.validation_level") or "strict"
         
         # Set conservative default temperature
-        temp_value = self.config_node.get_value(f"{self.persona_path}.temperature")
+        temp_value = OmegaConf.select(self.config, f"{self.persona_path}.temperature")
         # Override with a lower temperature if not explicitly set
         if temp_value is None:
             self.temperature = 0.0
@@ -1324,7 +1325,7 @@ If you can't solve the full problem, solve a simpler subset rather than failing 
                           error=self.previous_error)
         
         # Check for skill configuration - same as GenericLLMAgent
-        agent_config = self.config_node.get_value(self.config_path)
+        agent_config = OmegaConf.select(self.config, self.config_path)
         skill_identifier = None
         skill_params = {}
         
@@ -1334,13 +1335,13 @@ If you can't solve the full problem, solve a simpler subset rather than failing 
             
         # Also check persona config for skill configuration
         if not skill_identifier and self.persona_key:
-            persona_config = self.config_node.get_value(self.persona_path)
+            persona_config = OmegaConf.select(self.config, self.persona_path)
             if persona_config and isinstance(persona_config, dict):
                 skill_identifier = persona_config.get('skill')
                 skill_params = persona_config.get('skill_params', {})
         
         # If a skill is configured and we're allowed to use skills in fallback mode
-        use_skills = self.config_node.get_value(f"{self.persona_path}.use_skills") or False
+        use_skills = OmegaConf.select(self.config, f"{self.persona_path}.use_skills") or False
         if skill_identifier and use_skills:
             self.logger.info("fallback_agent.using_skill", 
                           skill=skill_identifier, 

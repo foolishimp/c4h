@@ -15,7 +15,7 @@ from c4h_agents.agents.lineage_context import LineageContext # Correct import
 from c4h_agents.agents.base_llm import BaseLLM
 from c4h_agents.agents.continuation.continuation_handler import ContinuationHandler
 from c4h_agents.agents.types import AgentResponse, AgentMetrics, LLMProvider, LLMMessages, LogDetail, SkillResult
-from c4h_agents.config import create_config_node # Keep create_config_node
+from omegaconf import OmegaConf, DictConfig
 from c4h_agents.core.project import Project
 # Import get_logger and log_config_node from the correct utility path
 from c4h_agents.utils.logging import get_logger, log_config_node
@@ -28,7 +28,7 @@ class BaseAgent(BaseConfig, BaseLLM):
 
     # Corrected __init__ method:
     def __init__(self, full_effective_config: Dict[str, Any], unique_name: str):
-        # --- Step 1: Initialize BaseConfig FIRST to set up self.config and self.config_node ---
+        # --- Step 1: Initialize BaseConfig FIRST to set up self.config ---
         # BaseConfig now accepts the full config directly
         BaseConfig.__init__(self, config=full_effective_config)
 
@@ -75,7 +75,11 @@ class BaseAgent(BaseConfig, BaseLLM):
         
         # --- Step 7: Use persona configuration directly ---
         self.config_path = f"llm_config.agents.{agent_name}"
-        agent_config = self.config_node.get_value(self.config_path) or {}
+        agent_config = OmegaConf.select(self.config, self.config_path)
+        if isinstance(agent_config, DictConfig):
+            agent_config = OmegaConf.to_container(agent_config, resolve=True)
+        if not agent_config:
+            agent_config = {}
         
         # Get persona_key from task config - required for this approach
         self.persona_key = agent_config.get('persona_key')
@@ -83,7 +87,9 @@ class BaseAgent(BaseConfig, BaseLLM):
         # Handle skill agents that operate both as skills and agents
         # Look for the agent in skills config if it's not in agents
         if not self.persona_key:
-            skill_config = self.config_node.get_value(f"llm_config.skills.{agent_name}")
+            skill_config = OmegaConf.select(self.config, f"llm_config.skills.{agent_name}")
+            if isinstance(skill_config, DictConfig):
+                skill_config = OmegaConf.to_container(skill_config, resolve=True)
             if skill_config:
                 # This is a skill-based agent, use a default persona
                 self.logger.info(f"{agent_name}.init.skill_based_agent", 
@@ -103,7 +109,7 @@ class BaseAgent(BaseConfig, BaseLLM):
         self.persona_path = f"llm_config.personas.{self.persona_key}"
         
         # Verify persona exists
-        persona_config = self.config_node.get_value(self.persona_path)
+        persona_config = OmegaConf.select(self.config, self.persona_path)
         if not persona_config:
             self.logger.error(f"{agent_name}.init.persona_not_found", 
                              persona_key=self.persona_key, 
@@ -117,20 +123,20 @@ class BaseAgent(BaseConfig, BaseLLM):
         # --- Step 8: Resolve Provider, Model, Temperature primarily from persona ---
         # Use persona configuration as primary source with minimal fallbacks
         self.provider = LLMProvider(
-            self.config_node.get_value(f"{self.persona_path}.provider") or \
-            self.config_node.get_value("llm_config.default_provider") or \
+            OmegaConf.select(self.config, f"{self.persona_path}.provider") or \
+            OmegaConf.select(self.config, "llm_config.default_provider") or \
             "anthropic"  # Ultimate fallback
         )
         
         self.model = (
-            self.config_node.get_value(f"{self.persona_path}.model") or \
-            self.config_node.get_value(f"llm_config.providers.{self.provider.value}.default_model") or \
-            self.config_node.get_value("llm_config.default_model") or \
+            OmegaConf.select(self.config, f"{self.persona_path}.model") or \
+            OmegaConf.select(self.config, f"llm_config.providers.{self.provider.value}.default_model") or \
+            OmegaConf.select(self.config, "llm_config.default_model") or \
             "claude-3-opus-20240229"  # Ultimate fallback
         )
         
         # Temperature from persona
-        temp_val = self.config_node.get_value(f"{self.persona_path}.temperature")
+        temp_val = OmegaConf.select(self.config, f"{self.persona_path}.temperature")
         self.temperature = float(temp_val) if temp_val is not None else 0.0
 
         self.logger.debug(f"{agent_name}.init.resolved_settings",
@@ -142,11 +148,11 @@ class BaseAgent(BaseConfig, BaseLLM):
         # --- Step 9: Continuation settings from persona ---
         # Use persona config with defaults only as fallback
         self.max_continuation_attempts = (
-            self.config_node.get_value(f"{self.persona_path}.max_continuation_attempts") or 5  # Default value
+            OmegaConf.select(self.config, f"{self.persona_path}.max_continuation_attempts") or 5  # Default value
         )
         
         self.continuation_token_buffer = (
-            self.config_node.get_value(f"{self.persona_path}.continuation_token_buffer") or 1000  # Default value
+            OmegaConf.select(self.config, f"{self.persona_path}.continuation_token_buffer") or 1000  # Default value
         )
 
         # --- Step 10: Initialize metrics ---
@@ -154,9 +160,9 @@ class BaseAgent(BaseConfig, BaseLLM):
 
         # --- Step 11: Set logging detail level from persona ---
         log_level_str = (
-            self.config_node.get_value(f"{self.persona_path}.log_level") or
-            self.config_node.get_value("logging.agent_level") or 
-            self.config_node.get_value("logging.level") or 
+            OmegaConf.select(self.config, f"{self.persona_path}.log_level") or
+            OmegaConf.select(self.config, "logging.agent_level") or 
+            OmegaConf.select(self.config, "logging.level") or 
             "basic"
         )
         self.log_level = LogDetail.from_str(log_level_str)
@@ -164,7 +170,7 @@ class BaseAgent(BaseConfig, BaseLLM):
         # --- Step 12: Setup LiteLLM ---
         # _get_model_str uses self.provider/self.model resolved above
         self.model_str = self._get_model_str()
-        # _get_provider_config uses self.config_node
+        # _get_provider_config uses self.config
         self._setup_litellm(self._get_provider_config(self.provider))
 
         # --- Step 13: Finalize logger binding with run_id ---
@@ -204,13 +210,13 @@ class BaseAgent(BaseConfig, BaseLLM):
             Workflow run ID or None if not found
         """
         # Check hierarchical sources in order of priority
-        # Ensure self.config_node is used
+        # Ensure self.config is used with OmegaConf
         run_id = (
-            self.config_node.get_value("workflow_run_id") or
-            self.config_node.get_value("system.runid") or
-            self.config_node.get_value("runtime.workflow_run_id") or
-            self.config_node.get_value("runtime.run_id") or
-            self.config_node.get_value("runtime.workflow.id")
+            OmegaConf.select(self.config, "workflow_run_id") or
+            OmegaConf.select(self.config, "system.runid") or
+            OmegaConf.select(self.config, "runtime.workflow_run_id") or
+            OmegaConf.select(self.config, "runtime.run_id") or
+            OmegaConf.select(self.config, "runtime.workflow.id")
         )
 
         if run_id:
@@ -508,11 +514,11 @@ class BaseAgent(BaseConfig, BaseLLM):
         """Extracts primary data payload, ensuring it's a dictionary."""
         try:
             # Prioritize 'input_data' as the primary container
-            if 'input_data' in context and isinstance(context['input_data'], dict):
+            if 'input_data' in context and (isinstance(context['input_data'], dict) or isinstance(context['input_data'], DictConfig)):
                 self.logger.debug("_get_data: using 'input_data' key")
                 return context['input_data']
             # If input_data isn't a dict or doesn't exist, use the context itself if it's a dict
-            elif isinstance(context, dict):
+            elif isinstance(context, dict) or isinstance(context, DictConfig):
                 self.logger.debug("_get_data: using context as data (input_data missing or not dict)")
                 return context
             # Fallback: create a basic dict if context isn't suitable
@@ -549,10 +555,20 @@ class BaseAgent(BaseConfig, BaseLLM):
         
         # Try to get the persona key for this agent
         try:  
-            persona_key = self.config_node.get_value(f"orchestration.teams.*.tasks[?name={self.unique_name}].persona_key")
+            # OmegaConf doesn't support wildcard/query syntax, need to search manually
+            teams = OmegaConf.select(self.config, "orchestration.teams") or {}
+            persona_key = None
+            for team_name, team_config in teams.items():
+                tasks = team_config.get('tasks', [])
+                for task in tasks:
+                    if task.get('name') == self.unique_name:
+                        persona_key = task.get('persona_key')
+                        break
+                if persona_key:
+                    break
             if not persona_key:
                 # Also try the direct path in case it's configured there
-                persona_key = self.config_node.get_value(f"llm_config.agents.{self.unique_name}.persona_key")
+                persona_key = OmegaConf.select(self.config, f"llm_config.agents.{self.unique_name}.persona_key")
                 
                 if not persona_key:
                     self.logger.warning("_get_system_message.persona_key_not_found", 
@@ -561,28 +577,28 @@ class BaseAgent(BaseConfig, BaseLLM):
                     persona_key = "default"
                     
             # Next try persona configuration (normal path)
-            system_message = self.config_node.get_value(f"llm_config.personas.{persona_key}.prompts.system")
+            system_message = OmegaConf.select(self.config, f"llm_config.personas.{persona_key}.prompts.system")
             if system_message:
                 self.logger.debug("_get_system_message.using_persona_config", 
                                 persona_key=persona_key)
                 return str(system_message)
                 
             # Fallback to legacy agent config structure
-            system_message = self.config_node.get_value(f"llm_config.agents.{self.unique_name}.prompts.system")
+            system_message = OmegaConf.select(self.config, f"llm_config.agents.{self.unique_name}.prompts.system")
             if system_message:
                 self.logger.debug("_get_system_message.using_legacy_agent_config")
                 return str(system_message)
             
             # Try any self.persona_key if it exists on the instance
             if hasattr(self, 'persona_key') and self.persona_key:
-                alt_system_message = self.config_node.get_value(f"llm_config.personas.{self.persona_key}.prompts.system")
+                alt_system_message = OmegaConf.select(self.config, f"llm_config.personas.{self.persona_key}.prompts.system")
                 if alt_system_message:
                     self.logger.debug("_get_system_message.using_instance_persona_key", 
                                     persona_key=self.persona_key)
                     return str(alt_system_message)
             
             # Try default prompts location
-            default_system_message = self.config_node.get_value("llm_config.default_prompts.system")
+            default_system_message = OmegaConf.select(self.config, "llm_config.default_prompts.system")
             if default_system_message:
                 self.logger.debug("_get_system_message.using_default_prompts")
                 return str(default_system_message)
@@ -651,13 +667,13 @@ class BaseAgent(BaseConfig, BaseLLM):
         # If no direct prompt override was found, get from persona using prompt_key
         if prompt is None:
             persona_prompt_path = f"{self.persona_path}.prompts.{prompt_key}"
-            prompt = self.config_node.get_value(persona_prompt_path)
+            prompt = OmegaConf.select(self.config, persona_prompt_path)
             
             # Check for fallbacks if persona prompt isn't found
             if prompt is None:
                 # Try legacy prompt location (in agent config)
                 legacy_prompt_path = f"llm_config.agents.{self.unique_name}.prompts.{prompt_key}"
-                prompt = self.config_node.get_value(legacy_prompt_path)
+                prompt = OmegaConf.select(self.config, legacy_prompt_path)
                 
                 if prompt is not None:
                     self.logger.warning("prompt.using_legacy_location", 
@@ -667,7 +683,7 @@ class BaseAgent(BaseConfig, BaseLLM):
                 else:
                     # Try default prompts as last resort
                     default_prompt_path = f"llm_config.default_prompts.{prompt_key}"
-                    prompt = self.config_node.get_value(default_prompt_path)
+                    prompt = OmegaConf.select(self.config, default_prompt_path)
                     
                     if prompt is not None:
                         self.logger.warning("prompt.using_default_prompt", 
@@ -785,11 +801,15 @@ class BaseAgent(BaseConfig, BaseLLM):
         default_persona = "discovery_v1" # Prioritize discovery since it's most general
         
         # Check if the discovery persona exists
-        if self.config_node.get_value(f"llm_config.personas.{default_persona}"):
+        if OmegaConf.select(self.config, f"llm_config.personas.{default_persona}"):
             return default_persona
             
         # Next try to find any valid persona
-        persona_keys = self.config_node.get_keys("llm_config.personas") or []
+        # OmegaConf doesn't have get_keys, need to get the dict and extract keys
+        personas = OmegaConf.select(self.config, "llm_config.personas") or {}
+        if isinstance(personas, DictConfig):
+            personas = OmegaConf.to_container(personas, resolve=True)
+        persona_keys = list(personas.keys()) if isinstance(personas, dict) else []
         if persona_keys:
             # Use the first available persona
             return persona_keys[0]
@@ -855,7 +875,9 @@ class BaseAgent(BaseConfig, BaseLLM):
             never raises exceptions for expected failure conditions)
         """
         # 1. Attempt to locate the skill configuration
-        skill_config = self.config_node.get_value(f"llm_config.skills.{skill_name}")
+        skill_config = OmegaConf.select(self.config, f"llm_config.skills.{skill_name}")
+        if isinstance(skill_config, DictConfig):
+            skill_config = OmegaConf.to_container(skill_config, resolve=True)
         if not skill_config:
             error_msg = f"Skill '{skill_name}' not found in llm_config.skills configuration"
             self.logger.error("_invoke_skill.skill_not_found", skill_name=skill_name)
@@ -932,7 +954,9 @@ class BaseAgent(BaseConfig, BaseLLM):
             skill_full_config['llm_config']['agents'] = {}
         
         # Set a persona_key for the skill if it doesn't have one
-        agent_config = self.config_node.get_value(f"llm_config.agents.{skill_name}")
+        agent_config = OmegaConf.select(self.config, f"llm_config.agents.{skill_name}")
+        if isinstance(agent_config, DictConfig):
+            agent_config = OmegaConf.to_container(agent_config, resolve=True)
         if not agent_config or 'persona_key' not in agent_config:
             self.logger.debug("_invoke_skill.setting_persona_for_skill",
                             skill_name=skill_name,
@@ -1026,12 +1050,12 @@ class BaseAgent(BaseConfig, BaseLLM):
         """
         try:
             # Prioritize 'input_data' as the primary container
-            if 'input_data' in context and isinstance(context['input_data'], dict):
+            if 'input_data' in context and (isinstance(context['input_data'], dict) or isinstance(context['input_data'], DictConfig)):
                 self.logger.debug("_extract_data_from_context: using 'input_data' key")
                 return context['input_data']
                 
             # If input_data isn't a dict or doesn't exist, use the context itself
-            if isinstance(context, dict):
+            if isinstance(context, dict) or isinstance(context, DictConfig):
                 self.logger.debug("_extract_data_from_context: using context as data (input_data missing or not dict)")
                 return context
                 

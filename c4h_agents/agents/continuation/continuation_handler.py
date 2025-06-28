@@ -5,6 +5,7 @@ import traceback
 import logging # Keep standard logging for fallback
 
 import litellm
+from omegaconf import OmegaConf
 # Import the central logger utility
 from c4h_agents.utils.logging import get_logger
 from .config import WINDOW_CONFIG, STITCHING_STRATEGIES, requires_json_cleaning
@@ -262,7 +263,7 @@ Begin your response now with the exact overlap text and continue:
                  provider_config = self.parent._get_provider_config(self.provider)
             elif hasattr(self.parent, 'config_node') and self.provider: 
                  if self.parent.config_node:
-                      provider_config = self.parent.config_node.get_value(f"llm_config.providers.{self.provider.value}") or {}
+                      provider_config = OmegaConf.select(self.parent.config_node, f"llm_config.providers.{self.provider.value}") or {}
 
 
             params.update(provider_config.get("model_params", {}))
@@ -275,7 +276,7 @@ Begin your response now with the exact overlap text and continue:
                  config_node_to_use = getattr(self.parent, 'config_node', None)
                  agent_thinking_config = None
                  if config_node_to_use:
-                      agent_thinking_config = config_node_to_use.get_value(f"{agent_path}.extended_thinking")
+                      agent_thinking_config = OmegaConf.select(config_node_to_use, f"{agent_path}.extended_thinking")
                  if not agent_thinking_config:
                       agent_thinking_config = provider_config.get("extended_thinking", {})
                  if agent_thinking_config and agent_thinking_config.get("enabled", False) is True:

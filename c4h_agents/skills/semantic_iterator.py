@@ -9,8 +9,6 @@ import json
 import re
 from c4h_agents.skills.base_skill import BaseSkill, SkillProtocol
 from c4h_agents.agents.types import SkillResult
-# Ensure locate_config is imported if needed, or rely on BaseAgent's config handling
-from c4h_agents.config import locate_config 
 from c4h_agents.agents.base_agent import BaseAgent, AgentResponse 
 from c4h_agents.skills.shared.types import ExtractConfig
 from c4h_agents.skills._semantic_fast import FastExtractor, FastItemIterator

@@ -7,7 +7,6 @@ from typing import Dict, Any, Optional
 from c4h_agents.agents.base_agent import BaseAgent, AgentResponse 
 from c4h_agents.skills.shared.types import ExtractConfig
 import json
-from c4h_agents.config import locate_config
 from c4h_agents.utils.logging import get_logger
 
 # Get a logger for the non-class components
@@ -190,8 +189,8 @@ class SlowExtractor(BaseAgent):
         
         # The unique_name is now stored by BaseAgent
         
-        # Get our config section
-        slow_cfg = locate_config(self.config or {}, self._get_agent_name())
+        # Get our config section using inherited method
+        slow_cfg = self._get_agent_config()  # Gets llm_config.agents.semantic_slow_extractor
         
         # Validate template at initialization
         template = self._get_prompt('extract')

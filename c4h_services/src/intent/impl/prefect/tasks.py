@@ -8,9 +8,7 @@ import importlib
 import yaml
 import operator
 import os
-import json
 import re
-from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import time
 import copy
@@ -20,9 +18,9 @@ from c4h_agents.agents.base_agent import BaseAgent
 from c4h_agents.skills.semantic_iterator import SemanticIterator
 from c4h_agents.skills.shared.types import ExtractConfig
 from c4h_agents.lineage.event_logger import EventLogger, EventType
-from c4h_agents.config import create_config_node, deep_merge, load_config, load_persona_config, render_config, get_available_personas
-from c4h_services.src.utils.config_utils import validate_config_fragment, validate_config_fragments, ConfigValidationError
-from .models import AgentTaskConfig, EffectiveConfigInfo
+from omegaconf import OmegaConf
+from c4h_services.src.utils.config_utils import validate_config_fragment
+from .models import AgentTaskConfig
 
 logger = get_logger()
 
@@ -115,7 +113,7 @@ def run_agent_task(
         
         # Create configuration node for context
         try:
-            context_node = create_config_node(context_copy)
+            context_node = OmegaConf.create(context_copy)
         except Exception as e:
             error_msg = f"Failed to create context node: {str(e)}"
             prefect_logger.error(error_msg)
@@ -130,7 +128,7 @@ def run_agent_task(
         
         # Get run ID for tracking and lineage
         try:
-            run_id = context_node.get_value("workflow_run_id") or str(flow_run.get_id())
+            run_id = OmegaConf.select(context_node, "workflow_run_id") or str(flow_run.get_id())
         except Exception as e:
             prefect_logger.error(f"Failed to get run_id: {str(e)}")
             run_id = str(flow_run.get_id())
@@ -178,8 +176,8 @@ def run_agent_task(
         event_logger = None
         try:
             # Create config node for effective config - not context!
-            config_node = create_config_node(effective_config_copy)
-            lineage_config = config_node.get_value("llm_config.agents.lineage", {})
+            config_node = OmegaConf.create(effective_config_copy)
+            lineage_config = OmegaConf.select(config_node, "llm_config.agents.lineage") or {}
             if lineage_config and lineage_config.get("enabled", True):
                 try:
                     # Initialize event logger
@@ -202,7 +200,7 @@ def run_agent_task(
         # First check if we have a persona key
         if persona_key:
             # config_node already created above for effective_config_copy
-            persona_config = config_node.get_value(f"llm_config.personas.{persona_key}")
+            persona_config = OmegaConf.select(config_node, f"llm_config.personas.{persona_key}")
             if persona_config:
                 prefect_logger.info(f"Found persona config for persona key: {persona_key}")
                 merged_config.update(copy.deepcopy(persona_config))
@@ -211,7 +209,7 @@ def run_agent_task(
         agent_name = task_config_copy.get("name")
         if agent_name:
             # config_node already created above for effective_config_copy
-            agent_config = config_node.get_value(f"llm_config.agents.{agent_name}")
+            agent_config = OmegaConf.select(config_node, f"llm_config.agents.{agent_name}")
             if agent_config:
                 prefect_logger.info(f"Found agent config for agent: {agent_name}")
                 merged_config.update(copy.deepcopy(agent_config))
@@ -326,205 +324,6 @@ def run_agent_task(
         
         return error_response
 
-@task(retries=1, retry_delay_seconds=5)
-def materialise_config(
-    context: Dict[str, Any],
-    system_config_path: Path,
-    workspace_dir: Optional[Path] = None,
-    strict_validation: bool = False
-) -> EffectiveConfigInfo:
-    """
-    Generate and persist an effective configuration snapshot after merging all fragments.
-    Validates each configuration fragment against its corresponding schema.
-    
-    Args:
-        context: Job context that may contain config fragments and persona keys
-        system_config_path: Path to base system configuration
-        workspace_dir: Optional directory to store the snapshot (defaults to workspaces/{run_id})
-        strict_validation: If True, validation errors will halt processing; 
-                          if False, validation errors will be logged but processing will continue
-    
-    Returns:
-        Information about the effective configuration including snapshot path
-    """
-    prefect_logger = get_run_logger()
-    try:
-        # Determine workspace directory
-        if workspace_dir is None:
-            run_id = str(flow_run.get_id())
-            workspace_dir = Path("workspaces") / run_id
-        
-        # Create directory if it doesn't exist
-        workspace_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Load system config as base
-        prefect_logger.info(f"Loading system config from: {system_config_path}")
-        system_config = load_config(system_config_path)
-
-        # Determine the personas directory path from system_config
-        personas_base_path = None
-        if "config_locations" in system_config and "personas_dir" in system_config["config_locations"]:
-            # Get the relative personas path from config
-            relative_personas_dir = system_config["config_locations"]["personas_dir"]
-            # Calculate the absolute path based on system_config location
-            personas_base_path = system_config_path.parent / relative_personas_dir
-            prefect_logger.info(f"Using personas directory from config: {personas_base_path}")
-        else:
-            # Fallback to default location
-            personas_base_path = system_config_path.parent / "personas"
-            prefect_logger.warning(f"config_locations.personas_dir not found in system config, using default: {personas_base_path}")
-            
-        # Extract all config fragments including job-specific ones
-        config_fragments = [system_config]
-        fragment_sources = ["system"]
-        
-        # Scan for all available personas first to enable reporting on what's available
-        available_personas = get_available_personas(personas_base_path)
-        logger.info("personas.available", 
-                    count=len(available_personas),
-                    persona_keys=list(available_personas.keys()))
-        prefect_logger.info(f"Found {len(available_personas)} personas available")
-        
-        # Create a set to track loaded personas (avoid duplicate loading)
-        loaded_personas = set()
-        persona_configs = {}
-        
-        # Check for team-level persona specifications (one level up from tasks)
-        if "teams" in context:
-            for team_id, team_config in context.get("teams", {}).items():
-                if isinstance(team_config, dict):
-                    # Check for team-level persona_key
-                    if "persona_key" in team_config:
-                        persona_key = team_config["persona_key"]
-                        prefect_logger.info(f"Loading team-level persona config for team {team_id}: {persona_key}")
-                        
-                        if persona_key not in loaded_personas:
-                            persona_config = load_persona_config(persona_key, personas_base_path)
-                            if persona_config:
-                                persona_configs[persona_key] = persona_config
-                                loaded_personas.add(persona_key)
-                    
-                    # Look for task-level persona_keys in this team
-                    if "tasks" in team_config and isinstance(team_config["tasks"], list):
-                        for task in team_config["tasks"]:
-                            if isinstance(task, dict) and "persona_key" in task:
-                                persona_key = task["persona_key"]
-                                prefect_logger.info(f"Loading task-level persona config for task in team {team_id}: {persona_key}")
-                                
-                                if persona_key not in loaded_personas:
-                                    persona_config = load_persona_config(persona_key, personas_base_path)
-                                    if persona_config:
-                                        persona_configs[persona_key] = persona_config
-                                        loaded_personas.add(persona_key)
-        
-        # Check task-level persona_keys in the context (flat list)
-        if "tasks" in context:
-            for task in context.get("tasks", []):
-                if isinstance(task, dict) and "persona_key" in task:
-                    persona_key = task["persona_key"]
-                    prefect_logger.info(f"Loading persona config for task: {persona_key}")
-                    
-                    if persona_key not in loaded_personas:
-                        persona_config = load_persona_config(persona_key, personas_base_path)
-                        if persona_config:
-                            persona_configs[persona_key] = persona_config
-                            loaded_personas.add(persona_key)
-                            
-        # Check for explicit persona override in the context
-        if "persona_key" in context:
-            persona_key = context["persona_key"]
-            prefect_logger.info(f"Loading explicit persona config from context: {persona_key}")
-            
-            if persona_key not in loaded_personas:
-                persona_config = load_persona_config(persona_key, personas_base_path)
-                if persona_config:
-                    persona_configs[persona_key] = persona_config
-                    loaded_personas.add(persona_key)
-                    
-        # Add all loaded personas to the fragments list
-        for persona_key, persona_config in persona_configs.items():
-            config_fragments.append(persona_config)
-            fragment_sources.append(f"persona_{persona_key}")
-            logger.info("persona.added_to_fragments", 
-                        persona_key=persona_key,
-                        config_keys=list(persona_config.keys()))
-            prefect_logger.info(f"Added persona {persona_key} to configuration fragments")
-        
-        # Add job-specific config as final override
-        if "config" in context:
-            config_fragments.append(context["config"])
-            fragment_sources.append("job")
-        
-        # Create schema mapping for validation
-        schema_map = {}
-        for i, source in enumerate(fragment_sources):
-            if source == "system":
-                schema_map[i] = "system"
-            elif source.startswith("persona_"):
-                schema_map[i] = "persona"
-            elif source == "job":
-                schema_map[i] = "job"
-        
-        # Validate all config fragments against their respective schemas
-        prefect_logger.info(f"Validating {len(config_fragments)} configuration fragments")
-        validation_results = validate_config_fragments(
-            config_fragments, 
-            schema_map,
-            strict=strict_validation
-        )
-        
-        # Determine overall validation success
-        schema_validated = all(success for success, _ in validation_results.values())
-        if not schema_validated:
-            # Log all validation errors
-            error_count = sum(1 for success, _ in validation_results.values() if not success)
-            failures = [(idx, error) for idx, (success, error) in validation_results.items() if not success]
-            prefect_logger.warning(f"Configuration validation had {error_count} failures", failures=failures)
-            
-            # In strict mode, this would have already raised an exception
-            if strict_validation:
-                raise RuntimeError("Configuration validation failed in strict mode")
-                
-            # In non-strict mode, we continue despite validation errors
-            prefect_logger.info("Continuing with snapshot generation despite validation errors")
-        
-        # Get Prefect run ID for snapshot path
-        run_id = str(flow_run.get_id())
-        prefect_logger.info(f"Creating config snapshot for run: {run_id}")
-        
-        # Generate the effective configuration snapshot
-        snapshot_path = render_config(
-            fragments=config_fragments,
-            run_id=run_id,
-            workdir=workspace_dir
-        )
-        
-        prefect_logger.info(f"Effective configuration snapshot saved to: {snapshot_path}")
-        
-        # Create fragment metadata for lineage tracking
-        fragment_metadata = [
-            {
-                "source": source,
-                "schema": schema_map.get(i),
-                "validated": validation_results.get(i, (False, "Not validated"))[0] if i in validation_results else False,
-                "size": len(json.dumps(fragment)) if fragment else 0
-            }
-            for i, (source, fragment) in enumerate(zip(fragment_sources, config_fragments))
-        ]
-        
-        # Return detailed information about the effective configuration
-        return EffectiveConfigInfo(
-            snapshot_path=snapshot_path,
-            fragments_count=len(config_fragments),
-            run_id=run_id,
-            schema_validated=schema_validated,
-            fragment_metadata=fragment_metadata
-        )
-        
-    except Exception as e:
-        error_msg = f"Failed to materialize config: {str(e)}"
-        prefect_logger.error(error_msg)
-        raise RuntimeError(error_msg)
 
 @task(name="evaluate_routing")
 def evaluate_routing_task(
@@ -556,10 +355,10 @@ def evaluate_routing_task(
     
     try:
         # Create config node for accessing the effective config
-        config_node = create_config_node(effective_config)
+        config_node = OmegaConf.create(effective_config)
         
         # Look up routing configuration for the team
-        routing_config = config_node.get_value(f"orchestration.teams.{team_id}.routing")
+        routing_config = OmegaConf.select(config_node, f"orchestration.teams.{team_id}.routing")
         if not routing_config:
             prefect_logger.warning(f"No routing configuration found for team: {team_id}")
             return {"next_team_id": None, "context_updates": {}}

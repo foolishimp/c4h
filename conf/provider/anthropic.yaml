@@ -1,0 +1,31 @@
+anthropic:
+  api_base: "https://api.anthropic.com"
+  context_length: 200000
+  env_var: "ANTHROPIC_API_KEY"
+  default_model: "claude-3-5-sonnet-20241022"
+  valid_models:
+    - "claude-3-7-sonnet-20250219"
+    - "claude-3-5-sonnet-20241022"
+    - "claude-3-5-haiku-20241022"
+    - "claude-3-opus-20240229"
+    - "claude-3-sonnet-20240229"
+    - "claude-3-haiku-20240307"
+  extended_thinking:
+    enabled: false
+    budget_tokens: 32000
+    min_budget_tokens: 1024
+    max_budget_tokens: 128000
+  litellm_params:
+    vertex_project: "{YOUR_GCP_PROJECT_ID}" # Replace with your project ID
+    vertex_location: "{YOUR_GCP_REGION}"   # Replace with your region (e.g., us-central1)
+    retry: true
+    max_retries: 5
+    timeout: 30
+    rate_limit_policy:
+      tokens: 8000
+      requests: 50
+      period: 60
+    backoff:
+      initial_delay: 1
+      max_delay: 30
+      exponential: true

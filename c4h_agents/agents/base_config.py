@@ -10,8 +10,8 @@ from datetime import datetime
 from functools import wraps
 import time
 
+from omegaconf import DictConfig, OmegaConf
 from c4h_agents.core.project import Project, ProjectPaths
-from c4h_agents.config import ConfigNode, create_config_node, locate_config, get_value
 from c4h_agents.utils.logging import get_logger
 from .types import LogDetail, LLMProvider
 
@@ -36,17 +36,23 @@ def log_operation(operation_name: str):
 class BaseConfig:
     """Configuration management for agent implementations"""
     
-    def __init__(self, config: Dict[str, Any] = None, project: Optional[Project] = None):
+    def __init__(self, config: Union[Dict[str, Any], DictConfig] = None, project: Optional[Project] = None):
         """Initialize configuration and project context"""
-        self.config = config or {}
-        self.config_node = create_config_node(self.config)
+        # Convert dict to DictConfig if needed
+        if config is None:
+            self.config = OmegaConf.create({})
+        elif isinstance(config, dict):
+            self.config = OmegaConf.create(config)
+        else:
+            self.config = config
+        
         self.project = project
         
         if self.project:
             self.ensure_paths()
 
         # Set logging detail level from config
-        log_level = self.config_node.get_value("logging.agent_level") or "basic"
+        log_level = OmegaConf.select(self.config, "logging.agent_level", default="basic")
         self.log_level = LogDetail.from_str(log_level)
         
         # Initialize metrics with project context
@@ -75,33 +81,34 @@ class BaseConfig:
     def lookup(self, path: str) -> Any:
         """
         Lookup a value in the full configuration using a hierarchical path.
-        Supports dot notation (e.g., "system.runid") and wildcards.
+        Supports dot notation (e.g., "system.runid").
         """
-        return self.config_node.get_value(path)
+        return OmegaConf.select(self.config, path)
 
-    def get_agent_node(self) -> ConfigNode:
+    def get_agent_config(self) -> DictConfig:
         """
-        Get configuration node for this agent's section.
+        Get configuration for this agent's section.
         Provides relative path access for agent-specific configuration.
         """
         agent_name = self._get_agent_name()
         agent_path = f"llm_config.agents.{agent_name}"
-        return self.config_node.get_node(agent_path)
+        return OmegaConf.select(self.config, agent_path, default=OmegaConf.create({}))
 
     def _get_runtime_config(self) -> Dict[str, Any]:
         """Get runtime configuration section"""
-        runtime_node = self.config_node.get_node("runtime")
-        return runtime_node.data or {}
+        runtime_config = OmegaConf.select(self.config, "runtime", default={})
+        return OmegaConf.to_container(runtime_config) if runtime_config else {}
 
     def _get_lineage_config(self) -> Dict[str, Any]:
         """Get lineage configuration section"""
         runtime_config = self._get_runtime_config()
-        lineage_config = self.config_node.get_value("runtime.lineage") or {}
+        lineage_config = OmegaConf.select(self.config, "runtime.lineage", default={})
+        lineage_dict = OmegaConf.to_container(lineage_config) if lineage_config else {}
         logger.debug("config.lineage_loaded", 
                     agent=self._get_agent_name(), 
-                    enabled=lineage_config.get('enabled', False), 
-                    config_keys=list(lineage_config.keys()))
-        return lineage_config
+                    enabled=lineage_dict.get('enabled', False), 
+                    config_keys=list(lineage_dict.keys()))
+        return lineage_dict
 
     """
     Update the _get_provider_config method to fix the rate limit handling.
@@ -111,8 +118,8 @@ class BaseConfig:
     def _get_provider_config(self, provider: LLMProvider) -> Dict[str, Any]:
         """Get provider-specific configuration with correct retry handling"""
         try:
-            provider_node = self.config_node.get_node(f"llm_config.providers.{provider.value}")
-            provider_config = provider_node.data or {}
+            provider_cfg = OmegaConf.select(self.config, f"llm_config.providers.{provider.value}", default={})
+            provider_config = OmegaConf.to_container(provider_cfg) if provider_cfg else {}
             
             # Handle default retry configuration
             litellm_params = provider_config.get("litellm_params", {})
@@ -161,8 +168,8 @@ class BaseConfig:
         Get this agent's configuration section.
         Uses hierarchical path lookup for reliable access.
         """
-        agent_node = self.get_agent_node()
-        return agent_node.data or {}
+        agent_config = self.get_agent_config()
+        return OmegaConf.to_container(agent_config) if agent_config else {}
 
     def _resolve_model(self, explicit_model: Optional[str], provider_config: Dict[str, Any]) -> str:
         """Resolve model name using hierarchical config lookup"""
@@ -235,9 +242,9 @@ class BaseConfig:
         """
         try:
             agent_name = self._get_agent_name()
-            agent_node = self.config_node.get_node(f"llm_config.agents.{agent_name}")
+            agent_config = OmegaConf.select(self.config, f"llm_config.agents.{agent_name}", default={})
             
-            return "execution_plan" in agent_node.data and isinstance(agent_node.data["execution_plan"], dict)
+            return agent_config and "execution_plan" in agent_config and isinstance(agent_config.execution_plan, (dict, DictConfig))
         except Exception:
             return False
     
@@ -253,7 +260,8 @@ class BaseConfig:
             
         try:
             agent_name = self._get_agent_name()
-            return self.config_node.get_value(f"llm_config.agents.{agent_name}.execution_plan")
+            execution_plan = OmegaConf.select(self.config, f"llm_config.agents.{agent_name}.execution_plan")
+            return OmegaConf.to_container(execution_plan) if execution_plan else None
         except Exception as e:
             logger.error("config.get_execution_plan.failed", 
                        agent=agent_name if 'agent_name' in locals() else "unknown",

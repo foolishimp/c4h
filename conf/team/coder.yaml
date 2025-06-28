@@ -1,0 +1,16 @@
+name: "Coder Team"
+tasks:
+  - name: "coding_phase" # Unique instance name
+    # Use GenericOrchestratorAgent to use the execution plan
+    agent_type: "GenericOrchestratorAgent"
+    persona_key: "coder_v1" # References personas/coder_v1.yml with execution_plan
+    description: "Implement code changes based on solution design" # Optional description
+    requires_approval: false
+    max_retries: 1
+    agent_config:
+      # Configuration for the semantic_iterator skill
+      semantic_iterator:
+        persona_key: "discovery_v1"
+routing:
+  # End workflow after coder team completes
+  default: null
