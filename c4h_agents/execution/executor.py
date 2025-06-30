@@ -15,7 +15,7 @@ from enum import Enum
 import structlog
 
 from c4h_agents.lineage.event_logger import EventLogger, EventType
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
 from c4h_agents.skills.registry import SkillRegistry
 
 # Configure logger
@@ -248,24 +248,33 @@ class ExecutionPlanExecutor:
                 # Also update the context with step result output if output_field is specified
                 output_field = step.get("output_field")
                 if output_field and step_result.output:
+                    # For LLM calls, extract the response content directly
+                    output_value = step_result.output
+                    if (step.get("type") == "llm_call" and 
+                        isinstance(output_value, dict) and 
+                        "response" in output_value):
+                        output_value = output_value["response"]
+                    
                     # Create a new context with the updated value
                     current_context = self._set_context_value(
                         current_context, 
                         output_field, 
-                        step_result.output
+                        output_value
                     )
                     self.logger.debug("step.updated_context", 
                                    step_name=step_name,
-                                   output_field=output_field)
+                                   output_field=output_field,
+                                   value_type=type(output_value).__name__)
                 
                 # Handle special actions from the step result
                 if step_result.action:
                     if step_result.action == StepAction.EXIT_PLAN_WITH_SUCCESS:
                         self.logger.info("step.exit_with_success", 
                                       step_name=step_name)
+                        # WO-BUGFIX-1: Return empty context for special actions too
                         return ExecutionResult(
                             success=True,
-                            context=current_context,
+                            context={},  # Empty dict instead of current_context
                             output={
                                 "results": results,
                                 "execution_path": execution_path
@@ -275,9 +284,10 @@ class ExecutionPlanExecutor:
                         self.logger.info("step.exit_with_failure", 
                                       step_name=step_name,
                                       error=step_result.error)
+                        # WO-BUGFIX-1: Return empty context for special actions too
                         return ExecutionResult(
                             success=False,
-                            context=current_context,
+                            context={},  # Empty dict instead of current_context
                             output={
                                 "results": results,
                                 "execution_path": execution_path
@@ -303,9 +313,10 @@ class ExecutionPlanExecutor:
                 
                 # Check if we should stop on failure
                 if step.get("stop_on_failure", True):
+                    # WO-BUGFIX-1: Return empty context on failure as well
                     return ExecutionResult(
                         success=False,
-                        context=current_context,
+                        context={},  # Empty dict instead of current_context
                         output={
                             "results": results,
                             "execution_path": execution_path
@@ -326,18 +337,48 @@ class ExecutionPlanExecutor:
             current_context["execution_metadata"]["end_time"] = datetime.now(timezone.utc).isoformat()
             current_context["execution_metadata"]["steps_executed"] = len(execution_path)
             
-        # Extract output - prefer 'results' over 'response'
-        output = None
-        if "results" in current_context:
-            output = current_context["results"]
-        elif "response" in current_context:
-            output = current_context["response"]
-            
+        # WO-BUGFIX-2: Extract only explicitly generated output data
+        # The output should contain ONLY data that was explicitly set by the execution plan
+        output = {}
+        
+        # Method 1: Look for fields that were set via output_field in steps
+        # We need to check ALL steps, not just executed ones, since we want to know
+        # which fields were intended as outputs
+        output_fields_defined = set()
+        for step in steps:
+            if step.get("output_field"):
+                output_fields_defined.add(step["output_field"])
+        
+        # Collect data from identified output fields that exist in context
+        for field in output_fields_defined:
+            if field in current_context:
+                output[field] = current_context[field]
+                self.logger.debug("execute_plan.collected_output_field",
+                                field=field,
+                                has_value=field in current_context)
+        
+        # Method 2: If no explicit output fields were collected, check standard fields
+        # This maintains backward compatibility
+        if not output:
+            # Check standard output collection fields
+            if "results" in current_context:
+                output = {"results": current_context["results"]}
+            elif "response" in current_context:
+                output = {"response": current_context["response"]}
+            elif "result_data" in current_context:
+                output = {"result_data": current_context["result_data"]}
+        
+        self.logger.info("execute_plan.final_output",
+                        output_keys=list(output.keys()) if output else [],
+                        output_size=len(str(output)) if output else 0)
+        
+        # WO-BUGFIX-2: Return empty context to prevent data accumulation
+        # Only the explicitly generated output is returned
         return ExecutionResult(
             success=True,
-            context=current_context,
+            context={},  # Empty dict - no context leakage
             output=output,
-            steps_executed=len(execution_path)
+            steps_executed=len(results)  # Use results length, not execution_path
         )
     
     def _execute_step(
@@ -434,7 +475,16 @@ class ExecutionPlanExecutor:
             )
         
         # Prepare skill parameters
-        params = self._prepare_parameters(step.get("params", {}), context)
+        raw_params = step.get("params", {})
+        params = self._prepare_parameters(raw_params, context)
+        
+        # Log template interpolation details for debugging
+        if raw_params != params:
+            self.logger.debug("skill_call.parameters_interpolated",
+                           step_name=step_name,
+                           skill=skill_name,
+                           raw_params=raw_params,
+                           interpolated_params=params)
         
         self.logger.info("skill_call.executing", 
                       step_name=step_name,
@@ -1199,12 +1249,34 @@ class ExecutionPlanExecutor:
             
             # Create messages array with system message if provided
             messages = []
+            formatted_system = None
             if system_message:
                 formatted_system = self._format_template(system_message, context)
                 messages.append({"role": "system", "content": formatted_system})
             
             # Add user message with formatted prompt
             messages.append({"role": "user", "content": formatted_prompt})
+            
+            # Log the full interpolated prompt to lineage
+            # Note: We log after creating messages so we have the actual interpolated content
+            if self.event_logger:
+                llm_input_payload = {
+                    "step_name": step_name,
+                    "step_type": "llm_call",
+                    "provider": provider_name,
+                    "model": model_name,
+                    "temperature": temperature,
+                    "messages": messages,  # This contains the actual interpolated content
+                    "prompt_template": prompt,  # Original template for reference
+                    "system_template": system_message,  # Original template for reference
+                    "interpolated_prompt": formatted_prompt,
+                    "interpolated_system": formatted_system
+                }
+                
+                self.event_logger.log_event(
+                    event_type=EventType.LLM_INPUT,
+                    payload=llm_input_payload
+                )
             
             # Create BaseLLM instance
             llm = BaseLLM()
@@ -1309,6 +1381,22 @@ class ExecutionPlanExecutor:
                                       completion_tokens=output["usage"]["completion_tokens"],
                                       prompt_tokens=output["usage"]["prompt_tokens"],
                                       total_tokens=output["usage"]["total_tokens"])
+                    
+                    # Log the LLM output to lineage
+                    if self.event_logger:
+                        llm_output_payload = {
+                            "step_name": step_name,
+                            "step_type": "llm_call",
+                            "provider": provider_name,
+                            "model": model_name,
+                            "response": content,
+                            "usage": output.get("usage", {})
+                        }
+                        
+                        self.event_logger.log_event(
+                            event_type=EventType.LLM_OUTPUT,
+                            payload=llm_output_payload
+                        )
                     
                     self.logger.info("llm_call.completed",
                                   step_name=step_name,
@@ -2031,7 +2119,12 @@ class ExecutionPlanExecutor:
                 return value
         
         # Handle dictionaries (recursively resolve any template strings in values)
-        if isinstance(value, dict):
+        # Note: DictConfig from OmegaConf is not a dict subclass, so check both
+        if isinstance(value, (dict, DictConfig)):
+            # Convert DictConfig to regular dict for processing
+            if isinstance(value, DictConfig):
+                value = OmegaConf.to_container(value, resolve=True)
+            
             result = {}
             for k, v in value.items():
                 # Process the key if it's a template
@@ -2332,6 +2425,10 @@ class ExecutionPlanExecutor:
         if not params:
             return {}
             
+        self.logger.debug("prepare_parameters.starting",
+                       param_keys=list(params.keys()) if params else [],
+                       context_has_workflow_run_id='workflow_run_id' in context)
+            
         # Create a deep copy to avoid modifying the original
         result = copy.deepcopy(params)
         
@@ -2339,9 +2436,19 @@ class ExecutionPlanExecutor:
         for key, value in result.items():
             if isinstance(value, str):
                 # Apply template substitution for strings
+                original = value
                 result[key] = self._format_template(value, context)
-            elif isinstance(value, dict):
-                # Recursively process dictionaries
+                if original != result[key]:
+                    self.logger.debug("prepare_parameters.string_interpolated",
+                                   key=key,
+                                   original=original,
+                                   result=result[key])
+            elif isinstance(value, (dict, DictConfig)):
+                # Recursively process dictionaries (including OmegaConf DictConfig)
+                self.logger.debug("prepare_parameters.processing_nested_dict",
+                               key=key,
+                               value_type=type(value).__name__,
+                               nested_keys=list(value.keys()))
                 result[key] = self._prepare_parameters(value, context)
             elif isinstance(value, list):
                 # Process list items
@@ -2376,6 +2483,12 @@ class ExecutionPlanExecutor:
         pattern = r'\{\{(context\.[^}]+)\}\}'
         matches = re.findall(pattern, template)
         
+        if matches:
+            self.logger.debug("template.interpolation_starting",
+                           template=template,
+                           matches=matches,
+                           context_keys=list(context.keys()))
+        
         result = template
         for match in matches:
             # Extract the path
@@ -2383,6 +2496,12 @@ class ExecutionPlanExecutor:
             
             # Get the value from context
             value = self._get_context_value(context, path)
+            
+            # Log what we found
+            self.logger.debug("template.variable_lookup",
+                           path=path,
+                           value=value,
+                           found=value is not None)
             
             # Convert value to string for substitution
             if value is None:
@@ -2397,5 +2516,10 @@ class ExecutionPlanExecutor:
             
             # Replace in the template
             result = result.replace(f"{{{{{match}}}}}", value_str)
+        
+        if matches and result != template:
+            self.logger.debug("template.interpolation_complete",
+                           original=template,
+                           result=result)
         
         return result

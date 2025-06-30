@@ -1,0 +1,29 @@
+# Basic test configuration for Hydra - minimal viable test
+
+workorder:
+  project:
+    path: "./tests/test_projects/"
+    workspace_root: "workspaces"
+  intent:
+    description: |
+      Test basic Hydra configuration
+
+# Override discovery team to skip execution plan requirement
+orchestration:
+  teams:
+    discovery:
+      name: "Basic Test Team"
+      tasks:
+        - name: "basic_test"
+          agent_type: "GenericLLMAgent"
+          persona_key: "discovery_v1"
+          description: "Basic test agent"
+          # Add a dummy execution plan to satisfy the requirement
+          execution_plan:
+            enabled: true
+            steps:
+              - name: "test_step"
+                skill: "noop"
+                description: "Test step"
+      routing:
+        default: null  # End after discovery

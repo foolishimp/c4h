@@ -25,3 +25,23 @@ prompts:
     4. Available functionality
     
     Your analysis will be used to inform code changes and recommendations.
+
+# Add execution plan for the new execution system
+execution_plan:
+  enabled: true
+  steps:
+    - name: "run_tartxt"
+      type: "skill_call"
+      skill: "command_line_runner"
+      description: "Execute tartxt to analyze project structure"
+      params:
+        command_line: "python -m c4h_agents.skills.tartxt"
+        command_args:
+          positional_args: ["{{context.project.path}}"]
+          exclude: "**/node_modules/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/package-lock.json,**/dist/**,**/.DS_Store,**/README.md,**/workspaces/**,**/backup_txt/**"
+          history: 0
+          file: "{{context.workflow_run_id}}_project_scan.txt"
+        working_dir: "{{context.project.path}}"
+        output_to_file: true
+        # Explicitly disable project_path injection
+        skip_auto_args: true

@@ -30,8 +30,12 @@ logger = get_logger() # Initialize logger at module level is fine
 workflow_storage: Dict[str, Dict[str, Any]] = {}
 job_storage: Dict[str, Dict[str, Any]] = {}
 job_to_workflow_map: Dict[str, str] = {}
-# Define the Hydra configuration path
-hydra_config_path = Path("/Users/jim/src/apps/c4h_ai_dev/conf")
+# Define the default Hydra configuration path
+default_hydra_config_path = Path(__file__).parent.parent.parent.parent / "conf"
+hydra_config_path = default_hydra_config_path
+
+# Export for prefect_runner.py
+system_config_path_default = str(default_hydra_config_path)
 
 # --- Helper Functions ---
 def map_workflow_to_job_changes(workflow_data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -118,11 +122,12 @@ def map_workflow_to_job_changes(workflow_data: Dict[str, Any]) -> List[Dict[str,
 
 # --- FastAPI App Creation Function ---
 
-def create_app(config: Optional[Dict[str, Any]] = None) -> FastAPI: # Changed signature: now requires config
+def create_app(config: Optional[Dict[str, Any]] = None, config_path: Optional[str] = None) -> FastAPI:
     """
     Create FastAPI application with team-based orchestration.
     Args:
         config: The fully loaded and merged configuration for this app instance.
+        config_path: Optional path to Hydra configuration directory.
 
     Returns:
         Configured FastAPI application
@@ -133,19 +138,29 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> FastAPI: # Changed si
         version="0.2.1" # Incremented version
     )
 
+    # Determine the config path to use
+    actual_config_path = Path(config_path) if config_path else hydra_config_path
+    
     # If no config provided, load default using Hydra
     if config is None:
         # Clear any existing Hydra instance
         if GlobalHydra.instance().is_initialized():
             GlobalHydra.instance().clear()
         
-        with initialize(version_base=None, config_path=str(hydra_config_path)):
+        # Hydra requires relative paths, so compute relative path from service.py to config
+        try:
+            relative_config_path = os.path.relpath(str(actual_config_path), start=os.path.dirname(__file__))
+        except ValueError:
+            # If paths are on different drives on Windows, use the path as-is
+            relative_config_path = str(actual_config_path)
+            
+        with initialize(version_base=None, config_path=relative_config_path):
             cfg = compose(config_name="config")
             config = OmegaConf.to_container(cfg, resolve=True)
     
     # Store the provided config in app state
     app.state.config = config
-    app.state.hydra_config_path = hydra_config_path
+    app.state.hydra_config_path = actual_config_path
 
     # Configure API logger
     api_logger = logging.getLogger("api.requests")
@@ -171,7 +186,14 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> FastAPI: # Changed si
             if GlobalHydra.instance().is_initialized():
                 GlobalHydra.instance().clear()
             
-            with initialize(version_base=None, config_path=str(app.state.hydra_config_path)):
+            # Compute relative path for Hydra
+            try:
+                relative_config_path = os.path.relpath(str(app.state.hydra_config_path), start=os.path.dirname(__file__))
+            except ValueError:
+                # If paths are on different drives on Windows, use the path as-is
+                relative_config_path = str(app.state.hydra_config_path)
+            
+            with initialize(version_base=None, config_path=relative_config_path):
                 # Load base configuration
                 current_run_cfg = compose(config_name="config")
                 
@@ -361,7 +383,14 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> FastAPI: # Changed si
             if GlobalHydra.instance().is_initialized():
                 GlobalHydra.instance().clear()
             
-            with initialize(version_base=None, config_path=str(app.state.hydra_config_path)):
+            # Compute relative path for Hydra
+            try:
+                relative_config_path = os.path.relpath(str(app.state.hydra_config_path), start=os.path.dirname(__file__))
+            except ValueError:
+                # If paths are on different drives on Windows, use the path as-is
+                relative_config_path = str(app.state.hydra_config_path)
+            
+            with initialize(version_base=None, config_path=relative_config_path):
                 # Load base configuration
                 base_cfg = compose(config_name="config")
                 
@@ -562,7 +591,14 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> FastAPI: # Changed si
             if GlobalHydra.instance().is_initialized():
                 GlobalHydra.instance().clear()
             
-            with initialize(version_base=None, config_path=str(app.state.hydra_config_path)):
+            # Compute relative path for Hydra
+            try:
+                relative_config_path = os.path.relpath(str(app.state.hydra_config_path), start=os.path.dirname(__file__))
+            except ValueError:
+                # If paths are on different drives on Windows, use the path as-is
+                relative_config_path = str(app.state.hydra_config_path)
+            
+            with initialize(version_base=None, config_path=relative_config_path):
                 if request.include_system_config:
                     # Load the base configuration using Hydra
                     merged_cfg = compose(config_name="config")

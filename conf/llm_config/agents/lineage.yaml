@@ -1,0 +1,10 @@
+# Lineage tracking configuration
+enabled: true
+backends:
+  file:
+    enabled: true
+    path: "workspaces/lineage"
+
+# Artifact creation threshold (in bytes)
+# Team transition data larger than this will be saved as separate artifact files
+artifact_threshold: 1000  # 1KB default, was 10KB

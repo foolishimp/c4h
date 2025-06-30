@@ -1,16 +1,33 @@
 # Default composition for the C4H system
 defaults:
-  - team: discovery
-  - persona: discovery_v1
-  - provider: anthropic
+  - provider@llm_config.providers.anthropic: anthropic
+  - provider@llm_config.providers.openai: openai
+  - provider@llm_config.providers.gemini: gemini
+  - provider@llm_config.providers.xai: xai
+  - team@orchestration.teams.discovery: discovery
+  - team@orchestration.teams.solution: solution
+  - team@orchestration.teams.coder: coder
+  - team@orchestration.teams.fallback: fallback
+  # Load all personas under llm_config.personas
+  - persona@llm_config.personas.discovery_v1: discovery_v1
+  - persona@llm_config.personas.discovery_by_skill_v1: discovery_by_skill_v1
+  - persona@llm_config.personas.solution_designer_v1: solution_designer_v1
+  - persona@llm_config.personas.coder_v1: coder_v1
+  - persona@llm_config.personas.coder_claude_v1: coder_claude_v1
+  # Load agent configuration for lineage
+  - llm_config/agents/lineage@llm_config.agents.lineage
+  # Load skills configuration
+  - skills/claude_code_runner@llm_config.skills
+  - skills/change_validator@llm_config.skills
   - _self_
 
-# Placeholder for runtime-injected project path and intent
-project:
-  path: ???
-
-intent:
-  description: ???
+# Placeholder for runtime-injected workorder (project and intent)
+workorder:
+  project:
+    path: ???
+    workspace_root: "workspaces"
+  intent:
+    description: ???
 
 # Global settings moved from the old system_config.yml
 logging:
@@ -70,12 +87,7 @@ backup:
 llm_config:
   default_provider: "anthropic"
   default_model: "claude-3-5-sonnet-20241022"
-  providers:
-    # Use interpolation to include the provider configs
-    anthropic: ${provider.anthropic}
-    openai: ${provider.openai}
-    gemini: ${provider.gemini}
-    xai: ${provider.xai}
+  # Providers will be populated by the defaults list above
 
 orchestration:
   enabled: true
@@ -86,9 +98,4 @@ orchestration:
     retry_teams: true
     max_retries: 2
     log_level: "ERROR"
-  teams:
-    # Use interpolation to compose teams
-    discovery: ${team.discovery}
-    solution: ${team.solution}
-    coder: ${team.coder}
-    fallback: ${team.fallback}
+  # Teams will be populated by the defaults list above

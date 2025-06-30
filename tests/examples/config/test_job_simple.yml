@@ -1,0 +1,12 @@
+# Path: tests/examples/config/test_job_simple.yml
+# Simple test job configuration for Hydra
+
+# Workorder section - contains project and intent details
+workorder:
+  project:
+    path: "./tests/test_projects/"
+    workspace_root: "workspaces"
+  
+  intent:
+    description: |
+      Add a simple hello world function to the main module

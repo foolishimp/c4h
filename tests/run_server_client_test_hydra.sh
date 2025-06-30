@@ -1,5 +1,5 @@
 #!/bin/bash
-# Script to test server/client mode in compatibility mode
+# Script to test server/client mode with Hydra configuration
 
 set -e
 
@@ -7,9 +7,10 @@ set -e
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PYTHONPATH=$REPO_ROOT
 PORT=5565
+# Use Hydra config directory instead of old system_config.yml
 CONFIG_PATH="$REPO_ROOT/conf"
-CLIENT_CONFIG="$REPO_ROOT/tests/examples/config/test_job_claude_code_2.yml"
-LOG_FILE="$REPO_ROOT/server_client_test.log"
+CLIENT_CONFIG="$REPO_ROOT/tests/examples/config/jobs_coder_01_hydra.yml"
+LOG_FILE="$REPO_ROOT/server_client_test_hydra.log"
 
 # Load the API keys from .env file
 if [ -f "$REPO_ROOT/.env" ]; then
@@ -26,7 +27,7 @@ PYTHON_CMD=$REPO_ROOT/venv/bin/python
 
 # Print environment setup
 echo "===========================================" > $LOG_FILE
-echo "ENVIRONMENT SETUP" >> $LOG_FILE
+echo "ENVIRONMENT SETUP (HYDRA)" >> $LOG_FILE
 echo "REPO_ROOT: $REPO_ROOT" >> $LOG_FILE
 echo "PYTHONPATH: $PYTHONPATH" >> $LOG_FILE
 echo "PYTHON_CMD: $PYTHON_CMD" >> $LOG_FILE
@@ -38,7 +39,7 @@ echo "===========================================" >> $LOG_FILE
 echo "" >> $LOG_FILE
 
 # Print test information
-echo "Starting server/client compatibility test..." | tee -a $LOG_FILE
+echo "Starting server/client Hydra test..." | tee -a $LOG_FILE
 echo "Using Hydra configuration path: $CONFIG_PATH" | tee -a $LOG_FILE
 echo "Using client job configuration: $CLIENT_CONFIG" | tee -a $LOG_FILE
 echo "" | tee -a $LOG_FILE
@@ -63,7 +64,7 @@ cleanup() {
 # Register cleanup function
 trap cleanup EXIT
 
-# Start server in background with Hydra config
+# Start server in background with Hydra config path
 echo "Starting server with Hydra configuration..." | tee -a $LOG_FILE
 PYTHONPATH=$PYTHONPATH $PYTHON_CMD $REPO_ROOT/c4h_services/src/bootstrap/prefect_runner.py service -P $PORT --config-path $CONFIG_PATH >> $LOG_FILE 2>&1 &
 SERVER_PID=$!
@@ -85,7 +86,7 @@ echo "" | tee -a $LOG_FILE
 echo "Running client job..." | tee -a $LOG_FILE
 
 # Run client job with simple approach (no fancy timeout)
-echo "Running client job with simple approach..." | tee -a $LOG_FILE
+echo "Running client job with Hydra configuration..." | tee -a $LOG_FILE
 
 # Just run the client directly with minimal polling to keep the test fast
 PYTHONPATH=$PYTHONPATH $PYTHON_CMD $REPO_ROOT/c4h_services/src/bootstrap/prefect_runner.py jobs -P $PORT --config $CLIENT_CONFIG --poll --poll-interval 5 --max-polls 3 | tee -a $LOG_FILE

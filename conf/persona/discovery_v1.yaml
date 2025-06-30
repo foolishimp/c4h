@@ -1,0 +1,54 @@
+# Discovery agent only runs tartxt - no LLM needed
+# tartxt configuration
+tartxt_config:
+  # Folders to scan (relative to project root)
+  input_paths:
+    - "."  # Scan entire project by default
+  
+  # File patterns to exclude
+  exclusions:
+    - '**/node_modules/**'
+    - '**/.git/**'
+    - '**/__pycache__/**'
+    - '**/*.pyc'
+    - '**/package-lock.json'
+    - '**/dist/**'
+    - '**/.DS_Store'
+    - '**/README.md'
+    - '**/workspaces/**'
+    - '**/backup_txt/**'
+    - '**/.venv/**'
+    - '**/venv/**'
+
+# Execution plan for discovery - run tartxt and capture output
+execution_plan:
+  enabled: true
+  steps:
+    - name: "run_tartxt"
+      type: "skill_call"
+      skill: "command_line_runner"
+      description: "Execute tartxt to collect source code files"
+      params:
+        # Use the venv python and tartxt script path from context
+        command_line: "/Users/jim/src/apps/c4h_ai_dev/venv/bin/python /Users/jim/src/apps/c4h_ai_dev/c4h_agents/skills/tartxt.py"
+        command_args:
+          # tartxt expects: python tartxt.py [paths] -x EXCLUDE -o (output to stdout)
+          positional_args: "."  # Scan current directory (working_dir sets the context)
+          exclude: "**/node_modules/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/package-lock.json,**/dist/**,**/.DS_Store,**/README.md,**/workspaces/**,**/backup_txt/**,**/.venv/**,**/venv/**"
+          o: true  # Output to stdout instead of file
+          verbose: true  # Verbose mode
+        working_dir: "{{context.project_path}}"
+        capture_output: true
+      output_field: "tartxt_result"
+    
+    - name: "store_discovery_output"
+      type: "set_value"
+      description: "Store the collected source code for next stage"
+      field: "result_data"
+      value:
+        discovery_output:
+          source_code: "{{context.tartxt_result.output}}"
+          scan_status: "{{context.tartxt_result.returncode}}"
+          scan_errors: "{{context.tartxt_result.stderr}}"
+          project_path: "{{context.project_path}}"
+          workflow_run_id: "{{context.workflow_run_id}}"

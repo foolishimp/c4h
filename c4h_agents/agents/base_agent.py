@@ -440,6 +440,34 @@ class BaseAgent(BaseConfig, BaseLLM):
                             user_length=len(user_message),
                             user_message=user_message[:10] + "..." if len(user_message) > 10 else user_message)
 
+            # WO-BUGFIX-2: Check for MCP messages in input_data (backward compatible)
+            message_history = []
+            if "input_data" in lineage_context and isinstance(lineage_context.get("input_data"), dict):
+                input_data = lineage_context["input_data"]
+                if "messages" in input_data and isinstance(input_data["messages"], list):
+                    # We have MCP-formatted messages from previous teams
+                    message_history = input_data["messages"]
+                    self.logger.info("agent.using_mcp_messages",
+                                   message_count=len(message_history),
+                                   agent_name=self._get_agent_name())
+            
+            # Build the final messages array for LLM
+            llm_messages = []
+            
+            # Add system message
+            llm_messages.append({"role": "system", "content": system_message})
+            
+            # Add message history if available
+            for msg in message_history:
+                if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                    llm_messages.append({
+                        "role": msg["role"],
+                        "content": msg["content"]
+                    })
+            
+            # Add current user message
+            llm_messages.append({"role": "user", "content": user_message})
+            
             # Create complete messages object for LLM and lineage tracking
             messages = LLMMessages(
                 system=system_message,
@@ -452,10 +480,7 @@ class BaseAgent(BaseConfig, BaseLLM):
                 # Get completion with automatic continuation handling (calls BaseLLM method)
                 # Pass lineage_context to support runtime configuration overrides
                 content, raw_response = self._get_completion_with_continuation(
-                    [
-                        {"role": "system", "content": messages.system},
-                        {"role": "user", "content": messages.user}
-                    ],
+                    llm_messages,
                     context=lineage_context
                 )
 

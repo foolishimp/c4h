@@ -45,6 +45,8 @@ class EventType(Enum):
     CONCENTRATOR_END = "CONCENTRATOR_END"
     FAN_OUT_DISPATCH = "FAN_OUT_DISPATCH"
     ERROR_EVENT = "ERROR_EVENT"
+    LLM_INPUT = "LLM_INPUT"
+    LLM_OUTPUT = "LLM_OUTPUT"
 
 
 class EventLogger:
@@ -167,7 +169,8 @@ class EventLogger:
                  parent_id: Optional[str] = None,
                  execution_path: Optional[List[str]] = None,
                  config_snapshot_path: Optional[str] = None,
-                 config_hash: Optional[str] = None) -> str:
+                 config_hash: Optional[str] = None,
+                 event_id: Optional[str] = None) -> str:
         """
         Log an event with the specified type and payload.
         
@@ -179,18 +182,20 @@ class EventLogger:
             execution_path: List representing the call stack to this event
             config_snapshot_path: Path to the configuration snapshot
             config_hash: Hash identifier of the configuration
+            event_id: Optional pre-generated event ID to use (for artifact correlation)
             
         Returns:
-            The generated event_id
+            The event_id (either provided or generated)
         """
         if not self.enabled:
-            return str(uuid.uuid4())  # Still return a UUID even if disabled
+            return event_id if event_id else str(uuid.uuid4())  # Return provided ID or generate one
         
         # Increment sequence counter
         self.sequence += 1
         
-        # Generate event_id
-        event_id = str(uuid.uuid4())
+        # Use provided event_id or generate a new one
+        if not event_id:
+            event_id = str(uuid.uuid4())
         
         # Get current timestamp in UTC
         timestamp = datetime.now(timezone.utc)

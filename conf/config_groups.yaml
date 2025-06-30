@@ -1,0 +1,12 @@
+# Config groups definition for Hydra
+defaults:
+  - provider@llm_config.providers.anthropic: anthropic
+  - provider@llm_config.providers.openai: openai
+  - provider@llm_config.providers.gemini: gemini
+  - provider@llm_config.providers.xai: xai
+  - team@orchestration.teams.discovery: discovery
+  - team@orchestration.teams.solution: solution
+  - team@orchestration.teams.coder: coder
+  - team@orchestration.teams.fallback: fallback
+  - persona: discovery_v1
+  - _self_

@@ -298,20 +298,32 @@ def handle_service_mode(args: argparse.Namespace) -> None:
     try:
         from c4h_services.src.api.service import create_app, system_config_path_default
 
-        config_to_load_path = args.config if args.config else system_config_path_default
-        logger.info(f"service_mode: Attempting to load configuration from: {config_to_load_path}")
+        # Check if --config-path is provided for Hydra config directory
+        if hasattr(args, 'config_path') and args.config_path:
+            logger.info(f"service_mode: Using Hydra config path: {args.config_path}")
+            # Don't load config, let create_app handle Hydra initialization
+            loaded_config = None
+            config_path = args.config_path
+        else:
+            # Legacy: Load YAML config file if provided
+            config_to_load_path = args.config if args.config else None
+            if config_to_load_path:
+                logger.info(f"service_mode: Attempting to load configuration from: {config_to_load_path}")
+                try:
+                    loaded_config = load_single_config(str(config_to_load_path))
+                    if USING_C4H_LOGGER:
+                        initialize_logging_config(loaded_config)
+                    logger.info(f"service_mode: Configuration loaded successfully from {config_to_load_path}")
+                except (FileNotFoundError, ValueError, Exception) as e:
+                    logger.error(f"service_mode: Failed to load configuration from {config_to_load_path}: {e}. Exiting.")
+                    print(f"Error: Could not load configuration file '{config_to_load_path}'. Please ensure the file exists and is valid YAML.")
+                    sys.exit(1)
+            else:
+                # Use default Hydra config
+                loaded_config = None
+            config_path = None
 
-        try:
-             loaded_config = load_single_config(str(config_to_load_path))
-             if USING_C4H_LOGGER:
-                  initialize_logging_config(loaded_config)
-             logger.info(f"service_mode: Configuration loaded successfully from {config_to_load_path}")
-        except (FileNotFoundError, ValueError, Exception) as e:
-             logger.error(f"service_mode: Failed to load configuration from {config_to_load_path}: {e}. Exiting.")
-             print(f"Error: Could not load configuration file '{config_to_load_path}'. Please ensure the file exists and is valid YAML.")
-             sys.exit(1)
-
-        app = create_app(config=loaded_config)
+        app = create_app(config=loaded_config, config_path=config_path)
 
         print(f"Service mode enabled, running on http://0.0.0.0:{args.port}")
         logger.info(f"service_mode: Starting Uvicorn server on port {args.port}")
@@ -455,6 +467,7 @@ def main():
     parser.add_argument("mode", type=str, nargs="?", choices=["service", "jobs", "apply_diff"], default="service", help="Run mode (service, jobs, apply_diff)")
     parser.add_argument("-P", "--port", type=int, default=5500, help="Port number for API service or client communication (default: 5500)")
     parser.add_argument("--config", help="Path to config file (YAML). Used by 'jobs' mode. Used as base/override for 'service'/'apply_diff' mode.")
+    parser.add_argument("--config-path", help="Path to Hydra config directory. Used by 'service' mode for Hydra-based configuration.")
     parser.add_argument("--host", default="localhost", help="Host for jobs/apply_diff client (default: localhost)")
     parser.add_argument("--project-path", help="Path to the project. Required for 'apply_diff' mode. Overrides config for 'jobs' mode.")
     parser.add_argument("--diff-file", help="Path to file containing raw diff content. Required for 'apply_diff' mode.")

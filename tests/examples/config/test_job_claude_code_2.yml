@@ -1,0 +1,27 @@
+# Path: tests/examples/config/test_job_claude_code.yml
+# Test job configuration for Claude Code integration
+
+# Workorder section - contains project and intent details
+workorder:
+  project:
+    path: "./tests/test_projects/"
+    workspace_root: "workspaces"
+  
+  intent:
+    description: |
+      replace all the print statements with logging for each function
+
+# Override the coder team to use Claude Code
+orchestration:
+  teams:
+    coder:
+      name: "Claude Code Coder Team"
+      tasks:
+        - name: "coding_phase"
+          agent_type: "GenericLLMAgent"
+          persona_key: "coder_claude_v1"
+          description: "Implement code changes using Claude Code"
+          requires_approval: false
+          max_retries: 1
+      routing:
+        default: null

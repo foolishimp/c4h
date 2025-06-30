@@ -420,31 +420,13 @@ class CommandLineRunner:
             args.update(default_args)
         args.update(cmd_args)  # Override defaults with explicitly provided args
         
-        # Add common args from input
-        common_args = ["project_path", "input_paths", "exclusions", "output_file"]
-        for arg in common_args:
-            if arg in input and arg not in args:
-                args[arg] = input[arg]
-                
-        # Special case for tartxt-style commands
-        if "project_scan" in input and "project_scan" not in args:
-            args["project_scan"] = input["project_scan"]
+        # REMOVED: Auto-injection of common args from input context
+        # The skill should only use arguments that are explicitly configured
+        # This allows the caller to have full control over what arguments are passed
         
-        # Handle git command for tartxt
-        if command_name == "tartxt" and "git_command" in input and "git" not in args:
-            args["git"] = input["git_command"]
-            
-        # Handle history for tartxt
-        if command_name == "tartxt" and "history" in input and "history" not in args:
-            args["history"] = input["history"]
-            
-        # For Python modules, we may need to convert args to the right format
-        if cmd_type == "python_module":
-            # No special handling needed yet, but could be added here
-            pass
-            
         self.logger.debug("command_line_runner.prepared_args", 
-                       arg_keys=list(args.keys()))
+                       arg_keys=list(args.keys()),
+                       arg_count=len(args))
         return args
     
     def _execute_python_module(

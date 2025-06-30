@@ -1,0 +1,28 @@
+# Claude Code Runner skill configuration
+skills:
+  claude_code_runner:
+    module: "c4h_agents.skills.claude_code_runner"
+    class: "ClaudeCodeRunner"
+    method: "execute"
+    description: "Invokes Claude Code to implement code changes from solution designs"
+    tags: ["implementation", "external", "claude"]
+    default_params:
+      mode: "cli"  # Options: cli, api, direct
+      cli_path: "claude"  # Command to invoke Claude Code
+      timeout: 300  # 5 minute timeout
+      retry_attempts: 2
+    configuration:
+      # CLI mode configuration
+      cli:
+        path: "claude"  # Will look for 'claude' in PATH
+        args: ["code"]
+      
+      # API mode configuration (for future use)
+      api:
+        endpoint: "http://localhost:8000/api/v1/implement"
+        api_key: ""  # Set via CLAUDE_CODE_API_KEY environment variable
+      
+      # Direct mode configuration (for future use)
+      direct:
+        enabled: false
+        use_tools: true

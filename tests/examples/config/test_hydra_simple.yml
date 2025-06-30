@@ -1,0 +1,22 @@
+# Simple test configuration that overrides the team to use old-style agents
+
+workorder:
+  project:
+    path: "./tests/test_projects/"
+    workspace_root: "workspaces"
+  intent:
+    description: |
+      Add a simple hello world function
+
+# Override the discovery team to use a simple GenericLLMAgent
+orchestration:
+  teams:
+    discovery:
+      name: "Simple Discovery Team"
+      tasks:
+        - name: "simple_discovery"
+          agent_type: "GenericLLMAgent"  # Use the old style agent
+          persona_key: "discovery_v1"
+          description: "Simple discovery task"
+      routing:
+        default: null  # Don't route to other teams

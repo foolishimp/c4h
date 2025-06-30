@@ -1,0 +1,21 @@
+# Change Validator skill configuration
+skills:
+  change_validator:
+    module: "c4h_agents.skills.change_validator"
+    class: "ChangeValidator"
+    method: "execute"
+    description: "Validates code changes after implementation"
+    tags: ["validation", "testing", "quality"]
+    default_params:
+      run_tests: true
+      run_lint: true
+    configuration:
+      validation_steps:
+        - "file_exists"
+        - "syntax_check"
+        - "linting"
+        - "test_execution"
+      # Custom test commands to try (in addition to defaults)
+      test_commands: []
+      # Custom lint commands to try (in addition to defaults)
+      lint_commands: []

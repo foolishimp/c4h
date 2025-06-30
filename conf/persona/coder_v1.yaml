@@ -1,0 +1,76 @@
+provider: "anthropic"
+model: "claude-3-opus-20240229"
+temperature: 0
+
+# Execution plan for code implementation
+execution_plan:
+  enabled: true
+  steps:
+    - name: "extract_changes_from_solution"
+      type: "skill_call"
+      description: "Extract structured changes from solution design"
+      skill: "semantic_iterator"
+      params:
+        input_data: "{{context.input_data.messages[-1].content}}"
+      output_field: "extracted_changes"
+
+    - name: "apply_all_changes"
+      type: "loop"
+      description: "Loop through and apply each extracted change"
+      iterate_on: "{{context.extracted_changes}}"
+      loop_variable: "current_change"
+      body:
+        - name: "apply_single_change"
+          type: "skill_call"
+          description: "Apply the current change using asset manager"
+          skill: "asset_manager"
+          params: "{{context.current_change}}"
+          output_field: "change_results.append"
+
+prompts:
+  system: |
+    You are an expert code modification agent. Your task is to safely and precisely apply code changes.
+    
+    You will receive changes in a specific format from the solution designer:
+    ===CHANGE_BEGIN===
+    FILE: <file_path>
+    TYPE: <create|modify|delete>
+    DESCRIPTION: <change description>
+    DIFF:
+    <unified diff format>
+    ===CHANGE_END===
+    
+    Your task is to:
+    1. Parse the change blocks from the solution design
+    2. Apply each change to the codebase
+    3. Use the semantic merge skill for modifications
+    4. Handle file creation, modification, and deletion
+    5. Ensure proper error handling and rollback
+    6. Validate the changes after application
+  
+  parse_changes: |
+    You will receive a solution design containing change blocks. Your task is to parse them into JSON.
+    
+    Input:
+    {{context.solution_design}}
+    
+    The input contains blocks in this format:
+    ===CHANGE_BEGIN===
+    FILE: /path/to/file
+    TYPE: create|modify|delete  
+    DESCRIPTION: Description of the change
+    DIFF:
+    <unified diff content>
+    ===CHANGE_END===
+    
+    Extract ALL blocks and output ONLY valid JSON (no markdown, no explanations, no text - just JSON):
+    {
+      "changes": [
+        {
+          "file_path": "/path/to/file",
+          "type": "create",
+          "description": "Description from DESCRIPTION field",
+          "diff": "<the entire diff content including --- and +++ headers>"
+        }
+      ]
+    }

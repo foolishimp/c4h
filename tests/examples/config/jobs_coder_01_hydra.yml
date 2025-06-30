@@ -1,0 +1,27 @@
+# Path: tests/examples/config/jobs_coder_01_hydra.yml
+# Job configuration for Hydra-based client test
+
+# Workorder section - contains project and intent details
+workorder:
+  project:
+    path: "./tests/test_projects/"  # Using test project
+    workspace_root: "workspaces"
+  
+  intent:
+    description: |
+      Add logging to all functions with lineage tracking:
+      - Replace print statements with logging
+      - Add logging configuration
+      - Enable lineage tracking for observability
+
+# Override configuration values
+project:
+  path: "./tests/test_projects/"
+
+orchestration:
+  teams:
+    discovery:
+      tasks:
+        - agent_type: generic
+          name: discovery
+          persona_key: discovery_v1

@@ -1,0 +1,87 @@
+provider: "anthropic"
+model: "claude-3-5-sonnet-20241022"
+temperature: 0
+
+# Execution plan for code implementation using Claude Code
+execution_plan:
+  enabled: true
+  steps:
+    - name: "extract_solution_design"
+      type: "set_value"
+      description: "Extract solution design from input data"
+      field: "solution_design_content"
+      value: "{{context.solution_design}}"
+    
+    - name: "extract_intent"
+      type: "set_value"
+      description: "Extract intent description"
+      field: "intent_description"
+      value: "{{context.intent.description}}"
+    
+    - name: "invoke_claude_code"
+      type: "skill_call"
+      description: "Use Claude Code to implement the solution"
+      skill: "claude_code_runner"
+      params:
+        working_directory: "{{context.project_path}}"
+        solution_design: "{{context.solution_design_content}}"
+        intent: "{{context.intent_description}}"
+        mode: "implementation"
+      output_field: "claude_code_result"
+    
+    - name: "validate_implementation"
+      type: "branch"
+      description: "Check if Claude Code succeeded"
+      execute_inline: true
+      branches:
+        - name: "success_branch"
+          condition:
+            type: "simple"
+            field: "claude_code_result.success"
+            operator: "equals"
+            value: true
+          body:
+            - name: "run_change_validation"
+              type: "skill_call"
+              description: "Validate the changes made by Claude Code"
+              skill: "change_validator"
+              params:
+                changes: "{{context.claude_code_result.value.files_modified}}"
+                project_path: "{{context.project_path}}"
+                run_tests: false  # Skip tests for now to speed up
+                run_lint: true
+              output_field: "validation_result"
+            
+            - name: "format_success_response"
+              type: "set_value"
+              field: "coder_result"
+              value:
+                status: "success"
+                message: "Code implementation completed successfully using Claude Code"
+                files_modified: "{{context.claude_code_result.value.files_modified}}"
+                summary: "{{context.claude_code_result.value.summary}}"
+                validation: "{{context.validation_result}}"
+                implementation_mode: "claude_code"
+      default:
+        - name: "format_error_response"
+          type: "set_value"
+          field: "coder_result"
+          value:
+            status: "error"
+            message: "Code implementation failed"
+            error: "{{context.claude_code_result.error}}"
+            implementation_mode: "claude_code"
+
+prompts:
+  system: |
+    You are a code implementation coordinator that uses Claude Code to apply changes.
+    Your role is to:
+    1. Prepare and format solution designs for Claude Code
+    2. Invoke Claude Code with appropriate parameters
+    3. Validate and report results
+    
+    You do not implement code directly - you delegate to Claude Code.
+  
+  fallback: |
+    If Claude Code is not available or fails, you should report the error clearly
+    and suggest manual implementation of the solution design.

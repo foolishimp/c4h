@@ -1,0 +1,20 @@
+name: "Claude Code Coder Team"
+description: "Coder team that uses Claude Code for implementation"
+tasks:
+  - name: "coder_phase"
+    agent_type: "GenericLLMAgent"
+    persona_key: "coder_claude_v1"
+    description: "Implement code changes using Claude Code"
+    output_config:
+      format: "json"
+      fields:
+        - name: "coder_result"
+          description: "Result of code implementation"
+          required: true
+        - name: "files_modified"
+          description: "List of files modified"
+          required: false
+        - name: "summary"
+          description: "Summary of changes made"
+          required: false
+next_team: "none"

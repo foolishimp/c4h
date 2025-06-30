@@ -1,0 +1,13 @@
+# Minimal test configuration for Hydra integration testing
+
+workorder:
+  project:
+    path: "./tests/test_projects/"
+    workspace_root: "workspaces"
+  intent:
+    description: |
+      Test Hydra configuration system
+
+# Override to disable execution plan requirement for testing
+runtime:
+  require_execution_plans: false
