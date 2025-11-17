@@ -44,11 +44,11 @@ execution_plan:
     - name: "store_discovery_output"
       type: "set_value"
       description: "Store the collected source code for next stage"
-      field: "result_data"
+      field: "discovery_output"
       value:
-        discovery_output:
-          source_code: "{{context.tartxt_result.output}}"
-          scan_status: "{{context.tartxt_result.returncode}}"
-          scan_errors: "{{context.tartxt_result.stderr}}"
-          project_path: "{{context.project_path}}"
-          workflow_run_id: "{{context.workflow_run_id}}"
+        source_code: "{{context.tartxt_result.output}}"
+        scan_status: "{{context.tartxt_result.returncode}}"
+        scan_errors: "{{context.tartxt_result.stderr}}"
+        project_path: "{{context.project_path}}"
+        workflow_run_id: "{{context.workflow_run_id}}"
+      output_field: "discovery_output"

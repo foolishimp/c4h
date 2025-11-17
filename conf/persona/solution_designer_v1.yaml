@@ -79,7 +79,7 @@ execution_plan:
         - Keep descriptions short and clear
       prompt: |
         Source Code:
-        {{context.discovery_output.source_code}}
+        {{context.discovery_output.value.source_code}}
         
         Intent:
         {{context.intent.description}}
